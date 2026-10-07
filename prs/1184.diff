@@ -1,0 +1,345 @@
+diff --git a/cmake/hip_backend.cmake b/cmake/hip_backend.cmake
+index 0697f82ac5..b9088a6244 100644
+--- a/cmake/hip_backend.cmake
++++ b/cmake/hip_backend.cmake
+@@ -12,7 +12,7 @@ endif()
+ # same wave32 / 64 KiB LDS / sudot4 family as gfx1100, on a unified-memory APU; experimental.
+ set(_strata_hip_validated gfx1100 gfx1201)
+ set(_strata_hip_community gfx1101 gfx1200)
+-set(_strata_hip_unvalidated gfx1012 gfx1102 gfx1030 gfx1031 gfx1034 gfx1151)
++set(_strata_hip_unvalidated gfx1012 gfx1102 gfx1030 gfx1031 gfx1032 gfx1034 gfx1151)
+ # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
+ # spaces, which foreach(IN LISTS) would otherwise treat as one element.
+ string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
+diff --git a/docs/AMD_HIP.md b/docs/AMD_HIP.md
+index 5996177e1e..456241193e 100644
+--- a/docs/AMD_HIP.md
++++ b/docs/AMD_HIP.md
+@@ -370,7 +370,11 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
+   `platform_memory_test` cannot `mlock` at the shell's default `ulimit -l`).
+ - **gfx1031** (RX 6700 XT, #524): setup knows it (the `gfx103X-all` wheels, unvalidated); its reporter runs it daily
+   on one card.
+-- **Not validated:** gfx1032 (the same `dp4a` path, no hardware report), setup's own build path and the
++- **gfx1032** (RX 6600/6600 XT): unvalidated; built with `STRATA_HIP_ARCHS=gfx1030;gfx1032` and ran under Windows as
++  the *helper* expert GPU of an RX 6800 ([SECOND_GPU.md](SECOND_GPU.md)), 3.4-3.8k expert slots in its 8 GB and
++  +8-18% decode over the 6800 alone. Its 14 WGP make a helper row about 2-3x the 6800's cost, so it pays as a
++  cache tier for the CPU pool, not as a compute peer. No report of it as a primary card.
++- **Not validated:** setup's own build path and the
+   `gfx103X-all` wheels on gfx1030, images, answer-quality benchmarks. RDNA1 (gfx1012, RX 5500 XT) builds by hand:
+   [OLDER_GPUS.md](OLDER_GPUS.md#amd-building-gfx906-and-gfx1012).
+ 
+diff --git a/docs/SECOND_GPU.md b/docs/SECOND_GPU.md
+index f5682bc212..7aff60db41 100644
+--- a/docs/SECOND_GPU.md
++++ b/docs/SECOND_GPU.md
+@@ -166,3 +166,50 @@ not yet combined with the peer's rows. Mapped host buffers gain
+ context write them. The tier size is manual for now (`--peer-reserve-mib`,
+ `--peer-slots`); automatic sizing on small cards wants the buffer lending of
+ #216 and is a follow-up.
++
++## The resident RAM mode with the helper caches
++
++`--resident-experts` (the low-RAM mode) works with the helper caches: the
++experts a helper holds are left out of the RAM copy as a split stage's are, and
++the helpers' refills read through the source - the RAM copy when it holds the
++bytes, the files otherwise. Measured here on an RX 6800 (gfx1030, 16 GB) + RX
++6600 (gfx1032, 8 GB), Windows 11, an i5-11400F and 32 GB of RAM (the 6800 alone:
++~37.5 decode tok/s, the same worker configuration): the 6600's 3.4-3.8k-expert
++cache lifted decode to ~40.6 / 44.2 tok/s on 8K-token requests at 3800 slots,
++with the CPU pool's share of the experts down from ~2.9 to ~0.4 entries per
++layer-window. The helper's rows cost about 0.3-0.6 ms per layer on the pool's
++critical path - usually less than the CPU rows and page faults they replace,
++which is why the 6600 (about 2-3x the 6800's cost per row) still pays off as a
++cache tier.
++
++**Size a helper against the card's *real* free VRAM.** `--expert-cache-device1
++auto` reads `cudaMemGetInfo`, which on Windows reports the *process's* WDDM
++budget: it cannot see the desktop, the vision encoder (a separate process), a
++streaming host or other apps on that card.  A helper auto-sized on a card that
++also drives the display or the encoder over-commits, WDDM backs the excess with
++system RAM ("shared GPU memory"), and that memory leaves the machine's RAM - on
++a 32 GB PC it pushed the resident complement into the pagefile and made the
++helper read its own cache over PCIe.  An explicit count
++(`--expert-cache-device1 3800` here, of ~4100 that fit an empty card) kept the
++cache in real VRAM; freeing another app's sticky allocation on the same card
++was worth about the same again.  Prefer explicit counts on a card that shares
++its VRAM with anything else.
++
++## Choosing the primary device on Windows (`STRATA_PRIMARY_DEVICE`)
++
++The engine runs the model on the device the runtime numbers 0.  Windows' HIP
++runtime enumerates the cards in a fixed order that `HIP_VISIBLE_DEVICES` only
++filters - it cannot reorder - so on a PC whose faster card comes second (an RX
++6800 after an RX 6600, say) a run with both visible could only put the model on
++the slow one.  `STRATA_PRIMARY_DEVICE=N` picks another visible ordinal as the
++primary; unset or 0 is upstream's behavior.
++
++- the helper caches (`--expert-cache-device1..3`) take the visible devices
++  other than the primary, in order;
++- the peer tier's cross-device checks use the same ordinal;
++- a layer split is refused with this set (its later stages must be > 0, and
++  stage 0 is the primary);
++- NVIDIA cards do not need it: `CUDA_VISIBLE_DEVICES` with
++  `CUDA_DEVICE_ORDER=PCI_BUS_ID` already reorders.
++
++Measured on RX 6800 + RX 6600, Windows 11; the report accompanies this change.
+diff --git a/include/strata/core/device.hpp b/include/strata/core/device.hpp
+index 091dff1c31..1745f8f281 100644
+--- a/include/strata/core/device.hpp
++++ b/include/strata/core/device.hpp
+@@ -48,6 +48,14 @@ int device_count();
+ // the runtime cannot describe it.
+ bool device_summary(int ordinal, std::string& name, std::string& detail);
+ 
++// STRATA_PRIMARY_DEVICE (generate.cpp): the ordinal the engine's own session runs on; 0 = the runtime's first
++// visible device (upstream's behavior).  The Windows HIP runtime enumerates the cards in a fixed order no
++// HIP_VISIBLE_DEVICES list can change (it only filters), so a PC whose faster card comes second could not run
++// the model on it while the first card served as a helper.  The helper expert caches and the peer tier must
++// live on another device.  Set once, before any context exists.
++void set_primary_device(int ordinal);
++int primary_device();
++
+ // Throws when there is no CUDA device.  The engine targets sm_120 specifically and must say so rather than
+ // run slowly on something else: `CMakeLists.txt` already refuses to COMPILE for another architecture, and
+ // this is the matching check at run time (a binary can be carried to a different machine).
+diff --git a/src/core/device.cu b/src/core/device.cu
+index a614f2487f..159e632577 100644
+--- a/src/core/device.cu
++++ b/src/core/device.cu
+@@ -82,6 +82,13 @@ int device_count() {
+     return count < 0 ? 0 : count;
+ }
+ 
++// STRATA_PRIMARY_DEVICE: see the declaration in device.hpp.  0 = upstream's behavior (the runtime's first
++// visible device).  Set once, before any context exists, by generate.cpp's STRATA_PRIMARY_DEVICE handling.
++static int g_primary_device = 0;
++
++void set_primary_device(int ordinal) { g_primary_device = ordinal; }
++int primary_device() { return g_primary_device; }
++
+ bool device_summary(int ordinal, std::string& name, std::string& detail) {
+     cudaDeviceProp p{};
+     if (ordinal < 0 || ordinal >= device_count() || cudaGetDeviceProperties(&p, ordinal) != cudaSuccess) {
+diff --git a/src/core/peer_experts.cpp b/src/core/peer_experts.cpp
+index ad88bda8fb..09c9bbe4ae 100644
+--- a/src/core/peer_experts.cpp
++++ b/src/core/peer_experts.cpp
+@@ -1,6 +1,7 @@
+ // src/core/peer_experts.cpp - see include/strata/core/peer_experts.hpp.
+ #include "strata/core/peer_experts.hpp"
+ 
++#include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ #include "strata/kernels/elementwise.hpp"
+ #include "strata/kernels/iq_kernels.hpp"
+@@ -96,15 +97,15 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
+     res_.assign((size_t) (n_layers * n_expert), kNotResident);
+     {   // direct access both ways (NVLink or another P2P path): the prompt path copies activations and results over it
+         int a = 0, b = 0;
+-        cudaDeviceCanAccessPeer(&a, 0, device);
+-        cudaDeviceCanAccessPeer(&b, device, 0);
++        cudaDeviceCanAccessPeer(&a, primary_device(), device);
++        cudaDeviceCanAccessPeer(&b, device, primary_device());
+         p2p_ = a && b;
+         if (p2p_) {
+-            On on0(0);
++            On on0(primary_device());
+             cudaError_t e0 = cudaDeviceEnablePeerAccess(device, 0);
+             if (e0 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e0 = cudaSuccess; }
+             On on1(device);
+-            cudaError_t e1 = cudaDeviceEnablePeerAccess(0, 0);
++            cudaError_t e1 = cudaDeviceEnablePeerAccess(primary_device(), 0);
+             if (e1 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e1 = cudaSuccess; }
+             p2p_ = e0 == cudaSuccess && e1 == cudaSuccess;
+         }
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 1b6969e828..1c6f9333e7 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -1,4 +1,5 @@
+ #include "strata/core/remote_experts.hpp"
++#include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+ #include "strata/core/remote_expert_opt.hpp"
+ 
+ #include "strata/kernels/cpu/expert_layout.hpp"
+@@ -67,10 +68,15 @@ RemoteExperts::~RemoteExperts() { close(); }
+ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
+     int count = 0;
+     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
+-    if (device < 1 || device >= count) {
++    if (device < 0 || device >= count) {
+         err = "CUDA" + std::to_string(device) + " experts: CUDA device is not visible";
+         return false;
+     }
++    if (device == primary_device()) {   // the primary may be any visible ordinal; the helper cannot be it
++        err = "CUDA" + std::to_string(device) + " experts: the helper cannot be the primary device "
++                                                 "(STRATA_PRIMARY_DEVICE)";
++        return false;
++    }
+     // The layer waits for this GPU on the CPU pool's critical path: spin instead of sleeping, whose wake-up
+     // costs more than a small expert batch takes (measured: ~0.3 ms per round trip on Windows).  Only possible
+     // before the device's context exists, so first thing; STRATA_REMOTE_SPIN=0 keeps the driver's default.
+@@ -125,8 +131,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
+     close();
+     int count = 0;
+     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
+-    if (device < 1 || device >= count || slots <= 0 || ranked.empty() ||
+-        layers <= 0 || experts <= 0 || claimed.size() != (size_t) layers * (size_t) experts) {
++    if (device < 0 || device >= count || slots <= 0 || ranked.empty() ||
++        layers <= 0 || experts <= 0 || claimed.size() != (size_t) layers * (size_t) experts ||
++        device == primary_device()) {   // the helper cannot be the primary device (any visible ordinal)
+         err = "CUDA" + std::to_string(device) + " experts: need the device, ranked experts and positive slot count";
+         return false;
+     }
+@@ -330,7 +337,23 @@ bool RemoteExperts::finish(float* out, std::string& err) {
+     DeviceScope scope(device_);
+     if (!scope.ok) { err = scope.error(device_); return false; }
+     const auto w0 = std::chrono::steady_clock::now();
+-    if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) return false;
++    // Spin on the stream like PeerExperts::finish instead of the blocking sync: the layer waits for this helper
++    // on the CPU pool's critical path, and a blocking sync's wake-up costs more than the helper's small batch
++    // takes - on HIP especially, where the CUDA branch's cudaInitDevice(ScheduleSpin) does not exist and the
++    // device keeps its default policy.  STRATA_REMOTE_SPIN=0 keeps the blocking sync (the same switch the CUDA
++    // branch reads).
++    static const bool spin = [] {
++        const char* v = std::getenv("STRATA_REMOTE_SPIN");
++        return !(v != nullptr && v[0] == '0');
++    }();
++    if (spin) {
++        cudaError_t e;
++        while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {
++        }
++        if (!check(e, "finish", err, device_)) return false;
++    } else if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) {
++        return false;
++    }
+     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+     if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
+     for (size_t i = 0; i < original_row_.size(); ++i)
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3b551f3aaf..1bdfa27940 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1859,6 +1859,16 @@ int main(int argc, char** argv) {
+     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
+         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
+                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
++    // STRATA_PRIMARY_DEVICE: which VISIBLE device the engine's own session runs on.  The Windows HIP runtime
++    // enumerates the cards in a fixed order no HIP_VISIBLE_DEVICES list can change (it only filters), so with a
++    // slower card first a run could only put the model on it (RX 6600 before RX 6800).  0 (unset) is upstream's
++    // behavior; the helper caches and the peer tier follow it, a layer split still assumes device 0 (see below).
++    const int primary_device = [] {
++        const char* v = std::getenv("STRATA_PRIMARY_DEVICE");
++        const int n = v != nullptr ? std::atoi(v) : 0;
++        return n > 0 ? n : 0;
++    }();
++    strata::core::set_primary_device(primary_device);
+     // parking with --layer-split saves every stage (SavedConversation::stage_images)
+     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
+     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
+@@ -1921,6 +1931,14 @@ int main(int argc, char** argv) {
+         }
+     }
+     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
++    // STRATA_PRIMARY_DEVICE: a later stage's list (`--split-device` values must be > 0) still assumes the
++    // primary is device 0 - refuse the combination rather than mis-place a stage.  The peer tier takes the
++    // primary into account (peer_experts.cpp).
++    if (primary_device != 0 && !o.layer_split.empty()) {
++        std::fprintf(stderr, "strata generate: STRATA_PRIMARY_DEVICE %d is not supported with a layer split yet\n",
++                     primary_device);
++        return 2;
++    }
+     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
+     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
+         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
+@@ -1930,17 +1948,25 @@ int main(int argc, char** argv) {
+         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
+         return 2;
+     }
+-    const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
+-                               o.expert_cache_remote[2] > 0;
+     // A layer split keeps the resident RAM mode: every stage's GPU cache is left out of the RAM copy, and an adaptive
+     // swap copies an evicted expert back from the card that owns its layer (resident_stage_swaps).
+-    if (o.resident_cpu_experts && remote_caches) {
+-        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support remote expert caches\n");
+-        return 2;
+-    }
++    // The helper-GPU caches are allowed beside the resident RAM mode too: their experts are left out of the RAM copy
++    // like a stage's (below), the helpers' refills read through the source (the RAM copy when it holds the bytes),
++    // and the two adaptive tiers already keep each other's experts out (helper_holds in the primary's candidates,
++    // RemoteExpertOpt::adapt's resident table).  Measured on RX 6800 + RX 6600, Windows (docs/SECOND_GPU.md).
+     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
+     // split, the visible GPUs no stage runs on, in order
+     int remote_dev[3] = {1, 2, 3};
++    if (primary_device != 0) {
++        // STRATA_PRIMARY_DEVICE: the helpers are the visible devices except the primary, in order
++        int n_vis = 1;
++        if (cudaGetDeviceCount(&n_vis) != cudaSuccess || n_vis < 1) n_vis = 1;
++        cudaGetLastError();
++        int k = 0;
++        for (int d = 0; d < n_vis && k < 3; ++d)
++            if (d != primary_device) remote_dev[k++] = d;
++        for (; k < 3; ++k) remote_dev[k] = -1;
++    }
+     if (multi_gpu) {
+         if (o.expert_profile.empty()) {
+             std::fprintf(stderr, "strata generate: a layer split across GPUs needs --expert-profile\n");
+@@ -2024,7 +2050,7 @@ int main(int argc, char** argv) {
+     {
+         // every GPU this run uses must be an architecture the binary has code for (a gfx1100 build on a gfx1201
+         // card would otherwise fail later with "invalid device function")
+-        std::vector<int> used{0};
++        std::vector<int> used{primary_device};   // STRATA_PRIMARY_DEVICE: the primary is not always 0
+         if (multi_gpu) used.insert(used.end(), split_devs.begin(), split_devs.end());
+         for (int r = 0; r < 3; ++r)
+             if (o.expert_cache_remote[(size_t) r] > 0) used.push_back(remote_dev[r]);
+@@ -2331,6 +2357,25 @@ int main(int argc, char** argv) {
+         }
+     }
+     const bool native_pack = strata::kernels::cpu::expert_layout().native;
++    // STRATA_PRIMARY_DEVICE: switch the engine's own thread to the chosen card BEFORE any GPU
++    // context or allocation exists below (the helper preflights, the PCIe probe, the weights and the
++    // arena all follow it).  Every other device switch in the engine saves and restores the current
++    // device, so this single call is where the primary is picked.
++    if (primary_device != 0) {
++        int n_vis = 0;
++        if (cudaGetDeviceCount(&n_vis) != cudaSuccess || primary_device >= n_vis) {
++            cudaGetLastError();
++            std::fprintf(stderr, "strata generate: STRATA_PRIMARY_DEVICE=%d: no such visible device (%d visible)\n",
++                         primary_device, n_vis);
++            return 2;
++        }
++        if (cudaSetDevice(primary_device) != cudaSuccess) {
++            std::fprintf(stderr, "strata generate: STRATA_PRIMARY_DEVICE=%d: cudaSetDevice failed: %s\n",
++                         primary_device, cudaGetErrorString(cudaGetLastError()));
++            return 1;
++        }
++        std::fprintf(stderr, "strata generate: primary device from STRATA_PRIMARY_DEVICE: CUDA%d\n", primary_device);
++    }
+     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
+     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
+     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
+@@ -3390,7 +3435,7 @@ int main(int argc, char** argv) {
+     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
+     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
+     {
+-        const strata::core::OnDevice on0(0);
++        const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
+         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
+         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
+@@ -5464,6 +5509,14 @@ int main(int argc, char** argv) {
+             for (int64_t l = st->lb; l < st->le; ++l)
+                 for (int64_t e = 0; e < g.n_expert; ++e)
+                     if (st->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
++        // A helper GPU's experts are left out of the RAM copy as a stage's are - the RAM
++        // that duplication would take goes to colder experts instead.
++        for (int r = 0; r < 3; ++r) {
++            if (o.expert_cache_remote[(size_t) r] <= 0) continue;
++            for (int64_t l = 0; l < g.n_layers; ++l)
++                for (int64_t e = 0; e < g.n_expert; ++e)
++                    if (remote_experts[(size_t) r].holds(l, (int32_t) e)) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
++        }
+         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
+         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
+                                                     o.resident_headroom, o.resident_budget, &rank_all);

@@ -1,0 +1,229 @@
+diff --git a/include/strata/spec/draft_policy.hpp b/include/strata/spec/draft_policy.hpp
+index c4981e924e..90871780c3 100644
+--- a/include/strata/spec/draft_policy.hpp
++++ b/include/strata/spec/draft_policy.hpp
+@@ -12,7 +12,9 @@
+ //
+ // and takes the lookup window only when its best E/cost beats the MTP's by `margin`. Costs are the measured round
+ // times per window size (EMA; sizes not seen yet are scaled from seen ones by a prior shape), so the policy adapts
+-// to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
++// to the machine and the context length. A confident full lookup window is retried after 64 timed rounds at other
++// sizes; its first fresh sample replaces the stale cost. It only chooses which drafts to verify: the output is
++// unchanged.
+ #pragma once
+ 
+ #include <array>
+@@ -49,10 +51,12 @@ class DraftPolicy {
+ private:
+     static int bucket(int match);
+     double mtp_tokens(int t) const;
++    void observe_cost(int t, double round_ms);
+ 
+     int max_t_;
+     double margin_;
+     std::array<double, kMaxT + 1> cost_{}, cost_n_{};      // round ms by window size
++    std::array<int, kMaxT + 1> cost_age_{};               // timed rounds at other sizes, saturated
+     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
+     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
+     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
+diff --git a/src/spec/draft_policy.cpp b/src/spec/draft_policy.cpp
+index 858f4a5639..c3d89e8e8c 100644
+--- a/src/spec/draft_policy.cpp
++++ b/src/spec/draft_policy.cpp
+@@ -17,6 +17,7 @@ constexpr double kDecay = 0.97;       // lookup counts: older windows fade
+ // on the same thing); worth 4 observations, so a few real windows override it
+ constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
+ constexpr double kPriorN = 4.0;
++constexpr int kReprobeRounds = 64;  // retry a stale size at most once per this many other timed rounds
+ constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
+ 
+ }  // namespace
+@@ -69,24 +70,34 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const
+     if (best_t > 0 && best > base * (1.0 + margin_)) {
+         p.lookup = true;
+         p.t = best_t;
+-        return p;
+     }
+     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
+     // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
+     const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
+-    if (t_full > p.t && cost_n_[t_full] < kProbes && q >= 0.85) {
++    // Even a measured cost can be stale after a slow start. Retry the full window occasionally, including when a
++    // smaller lookup already pays; otherwise that smaller window can keep the full size from ever being measured.
++    if (t_full > p.t && q >= 0.85 &&
++        ((!p.lookup && cost_n_[t_full] < kProbes) || cost_age_[t_full] >= kReprobeRounds)) {
+         p.lookup = true;
+         p.t = t_full;
+     }
+     return p;
+ }
+ 
++void DraftPolicy::observe_cost(int t, double round_ms) {
++    if (!(round_ms > 0)) return;
++    // A stale estimate must not outweigh its first fresh measurement: otherwise infrequent probes can take
++    // hundreds of rounds to undo a few expensive startup samples. Keep the sample count (and startup probe budget).
++    cost_[t] = cost_n_[t] > 0 && cost_age_[t] < kReprobeRounds
++                   ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
++    cost_n_[t] += 1.0;
++    for (int& age : cost_age_) age = std::min(age + 1, kReprobeRounds);
++    cost_age_[t] = 0;
++}
++
+ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
+     t = std::clamp(t, 1, kMaxT);
+-    if (round_ms > 0) {
+-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
+-        cost_n_[t] += 1.0;
+-    }
++    observe_cost(t, round_ms);
+     if (lookup) {
+         const int b = bucket(match);
+         ok_[b] = kDecay * ok_[b] + accepted;
+@@ -119,19 +130,17 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
+         const double r = (e0 + p_mtp * gain) / cost_ms(t_mtp + k);
+         if (r > best) { best = r; best_k = k; }
+     }
+-    if (best_k > 0 && best > base * (1.0 + margin_)) return best_k;
+-    // as choose(): a size whose cost is only guessed is tried a few times when the continuation looks likely
++    const int picked = best_k > 0 && best > base * (1.0 + margin_) ? best_k : 0;
++    // As choose(): probe guessed costs, and occasionally retry stale costs even when a shorter chain pays.
+     const int t_full = t_mtp + kmax;
+-    if (cost_n_[t_full] < kProbes && p_mtp * c >= 0.6) return kmax;
+-    return 0;
++    if (kmax > picked && p_mtp * c >= 0.6 &&
++        ((picked == 0 && cost_n_[t_full] < kProbes) || cost_age_[t_full] >= kReprobeRounds)) return kmax;
++    return picked;
+ }
+ 
+ void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
+     const int t = std::clamp(t_mtp + k, 1, kMaxT);
+-    if (round_ms > 0) {
+-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
+-        cost_n_[t] += 1.0;
+-    }
++    observe_cost(t, round_ms);
+     // the MTP part is an ordinary MTP window as far as its own drafts go
+     const int mtp_acc = std::min(accepted, t_mtp - 1);
+     const double got = mtp_acc + 1.0;
+diff --git a/src/spec/draft_policy_test.cpp b/src/spec/draft_policy_test.cpp
+index 3a7a3e6100..093c821d84 100644
+--- a/src/spec/draft_policy_test.cpp
++++ b/src/spec/draft_policy_test.cpp
+@@ -5,9 +5,11 @@
+ //   2. lookup drafts that are mostly rejected stop being taken (their bucket's rate falls);
+ //   3. lookup drafts that are always accepted are taken, and the window grows with them;
+ //   4. match-length buckets learn separately (short matches failing does not stop long ones);
+-//   5. the policy never proposes a window beyond its cap.
++//   5. the policy never proposes a window beyond its cap;
++//   6. a transient expensive window is retried and relearned, with bounded, confidence-gated probes.
+ #include "strata/spec/draft_policy.hpp"
+ 
++#include <cmath>
+ #include <cstdio>
+ 
+ using strata::spec::DraftPolicy;
+@@ -19,6 +21,64 @@ void check(bool ok, const char* what) {
+     if (!ok) ++g_fail;
+ }
+ double cost(int t) { return 19.0 + 10.5 * (t - 1); }   // ms per round, measured shape
++
++// Synthetic times isolate policy recovery; they are not a GPU throughput benchmark.
++DraftPolicy slow_start(bool chained, bool smaller_lookup = false) {
++    DraftPolicy p(6);
++    for (int t : {2, 3, 5})
++        for (int i = 0; i < 3; ++i)
++            p.observe(false, t, t - 1, 0, smaller_lookup && t == 5 ? 42.0 : 1000.0);
++    for (int i = 0; i < 3; ++i) p.observe(false, 4, 3, 0, 40.0);
++    for (int i = 0; i < 3; ++i) {
++        if (chained) p.observe_chain(4, 2, 5, 40, 1000.0);
++        else p.observe(true, 6, 5, 40, 1000.0);
++    }
++    return p;
++}
++
++void check_recovery(bool chained, bool smaller_lookup, int t_mtp = 4) {
++    DraftPolicy p = slow_start(chained, smaller_lookup);
++    const int initial = chained ? 4 + p.chain(4, 1.0, 2, 40) : p.choose(t_mtp, 5, 40).t;
++    check(initial == (smaller_lookup ? 5 : 4), "slow start: the expensive full window is initially avoided");
++    int full = 0;
++    bool settled = true;
++    for (int i = 0; i < 256; ++i) {
++        const auto pick = p.choose(t_mtp, 5, 40);
++        const int k = chained ? p.chain(4, 1.0, 2, 40) : 0;
++        const int t = chained ? 4 + k : pick.t;
++        if (t == 6) ++full;
++        if (i >= 128 && t != 6) settled = false;
++        const double ms = t == 4 ? 40.0 : 40.0 + 2.0 * (t - 4);
++        if (chained && k > 0) p.observe_chain(4, k, t - 1, 40, ms);
++        else p.observe(chained ? false : pick.lookup, t, t - 1, 40, ms);
++    }
++    std::printf("    %s, MTP=%d, %s: %d / 256 full windows after the slow start\n",
++                chained ? "chain" : "lookup", t_mtp, smaller_lookup ? "smaller lookup wins" : "MTP wins", full);
++    check(settled, "stale cost: recovery settles on the now-cheap full window");
++    check(p.cost_ms(6) < 45.0, "stale cost: the new measurement replaces the transient cost");
++}
++
++void check_expensive_probes(bool chained) {
++    DraftPolicy p = slow_start(chained);
++    int probes = 0, last_probe = -65;
++    bool spaced = true;
++    for (int i = 0; i < 256; ++i) {
++        const auto pick = p.choose(4, 5, 40);
++        const int k = chained ? p.chain(4, 1.0, 2, 40) : 0;
++        const int t = chained ? 4 + k : pick.t;
++        const bool full = t == 6;
++        probes += full;
++        if (full) {
++            spaced &= i - last_probe >= 65;
++            last_probe = i;
++        }
++        if (chained && k > 0) p.observe_chain(4, k, t - 1, 40, 1000.0);
++        else p.observe(chained ? false : pick.lookup, t, t - 1, 40, full ? 1000.0 : 40.0);
++    }
++    check(probes > 0 && probes <= 4 && spaced,
++          "persistently expensive: at most 4 isolated re-probes in 256 rounds");
++    check(p.cost_ms(6) == 1000.0, "persistently expensive: re-probes keep the measured cost");
++}
+ }  // namespace
+ 
+ int main() {
+@@ -75,6 +135,39 @@ int main() {
+         check(q.chain(4, 0.9, 3, 4) == 0, "chain: dear rows, never accepted -> none");
+         check(q.chain(4, 0.9, 0, 4) == 0 && q.chain(8, 1.0, 3, 40) == 0, "chain: nothing proposed / no room -> none");
+     }
++    for (bool chained : {false, true}) {
++        check_recovery(chained, false);
++        check_recovery(chained, true);   // a profitable smaller lookup must not starve the full window
++        check_expensive_probes(chained);
++        DraftPolicy p = slow_start(chained);
++        for (int i = 0; i < 256; ++i) p.observe(false, 4, 3, 0, 40.0);
++        if (chained) p.observe_chain(4, 2, 5, 40, 0.0);
++        else p.observe(true, 6, 5, 40, 0.0);
++        const int t = chained ? 4 + p.chain(4, 1.0, 2, 40) : p.choose(4, 5, 40).t;
++        check(t == 6 && p.cost_ms(6) == 1000.0, "untimed observation does not refresh a stale cost");
++        if (chained) p.observe_chain(4, 2, 5, 40, 44.0);
++        else p.observe(true, 6, 5, 40, 44.0);
++        check(p.cost_ms(6) == 44.0, "first fresh observation replaces the stale cost exactly");
++        if (chained) p.observe_chain(4, 2, 5, 40, 54.0);
++        else p.observe(true, 6, 5, 40, 54.0);
++        check(std::abs(p.cost_ms(6) - 45.0) < 1e-9, "subsequent fresh observation resumes the ordinary cost EMA");
++    }
++    check_recovery(false, true, 6);   // the full lookup need not be larger than the requested MTP window
++    {
++        DraftPolicy p = slow_start(false);
++        for (int i = 0; i < 256; ++i) {
++            p.choose(4, 5, 40);   // decisions without a timed observation do not age costs
++            p.observe(false, 4, 3, 0, i % 2 ? 0.0 : -1.0);
++        }
++        check(!p.choose(4, 5, 40).lookup, "untimed rounds and repeated decisions do not trigger a re-probe");
++        for (int i = 0; i < 256; ++i) p.observe(false, 4, 3, 0, 40.0);
++        check(!p.choose(4, 0, 40).lookup, "stale cost: no proposal still keeps the MTP window");
++        check(!p.choose(4, 5, 4).lookup, "stale cost: low-confidence lookup is not forced");
++        check(p.chain(4, 0.0, 2, 40) == 0, "stale cost: low-probability MTP does not force a chain");
++        check(p.chain(4, 1.0, 2, 4) == 0, "stale cost: low-confidence chain is not forced");
++        check(p.chain(4, 1.0, 0, 40) == 0 && p.chain(6, 1.0, 2, 40) == 0,
++              "stale cost: no chain proposal / no room still means none");
++    }
+     std::printf(g_fail ? "FAIL\n" : "PASS\n");
+     return g_fail ? 1 : 0;
+ }

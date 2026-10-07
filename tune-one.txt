@@ -1,0 +1,4 @@
+# solution IDs are scoped to this hipBLASLt version and device architecture
+STRATA_HIPBLASLT_TUNING_V1 gfx1100 100500
+f16 12288 2560 12288 8192 2106
+bf16 12288 2560 12288 8192 1036

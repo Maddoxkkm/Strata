@@ -1,0 +1,95 @@
+
+====================================================================================================
+#1289 hip: the gfx1100 100401 table covers the small-T expert GEMM (prompt +31.9%)
+  base 82f46a8 (== our HEAD: applies as-is) | +26/-0 in 2 file(s) | created 2026-10-07
+  dirs: docs, tools/hip
+  knobs: STRATA_HIPBLASLT_VERBOSE
+  numbers in the diff: +27.6 %, +31.9 %, 2.3 %
+  added lines mention hip/amd 2x vs cuda/nvml 0x
+
+====================================================================================================
+#1297 HIP: on-device autotuning for gfx1100 decode (kernel shapes, draft and CPU settings)
+  base 82f46a8 (== our HEAD: applies as-is) | +2078/-75 in 15 file(s) | created 2026-10-07
+  dirs: CMakeLists.txt, docs, include/strata, setup.py, src/kernels, src/program, tests/core, tools
+  knobs: STRATA_DECODE_TIMING, STRATA_DECODE_TUNING, STRATA_DECODE_TUNING_V1, STRATA_DECODE_TUNING_VERBOSE, STRATA_DECODE_VARIANTS, STRATA_DOWN, STRATA_D_FMTS, STRATA_ENABLE_HIP, STRATA_EXPERT_ROWS_VARIANTS, STRATA_EXPERT_V2
+  flags: --adapt-every, --build, --calibrate, --calibrate-draft, --calibrate-prompts, --draft, --expert, --force, --help, --hit-frac
+  numbers in the diff: -1%, -5%, 0.2%, 3%
+  added lines mention hip/amd 118x vs cuda/nvml 14x
+
+====================================================================================================
+#1323 prefill: batched unbuffered stager reads; close the experts.bin view once reads are unbuff
+  base 82f46a8 (== our HEAD: applies as-is) | +121/-16 in 4 file(s) | created 2026-10-07
+  dirs: include/strata, src/core, src/prefill, src/program
+  knobs: STRATA_KEEP_MAPPING, STRATA_STAGER_BATCH
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1282 prefill: STRATA_PREFILL_CPU_SHARE=auto hands a small chunk's least-routed experts to the i
+  base 82f46a8 (== our HEAD: applies as-is) | +196/-4 in 3 file(s) | created 2026-10-07
+  dirs: include/strata, src/prefill, src/program
+  knobs: STRATA_PREFILL_CPU_SHARE
+  added lines mention hip/amd 0x vs cuda/nvml 5x
+
+====================================================================================================
+#1283 prefill: bytes_needed sizes the MoE buffers for the layout init picks (with or without an 
+  base 82f46a8 (== our HEAD: applies as-is) | +27/-21 in 3 file(s) | created 2026-10-07
+  dirs: include/strata, src/prefill, src/program
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1181 perf(expert): the verify window's GPU plan in O(n) instead of O(n^2)
+  base 82f46a8 (== our HEAD: applies as-is) | +551/-88 in 4 file(s) | created 2026-10-06
+  dirs: CMakeLists.txt, include/strata, src/core, tests/core
+  flags: --remote-expert-opt
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1133 prefill: the advisory VRAM plan - the startup arithmetic says what it sees, and only warns
+  base 82f46a8 (== our HEAD: applies as-is) | +1650/-45 in 8 file(s) | created 2026-10-06
+  dirs: CMakeLists.txt, docs, include/strata, src/prefill, src/program, tests/core
+  knobs: STRATA_ADVISORY_PLAN, STRATA_OWNED_PRICE, STRATA_POSTTOUCH, STRATA_PREFILL_LEND_PCT, STRATA_RING_BYTES
+  flags: --expert-cache, --expert-cache-per-layer, --kv-resident, --max-context, --no-prefill-borrow, --pipeline-windows, --prefill, --spec, --vram-reserve-mib
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1184 AMD HIP: the primary ordinal, and the helper caches beside the resident RAM mode
+  base 82f46a8 (== our HEAD: applies as-is) | +161/-18 in 8 file(s) | created 2026-10-06
+  dirs: cmake, docs, include/strata, src/core, src/program
+  knobs: STRATA_HIP_ARCHS, STRATA_PRIMARY_DEVICE, STRATA_REMOTE_SPIN
+  flags: --expert-cache-device1, --resident-experts, --split-device
+  numbers in the diff: -18%
+  added lines mention hip/amd 6x vs cuda/nvml 4x
+
+====================================================================================================
+#1209 Speed up concurrent generation, fix QFUSE, and improve prefill monitoring
+  base 82f46a8 (== our HEAD: applies as-is) | +3360/-130 in 47 file(s) | created 2026-10-06
+  dirs: CMakeLists.txt, docs, docs/evidence, include/strata, serve, src/core, src/kernels, src/program
+  knobs: STRATA_BATCH_DENSE_PARALLEL, STRATA_BATCH_DENSE_PROFILE, STRATA_BUILD_TESTS, STRATA_ENABLE_CUDA, STRATA_ENABLE_HIP, STRATA_HIP_GFX906, STRATA_IQ_MT_MIN, STRATA_NATIVE_EXPERTS, STRATA_QFUSE, STRATA_USE_HIP
+  flags: --arm, --batch, --batch-adapt, --batch-draft-overlap, --batch-expert-merge, --batch-mtp, --batch-pcie-frac, --batch-prefill-chunk, --batch-prefill-rows, --batch-rows
+  numbers in the diff: 0.010%, 0.0975%, 300.0000%, 5.000%, 50%, 50.000%, 59.5%, 7.1852%, 86.1097%, 87.2055%
+  added lines mention hip/amd 15x vs cuda/nvml 13x
+
+====================================================================================================
+#1109 docs(hip): GPU_PINNED_MIN_XFER_SIZE=1048576 stopped our gfx1030 mmap-experts stalls (#267,
+  base 82f46a8 (== our HEAD: applies as-is) | +24/-0 in 2 file(s) | created 2026-10-06
+  dirs: docs
+  flags: --mmap-experts
+  added lines mention hip/amd 3x vs cuda/nvml 0x
+
+====================================================================================================
+#1296 hip: chunk-parallel GDN recurrence (WY form), two parity-gated arms (STRATA_GDN_WY)
+  base 82f46a8 (== our HEAD: applies as-is) | +1559/-2 in 6 file(s) | created 2026-10-07
+  dirs: CMakeLists.txt, src/prefill
+  knobs: STRATA_ENABLE_CUDA, STRATA_ENABLE_HIP, STRATA_GDN_WY, STRATA_GDN_WY_HAVE_ROCWMMA
+  flags: --bench
+  numbers in the diff: 2 %
+  added lines mention hip/amd 7x vs cuda/nvml 2x
+
+====================================================================================================
+#1298 hip: the gfx110x fp16 (rocWMMA) qsa-select scorer arm (STRATA_SELECT_WMMA)
+  base 82f46a8 (== our HEAD: applies as-is) | +531/-1 in 4 file(s) | created 2026-10-07
+  dirs: CMakeLists.txt, include/strata, src/kernels
+  knobs: STRATA_BUILD_TESTS, STRATA_ENABLE_HIP, STRATA_PARITY_QSA_SELECT_WMMA, STRATA_QSA_HAVE_ROCWMMA, STRATA_ROCWMMA_INCLUDE_DIR
+  flags: --selftest
+  numbers in the diff: 100%, 3 %, 37 %, 53 %
+  added lines mention hip/amd 27x vs cuda/nvml 3x

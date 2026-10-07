@@ -1,0 +1,1233 @@
+diff --git a/bench/results/2026-10-07-community-r9700/README.md b/bench/results/2026-10-07-community-r9700/README.md
+new file mode 100644
+index 0000000000..b8f1646fcb
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/README.md
+@@ -0,0 +1,177 @@
++# Community benchmark: AMD Radeon AI PRO R9700, Ryzen AI 9 HX 370
++
++Measured on 2026-10-07 by [alexhegit](https://github.com/alexhegit). This tests
++Strata 0.1.40 with the original Flash-Next IQ2_XS, one GPU, and a 131,072-token
++context limit. The desktop is on this GPU, so setup reserved 3,072 MiB of VRAM.
++
++Two sweeps used the same script. With the default prompt kernel, median decode
++was **94.1 tok/s at 4,096 prompt tokens and 86.1 tok/s at 32,768**. The server
++was then restarted with `STRATA_HIP_WMMA=1`. Median prompt throughput became
++**1,486.0 tok/s at 4,096 and 2,128.4 tok/s at 32,768**; decode stayed at 91.6
++and 89.7 tok/s. These are synthetic code-explanation requests with greedy
++decoding and a 256-token output cap. They do not establish general answer
++quality or performance on other workloads. A 128,000-token prompt and the recall
++check were not run.
++
++## Hardware and software
++
++- AMD Radeon AI PRO R9700 (gfx1201), PCI `0000:c8:00.0`, device `0x7551`.
++  The server reported 32,624 MiB of VRAM. The display is connected to this card.
++  The negotiated link was 32.0 GT/s, 16 lanes. The engine's startup transfer
++  probe reported 7.2 GB/s host-to-device and set `pcie_frac` to 0.20.
++  GPU clocks were not fixed. One status sample before the sweep showed 63 C
++  and 90 W; that sample is not a load measurement.
++- The integrated Radeon 890M (gfx1150) was present and was not used.
++- AMD Ryzen AI 9 HX 370, 12 cores / 24 threads, AVX2 and AVX-512. The engine
++  used 11 expert-pool workers on logical processors 1–11 and the host thread
++  on processor 0.
++- Setup's check printed 47 GB of RAM. The server later reported 46.7 GiB.
++  Model files were on the NVMe that holds `/home`. Experts loaded at 3.38 GiB/s.
++- Ubuntu 24.04.3, kernel 6.17.0-1025-oem, amdgpu DKMS 6.16.13.
++- Source commit `82f46a8c8f475f001ad76d92f58f4a4f8ffb0253`. Engine 0.1.40,
++  compiled here for gfx1201 (`-DSTRATA_ENABLE_HIP=ON`,
++  `-DCMAKE_HIP_ARCHITECTURES=gfx1201`, `-DSTRATA_PREFILL_MMQ=ON`).
++- The compiler and runtime were ROCm 7.14.0 from rocm-cli's TheRock wheels
++  (HIP 7.14.60850, hipBLASLt 1.4.1), selected with `ROCM_PATH`. Strata ships
++  no gfx1201 hipBLASLt table for 1.4.1, so prompt GEMMs used plain hipBLAS.
++  `/opt/rocm` stayed at 7.2.0 and was not used to compile this engine.
++  The kernel driver was not replaced.
++- Python 3.12.3 from `/usr/bin` (the virtualenv). The server listened on
++  `127.0.0.1:8080` with no API key. Other desktop programs kept running.
++
++## Model and configuration
++
++Model: `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`, the revision setup pins,
++`ed59f92082b1e93c0e96d60a8b11aab089b52f09`:
++
++- `IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf`
++- `IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf`
++
++Setup downloaded those files through `HF_ENDPOINT=https://hf-mirror.com`.
++The GGUF bytes were not hashed again against the revision's LFS hashes for
++this report. MTP is the draft the installer placed under the data directory's
++`mtp/rt`. Its upstream revision was not recorded separately.
++
++The unmodified installer prepared the native IQ2_XS pack. Images were off.
++The bundled expert profile was used without calibration.
++
++- Context 131,072; INT8 KV.
++- Expert cache `auto`: 16,711 slots, 22.41 GiB of VRAM, profile-prefilled,
++  **no eviction**. Startup left 25.55 GiB free and reserved 3,072 MiB, plus
++  143 MiB for the draft head. After load, 2,982 MiB of VRAM was free.
++- Prefill `auto` selected chunks of 8,192 tokens. The default run borrowed
++  3,107 cache slots (4.18 GiB) and used a 384-slot ring. With
++  `STRATA_HIP_WMMA=1` the ring was 96 slots and the prompt path borrowed 2,804
++  slots (3.77 GiB).
++- MTP `--spec 4 --spec-min-p 0.5`.
++- Experimental speed projection off. Recorded timings have `projection: null`.
++- Reasoning disabled, temperature 0, maximum 256 generated tokens per speed run.
++
++The measured configuration is [strata-iq2_xs.json](strata-iq2_xs.json).
++Startup lines, before any request, are in [engine-startup.txt](engine-startup.txt).
++
++## Method
++
++The script is the one shipped with the
++[RTX 5090 report](../2026-09-30-community-rtx-5090/benchmark.py). It builds a
++synthetic Python prompt, counts tokens with Strata's tokenizer, and checks the
++count against the server. This run asked only for 4,096 and 32,768 tokens:
++
++```bash
++.venv/bin/python bench/results/2026-09-30-community-rtx-5090/benchmark.py \
++  --root . \
++  --pack /home/alex/HF-MODEL/packs/iq2_xs \
++  --url http://127.0.0.1:8080 \
++  --out /tmp/strata-iq2xs-bench \
++  --targets 4096,32768 \
++  --runs 3
++```
++
++One short warm-up request was excluded. Three runs at each length ran serially,
++shorter length first, on the same loaded engine. All six requests read the whole
++prompt: **zero reused tokens**. The expert cache was filled at startup and kept
++between requests. Loading time is excluded.
++
++Streaming TTFT is the time from just before the HTTP request until the first
++nonempty text delta. Total time ends when the stream finishes. Both include
++loopback HTTP. Prompt tok/s is freshly read tokens divided by `prompt_ms`.
++Decode tok/s is `engine_generated / decode_ms`.
++
++[initial-status.json](initial-status.json) is the status the script saved before
++the sweep. Its `last_timings` field is an earlier 7,253-token request from the
++same session, not one of the six runs below.
++
++## Results, default prompt attention
++
++`STRATA_HIP_WMMA` was unset. Each cell is the median **[minimum–maximum]** of
++three runs. Every request generated 256 tokens and stopped at the output limit.
++
++| Prompt tokens | Reused | Prompt tok/s | Decode tok/s | TTFT seconds | Total seconds |
++| ---: | ---: | ---: | ---: | ---: | ---: |
++| 4,096 | 0 | 1,270.3 [1,234.9–1,280.3] | 94.1 [90.6–94.7] | 3.256 [3.231–3.349] | 6.034 [5.933–6.063] |
++| 32,768 | 0 | 1,574.1 [1,571.3–1,577.9] | 86.1 [85.3–94.2] | 20.875 [20.837–20.927] | 23.824 [23.575–23.881] |
++
++Per-run records, including draft counts and the answer text:
++[results.json](results.json). Aggregates: [summary.json](summary.json).
++Decode expert-cache hit rate on these six requests was 96.6–99.2%.
++
++At 4,096 tokens the engine accepted 157, 157, and 156 drafts (of 219, 218, and
++227). At 32,768 it accepted 144, 145, and 157 (of 192, 210, and 212).
++
++## Results, `STRATA_HIP_WMMA=1`
++
++The engine was stopped and started again with `STRATA_HIP_WMMA=1` in its
++environment. Everything else in the configuration stayed the same. Startup
++selected a 96-slot ring; the first prompt logged
++`STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1201)`.
++That startup is [engine-startup-wmma.txt](engine-startup-wmma.txt). Status
++before this sweep, with no earlier request in the new process, is
++[initial-status-wmma.json](initial-status-wmma.json).
++
++The same script wrote to a separate directory:
++
++```bash
++STRATA_HIP_WMMA=1 .venv/bin/python bench/results/2026-09-30-community-rtx-5090/benchmark.py \
++  --root . \
++  --pack /home/alex/HF-MODEL/packs/iq2_xs \
++  --url http://127.0.0.1:8080 \
++  --out /tmp/strata-iq2xs-bench-wmma \
++  --targets 4096,32768 \
++  --runs 3
++```
++
++| Prompt tokens | Reused | Prompt tok/s | Decode tok/s | TTFT seconds | Total seconds |
++| ---: | ---: | ---: | ---: | ---: | ---: |
++| 4,096 | 0 | 1,486.0 [1,199.3–1,491.6] | 91.6 [80.2–96.6] | 2.787 [2.780–3.448] | 5.557 [5.419–6.624] |
++| 32,768 | 0 | 2,128.4 [2,124.2–2,134.2] | 89.7 [87.8–99.5] | 15.456 [15.448–15.493] | 18.286 [18.011–18.390] |
++
++Per-run records: [results-wmma.json](results-wmma.json). Aggregates:
++[summary-wmma.json](summary-wmma.json). Decode expert-cache hit rate on these
++six requests was 96.2–99.3%.
++
++The 4,096 minimum is the first run (prompt 1,199.3 tok/s, decode 80.2 tok/s).
++The other two 4,096 prompts were 1,486.0 and 1,491.6 tok/s. The three 32,768
++prompts sit between 2,124.2 and 2,134.2 tok/s.
++
++At 4,096 tokens the engine accepted 156, 163, and 152 drafts (of 220, 218, and
++232). At 32,768 it accepted 150, 153, and 166 (of 216, 213, and 208).
++
++Against the default sweep on this machine, median prompt throughput was 17%
++higher at 4,096 tokens and 35% higher at 32,768. Median time to the first token
++at 32,768 fell from 20.875 s to 15.456 s. Decode medians stayed in the same
++band. The repository documents that this kernel is not bitwise-identical to the
++default prompt attention: greedy text can diverge from about token 50. This
++report records speed only.
++
++## Not measured
++
++128,000-token prompts and `tools/needle_bench.py` were not run. When the sweep
++started, the server reported 38.6 GiB of 46.7 GiB RAM in use.
++
++This is one machine, one quantization, and a small synthetic workload. Long
++output, sampled decoding, thinking, coding-task correctness, vision, tool use,
++concurrency, and a sustained thermal run were not evaluated. No second GPU was
++measured on this PC, so these numbers do not replace the RTX 5070 row in
++[DETAILS.md](../../../docs/DETAILS.md), the RTX 5090 report linked above, or the
++R9700 Coder IQ1_M table in [AMD_HIP.md](../../../docs/AMD_HIP.md). Those used
++other engines, CPUs, and protocols.
+diff --git a/bench/results/2026-10-07-community-r9700/engine-startup-wmma.txt b/bench/results/2026-10-07-community-r9700/engine-startup-wmma.txt
+new file mode 100644
+index 0000000000..e14ddf8a5d
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/engine-startup-wmma.txt
+@@ -0,0 +1,38 @@
++[strata] 2026-10-07 15:04:46 engine started: /home/alex/Repo/Strata/engine/strata --serve --pack /home/alex/HF-MODEL/packs/iq2_xs --native /home/alex/HF-MODEL/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf --ple-gguf /home/alex/HF-MODEL/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf --expert-profile /home/alex/Repo/Strata/data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp /home/alex/HF-MODEL/mtp/rt --max-context 131072 --kv int8 --vram-reserve-mib 3072
++strata generate: PCIe probe: 7.2 GB/s host->device (best of 7.2 7.2 7.2 7.2) -> pcie_frac 0.20 (default 0.55)
++strata generate: native pack: /home/alex/HF-MODEL/packs/iq2_xs experts (largest blob 1.51 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.2 s)
++strata generate: 1466 MiB of weights loaded from /home/alex/HF-MODEL/packs/iq2_xs in 0.8 s (302 canonical tensors skipped: served natively)
++strata generate: 300 native projection matrices, 1474.85 MiB of weights, in 0.8 s
++strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
++strata generate: profile /home/alex/Repo/Strata/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
++strata generate: PLE on, table 320001536 rows of /home/alex/HF-MODEL/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf
++strata mtp: draft layer loaded, 950 MiB of VRAM (experts 675, dense 111), files read in 0.39 s (2033 MiB/s)
++strata generate: experimental native Q5_K head, 337715200 bytes, in 0.1 s
++strata generate: GPU 0: AMD Radeon AI PRO R9700 (gfx1201)
++strata generate: expert arena read through the file cache (buffered (not Windows))
++strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (needed 16907 2 MiB pages, vm.nr_hugepages=0); transparent huge pages requested (MADV_HUGEPAGE)
++strata generate: loaded 33.02 GiB at 3.41 GiB/s
++strata generate: 11 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11, the host thread on 0 (draining too) (--host-core first)
++strata generate: expert cache auto: 25.55 GiB free, 3072 MiB reserved (+143 MiB for the draft head) -> 15931 slots
++strata generate: expert cache 16711 slots, 22.41 GiB of VRAM; policy is
++strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
++                 so a reply can differ slightly from a run without the cache (same quality:
++                 bench/results/2026-09-27-cache-parity).
++                 PROFILE, ranked by routing frequency, no eviction.
++strata generate: pre-filled 16711 of 16711 slots from the profile in 5.7 s (4193 MB/s); slot 0 verified
++strata generate: R4 hit path ON - resident experts are computed on the GPU
++strata generate: 11 expert-pool workers + the host thread
++strata generate: session is up (engine 0.1.40)
++strata generate: token graph hit path: 16711 resident experts, decided on the device
++strata serve: prompt chunk auto: 8192 tokens, a 96-slot ring
++strata serve: the prompt path borrows 2804 CUDA0 cache slots (3.77 GiB)
++strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
++strata verify: window up to 6 tokens, 57.4 MiB of device buffers
++strata mtp: draft head over 106299 tokens (137.9 MiB)
++strata serve: 2982 MiB of VRAM free with everything loaded
++strata verify: captured the 6-token window (upload no error, sync no error)
++strata verify: captured the 1-token window (upload no error, sync no error)
++strata verify: captured the 4-token window (upload no error, sync no error)
++strata serve: prompt 19 tokens = 0 reused + 19 read in 201 ms (94.5 tok/s), 2 generated in 70 ms (28.6 tok/s), drafts accepted 3 of 3, 1 checkpoints
++strata serve: decode expert cache hit rate: 84.5% (1997 hits / 2362 lookups); 38 more read by the GPU over PCIe or from another GPU (1.6% of all 2400 routed)
++strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1201)
+diff --git a/bench/results/2026-10-07-community-r9700/engine-startup.txt b/bench/results/2026-10-07-community-r9700/engine-startup.txt
+new file mode 100644
+index 0000000000..a9575c49f1
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/engine-startup.txt
+@@ -0,0 +1,37 @@
++[strata] 2026-10-07 12:16:26 engine started: /home/alex/Repo/Strata/engine/strata --serve --pack /home/alex/HF-MODEL/packs/iq2_xs --native /home/alex/HF-MODEL/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf --ple-gguf /home/alex/HF-MODEL/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf --expert-profile /home/alex/Repo/Strata/data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp /home/alex/HF-MODEL/mtp/rt --max-context 131072 --kv int8 --vram-reserve-mib 3072
++strata generate: PCIe probe: 7.2 GB/s host->device (best of 7.2 7.1 7.2 7.2) -> pcie_frac 0.20 (default 0.55)
++strata generate: native pack: /home/alex/HF-MODEL/packs/iq2_xs experts (largest blob 1.51 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.1 s)
++strata generate: 1466 MiB of weights loaded from /home/alex/HF-MODEL/packs/iq2_xs in 0.3 s (302 canonical tensors skipped: served natively)
++strata generate: 300 native projection matrices, 1474.85 MiB of weights, in 0.7 s
++strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
++strata generate: profile /home/alex/Repo/Strata/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
++strata generate: PLE on, table 320001536 rows of /home/alex/HF-MODEL/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf
++strata mtp: draft layer loaded, 950 MiB of VRAM (experts 675, dense 111), files read in 0.21 s (3801 MiB/s)
++strata generate: experimental native Q5_K head, 337715200 bytes, in 0.1 s
++strata generate: GPU 0: AMD Radeon AI PRO R9700 (gfx1201)
++strata generate: expert arena read through the file cache (buffered (not Windows))
++strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (needed 16907 2 MiB pages, vm.nr_hugepages=0); transparent huge pages requested (MADV_HUGEPAGE)
++strata generate: loaded 33.02 GiB at 3.38 GiB/s
++strata generate: 11 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11, the host thread on 0 (draining too) (--host-core first)
++strata generate: expert cache auto: 25.55 GiB free, 3072 MiB reserved (+143 MiB for the draft head) -> 15931 slots
++strata generate: expert cache 16711 slots, 22.41 GiB of VRAM; policy is
++strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
++                 so a reply can differ slightly from a run without the cache (same quality:
++                 bench/results/2026-09-27-cache-parity).
++                 PROFILE, ranked by routing frequency, no eviction.
++strata generate: pre-filled 16711 of 16711 slots from the profile in 5.4 s (4437 MB/s); slot 0 verified
++strata generate: R4 hit path ON - resident experts are computed on the GPU
++strata generate: 11 expert-pool workers + the host thread
++strata generate: session is up (engine 0.1.40)
++strata generate: token graph hit path: 16711 resident experts, decided on the device
++strata serve: prompt chunk auto: 8192 tokens, a 384-slot ring
++strata serve: the prompt path borrows 3107 CUDA0 cache slots (4.18 GiB)
++strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
++strata verify: window up to 6 tokens, 57.4 MiB of device buffers
++strata mtp: draft head over 106299 tokens (137.9 MiB)
++strata serve: 2982 MiB of VRAM free with everything loaded
++strata verify: captured the 6-token window (upload no error, sync no error)
++strata verify: captured the 5-token window (upload no error, sync no error)
++strata verify: captured the 1-token window (upload no error, sync no error)
++strata verify: captured the 2-token window (upload no error, sync no error)
++strata verify: captured the 4-token window (upload no error, sync no error)
+diff --git a/bench/results/2026-10-07-community-r9700/initial-status-wmma.json b/bench/results/2026-10-07-community-r9700/initial-status-wmma.json
+new file mode 100644
+index 0000000000..269a0d2c87
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/initial-status-wmma.json
+@@ -0,0 +1,61 @@
++{
++  "service": "strata",
++  "model": "qwen3.8-flash-next-iq2_xs",
++  "loaded": true,
++  "auto_load": true,
++  "structured_output": {
++    "formats": [
++      "json_object",
++      "json_schema"
++    ],
++    "method": "prompt_and_validate",
++    "constrained_decoding": false,
++    "stream_buffered": true
++  },
++  "engine": "0.1.40",
++  "started": 1791356708,
++  "uptime_s": 16,
++  "cache_max_tokens": 131072,
++  "context": {
++    "native": 131072,
++    "max_positions": 131072
++  },
++  "concurrency": {
++    "serving": 1,
++    "requested": 1
++  },
++  "dialects": [
++    "/v1/chat/completions",
++    "/v1/messages",
++    "/v1/responses"
++  ],
++  "vision": {
++    "enabled": false,
++    "available": false,
++    "error": null
++  },
++  "activity": {
++    "requests": 0,
++    "in_flight": 0,
++    "last_request_at": null
++  },
++  "last_timings": null,
++  "vram": {
++    "elastic": false
++  },
++  "machine": {
++    "at": 1791356724,
++    "gpu": {
++      "name": "AMD Radeon",
++      "used_mib": 29966.0,
++      "total_mib": 32624.0,
++      "util_pct": 100,
++      "temp_c": 63.0,
++      "power_w": 90.0
++    },
++    "ram": {
++      "used_gib": 37.7,
++      "total_gib": 46.7
++    }
++  }
++}
+diff --git a/bench/results/2026-10-07-community-r9700/initial-status.json b/bench/results/2026-10-07-community-r9700/initial-status.json
+new file mode 100644
+index 0000000000..71df9b2d06
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/initial-status.json
+@@ -0,0 +1,74 @@
++{
++  "service": "strata",
++  "model": "qwen3.8-flash-next-iq2_xs",
++  "loaded": true,
++  "auto_load": true,
++  "structured_output": {
++    "formats": [
++      "json_object",
++      "json_schema"
++    ],
++    "method": "prompt_and_validate",
++    "constrained_decoding": false,
++    "stream_buffered": true
++  },
++  "engine": "0.1.40",
++  "started": 1791346608,
++  "uptime_s": 2102,
++  "cache_max_tokens": 131072,
++  "context": {
++    "native": 131072,
++    "max_positions": 131072
++  },
++  "concurrency": {
++    "serving": 1,
++    "requested": 1
++  },
++  "dialects": [
++    "/v1/chat/completions",
++    "/v1/messages",
++    "/v1/responses"
++  ],
++  "vision": {
++    "enabled": false,
++    "available": false,
++    "error": null
++  },
++  "activity": {
++    "requests": 11,
++    "in_flight": 0,
++    "last_request_at": 1791348374
++  },
++  "last_timings": {
++    "cache_n": 0,
++    "prompt_n": 7253,
++    "prompt_ms": 4863.8,
++    "prompt_per_token_ms": 0.671,
++    "prompt_per_second": 1491.2,
++    "predicted_n": 128,
++    "predicted_ms": 1447.4,
++    "predicted_per_token_ms": 11.308,
++    "predicted_per_second": 88.4,
++    "draft_n": 109,
++    "draft_n_accepted": 80,
++    "at": 1791348374
++  },
++  "vram": {
++    "elastic": false
++  },
++  "machine": {
++    "at": 1791348711,
++    "gpu": {
++      "name": "AMD Radeon",
++      "used_mib": 30088.0,
++      "total_mib": 32624.0,
++      "util_pct": 100,
++      "temp_c": 63.0,
++      "power_w": 90.0
++    },
++    "ram": {
++      "used_gib": 38.6,
++      "total_gib": 46.7
++    }
++  }
++}
+diff --git a/bench/results/2026-10-07-community-r9700/results-wmma.json b/bench/results/2026-10-07-community-r9700/results-wmma.json
+new file mode 100644
+index 0000000000..f80f88a1e7
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/results-wmma.json
+@@ -0,0 +1,289 @@
++[
++  {
++    "label": "warmup",
++    "expected_prompt_tokens": null,
++    "request_sha256": "b63e57873441a996a529b246a66cf12de70a7c671777f99329354d5c195f788f",
++    "client_ttft_s": 0.23149733700120123,
++    "client_elapsed_s": 0.2768600230010634,
++    "finish_reason": "stop",
++    "usage": {
++      "prompt_tokens": 19,
++      "completion_tokens": 2,
++      "total_tokens": 21,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791356724.9711437,
++      "duration_s": 0.3,
++      "finish": "stop",
++      "prompt_tokens": 19,
++      "reused": 0,
++      "output_tokens": 2,
++      "prompt_total": 19,
++      "prompt_read": 19,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 2,
++      "prompt_ms": 201.0,
++      "decode_ms": 70.0,
++      "decode_tok_s": 28.6,
++      "hit_rate": 0.845,
++      "pcie_share": 0.016,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 3,
++      "drafts_accepted": 3
++    },
++    "text": "READY"
++  },
++  {
++    "label": "tokens-4096-run-1",
++    "expected_prompt_tokens": 4096,
++    "request_sha256": "5d94c652067354bbe72930d2bdad3886564f08cf2546b32411af02d33ad3ce05",
++    "client_ttft_s": 3.4480344759977015,
++    "client_elapsed_s": 6.624254053996992,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 4096,
++      "completion_tokens": 256,
++      "total_tokens": 4352,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791356725.7951624,
++      "duration_s": 6.6,
++      "finish": "length",
++      "prompt_tokens": 4096,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 4096,
++      "prompt_read": 4096,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 3415.2,
++      "decode_ms": 3194.0,
++      "decode_tok_s": 80.2,
++      "hit_rate": 0.962,
++      "pcie_share": 0.001,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 220,
++      "drafts_accepted": 156
++    },
++    "text": "# Analysis of Synthetic Python Module: Deterministic Integer Transforms\n\nThe provided Python module consists of a series of functions, `task_00000` through `task_00112`, each implementing a specific deterministic integer transformation. While the code appears repetitive, it serves as a clear example of modular arithmetic, function design, and the trade-offs between explicit implementation and algorithmic abstraction. Below is a detailed discussion of the code\u2019s structure, mathematical properties, testing implications, and maintainability concerns.\n\n## 1. Mathematical Structure and Deterministic Transforms\n\nEach function in the module follows a consistent pattern:\n```python\ndef task_XXXXX(value: int) -> int:\n    return (value * multiplier + addend) % 100003\n```\n\nThis is a **linear congruential transformation** modulo a prime number (100003). The general form is:\n$$ f(x) = (a \\cdot x + b) \\mod m $$\nwhere:\n- $a$ is the multiplier,\n- $b$ is the addend,\n- $m = 100003$ is the modulus.\n\n### Key Observations:\n"
++  },
++  {
++    "label": "tokens-4096-run-2",
++    "expected_prompt_tokens": 4096,
++    "request_sha256": "8da8a04e70e4d916f6630729082bdfb9d6ebbb47117aad60bc0541bce198a213",
++    "client_ttft_s": 2.786707668001327,
++    "client_elapsed_s": 5.418891915000131,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 4096,
++      "completion_tokens": 256,
++      "total_tokens": 4352,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791356733.0028188,
++      "duration_s": 5.4,
++      "finish": "length",
++      "prompt_tokens": 4096,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 4096,
++      "prompt_read": 4096,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 2756.4,
++      "decode_ms": 2650.0,
++      "decode_tok_s": 96.6,
++      "hit_rate": 0.984,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 218,
++      "drafts_accepted": 163
++    },
++    "text": "# Analysis of Synthetic Python Module: Deterministic Integer Transforms\n\nThe provided Python module consists of a series of functions, `task_00000` through `task_00112`, each implementing a specific deterministic integer transformation. While the code appears repetitive, it serves as a clear example of modular arithmetic, function design, and the trade-offs between explicit implementation and algorithmic abstraction. Below is a detailed discussion of the code's structure, mathematical properties, testing implications, naming conventions, complexity, and maintainability.\n\n## 1. Mathematical Structure and Deterministic Transforms\n\nEach function in the module follows a consistent pattern:\n```python\ndef task_XXXXX(value: int) -> int:\n    return (value * multiplier + addend) % modulus\n```\nFor `task_00000`, the multiplier is 1, the addend is 0, and the modulus is 100003. For `task_00001`, the multiplier is 2, the addend is 1, and the modulus remains 100003. This pattern continues, with the multiplier and addend increasing by 1 for each subsequent function, up to `task"
++  },
++  {
++    "label": "tokens-4096-run-3",
++    "expected_prompt_tokens": 4096,
++    "request_sha256": "946079edb58e764050805886156dc8f877cc29e1ca8d01c84e9a1e7917d49492",
++    "client_ttft_s": 2.779618513999594,
++    "client_elapsed_s": 5.5565727339999285,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 4096,
++      "completion_tokens": 256,
++      "total_tokens": 4352,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791356738.961734,
++      "duration_s": 5.5,
++      "finish": "length",
++      "prompt_tokens": 4096,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 4096,
++      "prompt_read": 4096,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 2746.0,
++      "decode_ms": 2795.0,
++      "decode_tok_s": 91.6,
++      "hit_rate": 0.992,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 232,
++      "drafts_accepted": 152
++    },
++    "text": "# Analysis of Synthetic Python Module: Deterministic Integer Transforms\n\nThe provided Python module consists of a series of functions, labeled `task_00000` through `task_00112`, that perform deterministic integer transformations. Each function takes an integer input `value` and returns an integer result based on a specific linear formula involving multiplication, addition, and modulo arithmetic. This analysis explores the mathematical structure, implementation details, testing implications, naming conventions, computational complexity, and maintainability of this synthetic code.\n\n## Mathematical Structure and Deterministic Transforms\n\nAt its core, every function in this module implements a linear congruential generator (LCG) step or a simple affine transformation modulo a prime number. The general form of each function is:\n\n$$ f_i(v) = (v \\cdot a_i + b_i) \\pmod{100003} $$\n\nwhere $a_i$ is the multiplier, $b_i$ is the additive constant, and $100003$ is the modulus. For most functions, the multiplier $a_i$ corresponds to the task index plus one (e.g., `task_00000` uses multiplier 1, `task_00"
++  },
++  {
++    "label": "tokens-32768-run-1",
++    "expected_prompt_tokens": 32768,
++    "request_sha256": "e37cfc2ab9867d91130927440df24a57255a736b8d0d829d07d828e22e3de572",
++    "client_ttft_s": 15.49341312499746,
++    "client_elapsed_s": 18.39047483700051,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 32768,
++      "completion_tokens": 256,
++      "total_tokens": 33024,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791356745.4456336,
++      "duration_s": 18.3,
++      "finish": "length",
++      "prompt_tokens": 32768,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 32768,
++      "prompt_read": 32768,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 15425.7,
++      "decode_ms": 2914.6,
++      "decode_tok_s": 87.8,
++      "hit_rate": 0.991,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 216,
++      "drafts_accepted": 150
++    },
++    "text": "Based on the provided Python module, here is a detailed technical review and explanation.\n\n### 1. Overview and Pattern Analysis\n\nThe provided code consists of a series of functions named `task_00000` through `task_00888` (and presumably continuing beyond the snippet). Each function accepts an integer `value` and returns an integer. The core logic in every function is identical in structure, differing only by specific constants.\n\nThe general formula for any function `task_N` is:\n$$ f_N(x) = (x \\cdot A_N + B_N) \\pmod{100003} $$\n\nWhere:\n*   $A_N$ is the multiplier.\n*   $B_N$ is the additive constant.\n*   $100003$ is the modulus.\n\n### 2. Deterministic Integer Transforms and Modulo Arithmetic\n\nThe code implements **deterministic integer transforms**. In computer science, a deterministic transform is a function where the output is entirely determined by the input, with no randomness or side effects. Here, the transform is an affine transformation over the ring of integers modulo $M$ ($\\mathbb{Z}_M$).\n\n"
++  },
++  {
++    "label": "tokens-32768-run-2",
++    "expected_prompt_tokens": 32768,
++    "request_sha256": "ed2dfaa11aecad9f4563f33bb5f5d4b8704486508700b8fa572722cc1225ee26",
++    "client_ttft_s": 15.448381633999816,
++    "client_elapsed_s": 18.286311930998636,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 32768,
++      "completion_tokens": 256,
++      "total_tokens": 33024,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791356764.7450254,
++      "duration_s": 18.2,
++      "finish": "length",
++      "prompt_tokens": 32768,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 32768,
++      "prompt_read": 32768,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 15353.9,
++      "decode_ms": 2855.4,
++      "decode_tok_s": 89.7,
++      "hit_rate": 0.993,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 213,
++      "drafts_accepted": 153
++    },
++    "text": "Based on the provided Python module, here is a detailed technical review and explanation.\n\n### Overview of the Module\n\nThe provided code defines a series of functions, `task_00000` through `task_00888`, that perform deterministic integer transformations. Each function takes an integer `value` and returns a new integer based on a specific linear formula involving multiplication, addition, and modulo arithmetic. The benchmark nonce `series-32768-trial-2` suggests this code is part of a larger test suite or performance benchmark, likely designed to evaluate computational consistency, hash generation, or state machine transitions.\n\n### Mathematical Logic and Deterministic Transforms\n\nAt its core, every function in this module implements a linear congruential generator (LCG) style transformation, albeit with varying parameters. The general structure of each function is:\n\n$$ f(x) = (x \\cdot a + b) \\pmod{M} $$\n\nWhere:\n*   $x$ is the input `value`.\n*   $a$ is the multiplier.\n*   $b$ is the additive constant.\n*   $M$ is the modulus, fixed at `100003` for all functions"
++  },
++  {
++    "label": "tokens-32768-run-3",
++    "expected_prompt_tokens": 32768,
++    "request_sha256": "2a3c7342622e80c3cd8b37e062f0a2f64640c119ece8cccbf168639041eac079",
++    "client_ttft_s": 15.455681155999628,
++    "client_elapsed_s": 18.01145206900037,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 32768,
++      "completion_tokens": 256,
++      "total_tokens": 33024,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791356783.9664707,
++      "duration_s": 18.0,
++      "finish": "length",
++      "prompt_tokens": 32768,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 32768,
++      "prompt_read": 32768,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 15395.3,
++      "decode_ms": 2573.5,
++      "decode_tok_s": 99.5,
++      "hit_rate": 0.991,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 208,
++      "drafts_accepted": 166
++    },
++    "text": "Based on the provided synthetic Python module, here is a detailed technical review and explanation.\n\n### 1. Structural Analysis and Pattern Recognition\n\nThe module consists of a series of functions named `task_00000` through `task_00888` (and presumably continuing beyond the truncated text). Each function follows a strict, deterministic signature: `def task_XXXXX(value: int) -> int`.\n\nThe core logic within each function is a linear transformation followed by a modulo operation:\n$$ f(x) = (x \\cdot a + b) \\pmod{100003} $$\n\nWhere:\n*   $x$ is the input `value`.\n*   $a$ is the multiplier.\n*   $b$ is the additive constant.\n*   $100003$ is the modulus.\n\n#### The Multiplier Pattern ($a$)\nThe multiplier $a$ follows a cyclic pattern. It increments from 1 to 97, then resets to 1.\n*   `task_00000`: $a=1$\n*   `task_00001`: $a=2$\n*   ..."
++  }
++]
+diff --git a/bench/results/2026-10-07-community-r9700/results.json b/bench/results/2026-10-07-community-r9700/results.json
+new file mode 100644
+index 0000000000..07f3ad1ac0
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/results.json
+@@ -0,0 +1,289 @@
++[
++  {
++    "label": "warmup",
++    "expected_prompt_tokens": null,
++    "request_sha256": "b63e57873441a996a529b246a66cf12de70a7c671777f99329354d5c195f788f",
++    "client_ttft_s": 0.17370180999932927,
++    "client_elapsed_s": 0.20492370599822607,
++    "finish_reason": "stop",
++    "usage": {
++      "prompt_tokens": 19,
++      "completion_tokens": 2,
++      "total_tokens": 21,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791348711.2368853,
++      "duration_s": 0.2,
++      "finish": "stop",
++      "prompt_tokens": 19,
++      "reused": 0,
++      "output_tokens": 2,
++      "prompt_total": 19,
++      "prompt_read": 19,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 2,
++      "prompt_ms": 151.4,
++      "decode_ms": 48.0,
++      "decode_tok_s": 41.7,
++      "hit_rate": 0.934,
++      "pcie_share": 0.003,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 3,
++      "drafts_accepted": 3
++    },
++    "text": "READY"
++  },
++  {
++    "label": "tokens-4096-run-1",
++    "expected_prompt_tokens": 4096,
++    "request_sha256": "5d94c652067354bbe72930d2bdad3886564f08cf2546b32411af02d33ad3ce05",
++    "client_ttft_s": 3.255741771998146,
++    "client_elapsed_s": 6.063133235998976,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 4096,
++      "completion_tokens": 256,
++      "total_tokens": 4352,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791348711.9175048,
++      "duration_s": 6.1,
++      "finish": "length",
++      "prompt_tokens": 4096,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 4096,
++      "prompt_read": 4096,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 3224.5,
++      "decode_ms": 2824.8,
++      "decode_tok_s": 90.6,
++      "hit_rate": 0.966,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 219,
++      "drafts_accepted": 157
++    },
++    "text": "# Analysis of Synthetic Python Module: Deterministic Integer Transforms\n\nThe provided Python module consists of a series of functions, `task_00000` through `task_00112`, each implementing a specific deterministic integer transformation. While the code appears repetitive, it serves as a clear example of modular arithmetic, function design, and the trade-offs between explicit implementation and algorithmic abstraction. Below is a detailed discussion of the code's structure, mathematical properties, testing implications, naming conventions, complexity, and maintainability.\n\n## 1. Mathematical Structure and Deterministic Transforms\n\nEach function in the module follows a consistent pattern:\n```python\ndef task_XXXXX(value: int) -> int:\n    return (value * multiplier + addend) % MOD\n```\nWhere `MOD = 100003`.\n\nFor most functions, the `multiplier` and `addend` are derived from the function index `i`:\n- `multiplier = i + 1`\n- `addend = i`\n\nThus, for `task_00000`, `multiplier = 1`, `addend = 0`.\nFor `task_00001`,"
++  },
++  {
++    "label": "tokens-4096-run-2",
++    "expected_prompt_tokens": 4096,
++    "request_sha256": "8da8a04e70e4d916f6630729082bdfb9d6ebbb47117aad60bc0541bce198a213",
++    "client_ttft_s": 3.3485343139982433,
++    "client_elapsed_s": 6.034404333997372,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 4096,
++      "completion_tokens": 256,
++      "total_tokens": 4352,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791348718.4548187,
++      "duration_s": 6.0,
++      "finish": "length",
++      "prompt_tokens": 4096,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 4096,
++      "prompt_read": 4096,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 3316.8,
++      "decode_ms": 2703.5,
++      "decode_tok_s": 94.7,
++      "hit_rate": 0.989,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 218,
++      "drafts_accepted": 157
++    },
++    "text": "# Analysis of Synthetic Python Module: Deterministic Integer Transforms\n\nThe provided Python module consists of a series of functions, `task_00000` through `task_00112`, each implementing a specific deterministic integer transformation. While the code appears repetitive, it serves as a clear example of modular arithmetic, function design, and the trade-offs between explicit definition and programmatic generation. Below is a detailed discussion of the code's structure, mathematical properties, testing implications, and maintainability.\n\n## 1. Mathematical Structure and Deterministic Transforms\n\nAt its core, every function in this module implements a linear congruential generator (LCG) step or a simple affine transformation modulo a prime number. The general form of each function is:\n\n$$ f_n(x) = (x \\cdot a_n + b_n) \\pmod{M} $$\n\nWhere:\n- $M = 100003$ is a fixed modulus.\n- $a_n$ is the multiplier for function $n$.\n- $b_n$ is the additive constant for function $n$.\n\nFor the majority of the functions (e.g., `task_00000` to `task_000"
++  },
++  {
++    "label": "tokens-4096-run-3",
++    "expected_prompt_tokens": 4096,
++    "request_sha256": "946079edb58e764050805886156dc8f877cc29e1ca8d01c84e9a1e7917d49492",
++    "client_ttft_s": 3.2309086350032885,
++    "client_elapsed_s": 5.933308020001277,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 4096,
++      "completion_tokens": 256,
++      "total_tokens": 4352,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791348724.9837277,
++      "duration_s": 5.9,
++      "finish": "length",
++      "prompt_tokens": 4096,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 4096,
++      "prompt_read": 4096,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 3199.3,
++      "decode_ms": 2720.1,
++      "decode_tok_s": 94.1,
++      "hit_rate": 0.991,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 227,
++      "drafts_accepted": 156
++    },
++    "text": "# Analysis of Synthetic Python Module: Deterministic Integer Transforms\n\nThe provided Python module consists of a series of functions, `task_00000` through `task_00112`, each implementing a specific deterministic integer transformation. While the code appears repetitive, it serves as a clear example of modular arithmetic, function design, and the trade-offs between explicit definition and programmatic generation. Below is a detailed discussion of the code's structure, mathematical properties, testing implications, and maintainability.\n\n## 1. Mathematical Structure and Deterministic Transforms\n\nAt its core, every function in this module implements a linear congruential generator (LCG) step or a simple affine transformation modulo a prime number. The general form of each function is:\n\n$$ f_i(v) = (v \\cdot a_i + b_i) \\pmod{M} $$\n\nWhere:\n- $v$ is the input integer.\n- $a_i$ is the multiplier for function $i$.\n- $b_i$ is the additive constant for function $i$.\n- $M = 100003$ is the modulus.\n\nFor the first 97 functions (`task_00000` to"
++  },
++  {
++    "label": "tokens-32768-run-1",
++    "expected_prompt_tokens": 32768,
++    "request_sha256": "e37cfc2ab9867d91130927440df24a57255a736b8d0d829d07d828e22e3de572",
++    "client_ttft_s": 20.927073609000217,
++    "client_elapsed_s": 23.881355937999615,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 32768,
++      "completion_tokens": 256,
++      "total_tokens": 33024,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791348732.093926,
++      "duration_s": 23.8,
++      "finish": "length",
++      "prompt_tokens": 32768,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 32768,
++      "prompt_read": 32768,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 20853.5,
++      "decode_ms": 2972.1,
++      "decode_tok_s": 86.1,
++      "hit_rate": 0.988,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 192,
++      "drafts_accepted": 144
++    },
++    "text": "Based on the provided Python module, here is a detailed technical review and explanation.\n\n### Overview of the Module\n\nThe provided code defines a series of functions, `task_00000` through `task_00888`, each performing a specific deterministic integer transformation. Each function takes an integer `value` as input and returns an integer result. The core logic in every function is identical in structure but varies in its parameters:\n\n```python\ndef task_XXXXX(value: int) -> int:\n    return (value * multiplier + offset) % 100003\n```\n\nThis pattern represents a **linear congruential transformation** modulo a prime number ($100,003$). The code is likely generated programmatically for benchmarking, fuzzing, or cryptographic testing purposes, as manually writing nearly 900 distinct functions with hardcoded constants is impractical for human maintenance.\n\n### 1. Deterministic Integer Transforms\n\nThe functions implement a deterministic mapping from an input integer to an output integer. This is a fundamental concept in computer science, particularly in hashing, random number generation, and cryptographic primitives.\n\n*   **Determinism:** For any given input `value`, the output is"
++  },
++  {
++    "label": "tokens-32768-run-2",
++    "expected_prompt_tokens": 32768,
++    "request_sha256": "ed2dfaa11aecad9f4563f33bb5f5d4b8704486508700b8fa572722cc1225ee26",
++    "client_ttft_s": 20.83662441300112,
++    "client_elapsed_s": 23.82424572200034,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 32768,
++      "completion_tokens": 256,
++      "total_tokens": 33024,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791348757.1246514,
++      "duration_s": 23.8,
++      "finish": "length",
++      "prompt_tokens": 32768,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 32768,
++      "prompt_read": 32768,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 20766.8,
++      "decode_ms": 3002.8,
++      "decode_tok_s": 85.3,
++      "hit_rate": 0.992,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 210,
++      "drafts_accepted": 145
++    },
++    "text": "Based on the provided synthetic Python module, here is a detailed technical review and explanation.\n\n### 1. Structural Overview and Pattern Recognition\n\nThe module consists of a series of functions named `task_00000` through `task_00888` (and presumably continuing beyond the truncated text). Each function follows a strict, deterministic signature: `def task_XXXXX(value: int) -> int`.\n\nThe core logic within each function is identical in structure but varies in specific constants:\n```python\nreturn (value * multiplier + offset) % 100003\n```\n\nThis pattern represents a **linear congruential transformation** applied to an input integer. The code is essentially a hardcoded lookup table of linear functions, likely generated programmatically for benchmarking, fuzzing, or cryptographic simulation purposes.\n\n### 2. Deterministic Integer Transforms and Modulo Arithmetic\n\nThe mathematical operation performed is a standard affine transformation over a finite field (or ring) defined by the modulus $M = 100,003$.\n\nFor any given function $f_i(x)$, the operation is:\n$$ f_i(x) = (a_i \\cdot x + b_i) \\pmod M"
++  },
++  {
++    "label": "tokens-32768-run-3",
++    "expected_prompt_tokens": 32768,
++    "request_sha256": "2a3c7342622e80c3cd8b37e062f0a2f64640c119ece8cccbf168639041eac079",
++    "client_ttft_s": 20.875074366998888,
++    "client_elapsed_s": 23.575035821999336,
++    "finish_reason": "length",
++    "usage": {
++      "prompt_tokens": 32768,
++      "completion_tokens": 256,
++      "total_tokens": 33024,
++      "prompt_tokens_details": {
++        "cached_tokens": 0
++      }
++    },
++    "engine": {
++      "projection": null,
++      "time": 1791348781.7966793,
++      "duration_s": 23.5,
++      "finish": "length",
++      "prompt_tokens": 32768,
++      "reused": 0,
++      "output_tokens": 256,
++      "prompt_total": 32768,
++      "prompt_read": 32768,
++      "reasoning_recoveries": 0,
++      "reasoning_repeat_coverage": 0.0,
++      "engine_generated": 256,
++      "prompt_ms": 20817.4,
++      "decode_ms": 2717.9,
++      "decode_tok_s": 94.2,
++      "hit_rate": 0.992,
++      "pcie_share": 0.0,
++      "ram_blobs": 0,
++      "file_blobs": 0,
++      "file_mb": 0.0,
++      "drafts_offered": 212,
++      "drafts_accepted": 157
++    },
++    "text": "Based on the provided Python module, here is a detailed technical review and explanation.\n\n### 1. Structural Overview and Pattern Analysis\n\nThe provided code consists of a series of function definitions, ranging from `task_00000` to `task_00888`. Each function follows a strict, repetitive structure:\n\n```python\ndef task_XXXXX(value: int) -> int:\n    return (value * A + B) % 100003\n```\n\nThis structure represents a **deterministic integer transform**. The core logic is an affine transformation over a finite field (or ring) defined by the modulus `100003`.\n\n#### The Affine Transform\nMathematically, each function implements the formula:\n$$ f(x) = (ax + b) \\pmod m $$\nWhere:\n*   $x$ is the input `value`.\n*   $a$ is the multiplier (coefficient).\n*   $b$ is the additive constant.\n*   $m$ is the modulus, fixed at `100003`.\n\nIn this specific module, the parameters $a$ and $b$ change for each function. However"
++  }
++]
+diff --git a/bench/results/2026-10-07-community-r9700/strata-iq2_xs.json b/bench/results/2026-10-07-community-r9700/strata-iq2_xs.json
+new file mode 100644
+index 0000000000..a5a4dc951d
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/strata-iq2_xs.json
+@@ -0,0 +1,40 @@
++{
++ "exe": "/home/alex/Repo/Strata/engine/strata",
++ "args": [
++  "--pack",
++  "/home/alex/HF-MODEL/packs/iq2_xs",
++  "--native",
++  "/home/alex/HF-MODEL/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
++  "--ple-gguf",
++  "/home/alex/HF-MODEL/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
++  "--expert-profile",
++  "/home/alex/Repo/Strata/data/expert-profile.bin",
++  "--expert-cache",
++  "auto",
++  "--prefill",
++  "auto",
++  "--spec",
++  "4",
++  "--spec-min-p",
++  "0.5",
++  "--mtp",
++  "/home/alex/HF-MODEL/mtp/rt",
++  "--max-context",
++  "131072",
++  "--kv",
++  "int8",
++  "--vram-reserve-mib",
++  "3072"
++ ],
++ "cwd": "/home/alex/Repo/Strata",
++ "tokenizer": "/home/alex/HF-MODEL/packs/iq2_xs/tokenizer",
++ "model_name": "qwen3.8-flash-next-iq2_xs",
++ "log": "/home/alex/Repo/Strata/strata-iq2_xs.log",
++ "lib_dirs": [
++  "/home/alex/.rocm/runtimes/wheel/release-wheel-multi-arch-7-14-0-dd2bd94eec87ccdf/lib/python3.12/site-packages/_rocm_sdk_devel/lib"
++ ],
++ "port": 8080,
++ "backend": "hip",
++ "gpu": 0,
++ "gpus_asked": true
++}
+\ No newline at end of file
+diff --git a/bench/results/2026-10-07-community-r9700/summary-wmma.json b/bench/results/2026-10-07-community-r9700/summary-wmma.json
+new file mode 100644
+index 0000000000..3d4276efef
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/summary-wmma.json
+@@ -0,0 +1,76 @@
++{
++  "4096": {
++    "prompt_tokens": {
++      "median": 4096,
++      "min": 4096,
++      "max": 4096
++    },
++    "cached_tokens": {
++      "median": 0,
++      "min": 0,
++      "max": 0
++    },
++    "output_tokens": {
++      "median": 256,
++      "min": 256,
++      "max": 256
++    },
++    "client_ttft_s": {
++      "median": 2.786707668001327,
++      "min": 2.779618513999594,
++      "max": 3.4480344759977015
++    },
++    "client_elapsed_s": {
++      "median": 5.5565727339999285,
++      "min": 5.418891915000131,
++      "max": 6.624254053996992
++    },
++    "prefill_tok_s": {
++      "median": 1485.996226962705,
++      "min": 1199.3441086905598,
++      "max": 1491.6241806263656
++    },
++    "decode_tok_s": {
++      "median": 91.59212880143113,
++      "min": 80.15028177833437,
++      "max": 96.60377358490567
++    }
++  },
++  "32768": {
++    "prompt_tokens": {
++      "median": 32768,
++      "min": 32768,
++      "max": 32768
++    },
++    "cached_tokens": {
++      "median": 0,
++      "min": 0,
++      "max": 0
++    },
++    "output_tokens": {
++      "median": 256,
++      "min": 256,
++      "max": 256
++    },
++    "client_ttft_s": {
++      "median": 15.455681155999628,
++      "min": 15.448381633999816,
++      "max": 15.49341312499746
++    },
++    "client_elapsed_s": {
++      "median": 18.286311930998636,
++      "min": 18.01145206900037,
++      "max": 18.39047483700051
++    },
++    "prefill_tok_s": {
++      "median": 2128.4417971718644,
++      "min": 2124.2471978581198,
++      "max": 2134.1808921511797
++    },
++    "decode_tok_s": {
++      "median": 89.65468936050992,
++      "min": 87.83366499691209,
++      "max": 99.47542257625801
++    }
++  }
++}
+diff --git a/bench/results/2026-10-07-community-r9700/summary.json b/bench/results/2026-10-07-community-r9700/summary.json
+new file mode 100644
+index 0000000000..8028c3107e
+--- /dev/null
++++ b/bench/results/2026-10-07-community-r9700/summary.json
+@@ -0,0 +1,76 @@
++{
++  "4096": {
++    "prompt_tokens": {
++      "median": 4096,
++      "min": 4096,
++      "max": 4096
++    },
++    "cached_tokens": {
++      "median": 0,
++      "min": 0,
++      "max": 0
++    },
++    "output_tokens": {
++      "median": 256,
++      "min": 256,
++      "max": 256
++    },
++    "client_ttft_s": {
++      "median": 3.255741771998146,
++      "min": 3.2309086350032885,
++      "max": 3.3485343139982433
++    },
++    "client_elapsed_s": {
++      "median": 6.034404333997372,
++      "min": 5.933308020001277,
++      "max": 6.063133235998976
++    },
++    "prefill_tok_s": {
++      "median": 1270.2744611567684,
++      "min": 1234.9252291365171,
++      "max": 1280.2800612634014
++    },
++    "decode_tok_s": {
++      "median": 94.11418697841991,
++      "min": 90.62588501840838,
++      "max": 94.69206584057703
++    }
++  },
++  "32768": {
++    "prompt_tokens": {
++      "median": 32768,
++      "min": 32768,
++      "max": 32768
++    },
++    "cached_tokens": {
++      "median": 0,
++      "min": 0,
++      "max": 0
++    },
++    "output_tokens": {
++      "median": 256,
++      "min": 256,
++      "max": 256
++    },
++    "client_ttft_s": {
++      "median": 20.875074366998888,
++      "min": 20.83662441300112,
++      "max": 20.927073609000217
++    },
++    "client_elapsed_s": {
++      "median": 23.82424572200034,
++      "min": 23.575035821999336,
++      "max": 23.881355937999615
++    },
++    "prefill_tok_s": {
++      "median": 1574.0678470894538,
++      "min": 1571.342940034047,
++      "max": 1577.9031916327986
++    },
++    "decode_tok_s": {
++      "median": 86.13438309612732,
++      "min": 85.25376315438923,
++      "max": 94.19036756319217
++    }
++  }
++}
+diff --git a/docs/COMMUNITY_BENCHMARKS.md b/docs/COMMUNITY_BENCHMARKS.md
+index adb9f736e1..b5702ddf36 100644
+--- a/docs/COMMUNITY_BENCHMARKS.md
++++ b/docs/COMMUNITY_BENCHMARKS.md
+@@ -21,6 +21,10 @@ and their limits. Report what you actually measured and label estimates separate
+ - [2026-10-04: 2x Intel Arc Pro B60 24 GB, Ryzen 5 5600, 64 GB RAM](../bench/results/2026-10-04-community-2x-arc-pro-b60/README.md):
+   the SYCL port at `6f32ec0` with two fixes, Coder IQ1_M and Flash-Next IQ2_XS, 8,192-token context, layer split across both cards;
+   short prompts and 2K-token prompts, plus one run on a single B60. Intel's SYCL engine, no 4,096/32,768/128,000-token sweep.
++- [2026-10-07: AMD Radeon AI PRO R9700 32 GB (gfx1201), Ryzen AI 9 HX 370, 47 GB RAM](../bench/results/2026-10-07-community-r9700/README.md):
++  Strata 0.1.40 at `82f46a8`, original Flash-Next IQ2_XS, 131,072-token context, ROCm 7.14;
++  three runs each at 4,096 and 32,768 prompt tokens, then the same sweep with `STRATA_HIP_WMMA=1`.
++  128,000-token prompts and the recall check were not run.
+ 
+ ## What to record
+ 

@@ -1,0 +1,2063 @@
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index eaeadf08d4..2b46128f2d 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -392,7 +392,8 @@ app. It has three tabs:
+ - **Chat:** streaming answers, the model's thinking (folded away once it answers), code with a copy button, pictures when
+   images are on, and sampling and thinking-level settings. Chats stay in your browser.
+ - **Monitor:** what the model is doing (reading the prompt, with progress, or writing, at how many tokens/s); GPU load,
+-  VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
++  VRAM, temperature, power and PCIe traffic, per GPU on multi-GPU machines; CPU, RAM and disk; the context in use; the
++  last requests. Cards can be rearranged and hidden.
+ - **About:** the model and engine settings, and the addresses to connect other apps.
+ 
+ `http://127.0.0.1:8080/?q=your question` opens it with a new chat already asking. The API is at
+@@ -744,6 +745,27 @@ slots and the RAM budget, how many were parked, restored and evicted, and the la
+ log), and for every setup how many prompt tokens the cache gave back - in the last request and since the start.
+ `/metrics` has the same under `"conversation_cache"`.
+ 
++The Monitor's GPU selector (in the Model state card, on machines with more than one GPU) focuses the GPU, power and
++PCIe cards on one GPU, including cards outside the engine, which are marked "not in use" (the model does not run on
++them). Other cards show draft acceptance, prompt reuse, prefill time, free VRAM, all-NVIDIA-card power and session
++time; the VRAM warning thresholds are display hints only. Drag a card to reorder it (press and hold on touch,
++Alt+Left/Right from the keyboard); its x hides it. Order and hidden cards are kept in the browser, and **Reset layout**
++above the cards brings back the defaults. **Clear** on Recent requests empties the table on that page only.
++
++Two optional sources, both localhost-only:
++
++- **CPU temperature and power** from LibreHardwareMonitor's web server (Options > Remote Web Server, port 8085), read
++  every 2 s from `http://127.0.0.1:8085/data.json`; `STRATA_LHM_URL` points elsewhere, and an empty value turns it off.
++  It uses the first CPU's package sensors (Intel and AMD). On Windows without it, the CPU temp card says "Needs
++  LibreHardwareMonitor"; on other systems the card is hidden.
++- **Forge**, a VS Code coding assistant for local models: with `STRATA_FORGE_URL=http://127.0.0.1:8799`, a card shows
++  the active Forge chat's turns, tool calls and tokens from Forge's read-only `/stats`. Off unless the variable is set.
++
++`/metrics` adds `power_limit`, `pcie_rx_mb`, `pcie_tx_mb`, `pcie_gen`, `pcie_gen_max` and `pcie_width` to
++`hardware.gpus[*]`, per-card readings over time in `history.gpus`, other NVIDIA cards in `hardware.other_gpus`,
++`hardware.all_gpu_power`, `hardware.cpu_temp` and `hardware.cpu_power` (LibreHardwareMonitor), `hardware_static.os`,
++and `forge` (`null` when off). Every one of them is optional.
++
+ Snapshots contain running state, checkpoints, used K/V pages, and draft-layer K/V.
+ They add host RAM, not another model or VRAM allocation. The byte budget also counts
+ an incoming snapshot during a switch. After a restore, unchanged K/V pages can be
+diff --git a/serve/forge_stats.py b/serve/forge_stats.py
+new file mode 100644
+index 0000000000..2ef52a59de
+--- /dev/null
++++ b/serve/forge_stats.py
+@@ -0,0 +1,86 @@
++"""A non-blocking cache of Forge's local, read-only stats endpoint.
++
++Set `STRATA_FORGE_URL` to enable it. Forge is a VS Code coding assistant with a local, read-only `/stats` endpoint;
++the card shows the active Forge chat's turns, tools and tokens.
++"""
++from __future__ import annotations
++
++import json
++import os
++import threading
++import time
++import urllib.request
++
++
++def _fetch(url, timeout):
++    with urllib.request.urlopen(url, timeout=timeout) as response:
++        return json.loads(response.read())
++
++
++class ForgeStats:
++    """Poll ``<forge_url>/stats`` off-thread and expose a short-lived, locked snapshot."""
++    DEFAULT_URL = ""
++    POLL_S = 5
++    TIMEOUT_S = 1
++    BACKOFF_S = 30
++    STALE_S = 15
++    EXPIRE_S = 60
++
++    def __init__(self, url=None, fetch=None, clock=None, start=True):
++        base = os.environ.get("STRATA_FORGE_URL", self.DEFAULT_URL) if url is None else url
++        self.url = f"{base.strip().rstrip('/')}/stats" if base.strip() else ""
++        self.enabled = bool(self.url)
++        self.fetch = fetch or _fetch
++        self.clock = clock or time.monotonic
++        self._lock = threading.Lock()
++        self._poll_lock = threading.Lock()
++        self._reply = None
++        self._received_at = None
++        self._next_try = 0.0
++        self.thread = None
++        if self.enabled and start:
++            self.thread = threading.Thread(target=self._run, name="forge-stats", daemon=True)
++            self.thread.start()
++
++    def poll_once(self):
++        """Poll if due; tests can drive the schedule without starting the daemon thread."""
++        if not self.enabled:
++            return False
++        with self._poll_lock:
++            now = self.clock()
++            with self._lock:
++                if now < self._next_try:
++                    return False
++                self._next_try = now + self.POLL_S
++            try:
++                reply = self.fetch(self.url, self.TIMEOUT_S)
++                if not isinstance(reply, dict):
++                    raise ValueError("Forge /stats did not return an object")
++            except Exception:  # noqa: BLE001 - the optional local service must not affect Strata
++                with self._lock:
++                    self._reply = None
++                    self._received_at = None
++                    self._next_try = self.clock() + self.BACKOFF_S
++                return False
++            received_at = self.clock()
++            with self._lock:
++                self._reply = dict(reply)
++                self._received_at = received_at
++            return True
++
++    def snapshot(self):
++        """Return a copy with its age, stale marker, or None after expiry."""
++        with self._lock:
++            if self._reply is None or self._received_at is None:
++                return None
++            age = max(0.0, self.clock() - self._received_at)
++            if age > self.EXPIRE_S:
++                return None
++            return {**self._reply, "age_s": round(age, 1), "stale": age > self.STALE_S}
++
++    def _run(self):
++        while self.enabled:
++            self.poll_once()
++            with self._lock:
++                delay = max(0.0, self._next_try - self.clock())
++            time.sleep(delay)
+diff --git a/serve/server.py b/serve/server.py
+index d6b1fc37e6..7a26367d82 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -2160,6 +2160,7 @@ def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name
+         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
+         self.effort_end = False
+         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
++        self.forge_stats = None                         # optional read-only Forge /stats cache
+         self.config_path = None                         # #564: the run config the web page's Settings view edits
+         self.config_lock = threading.Lock()
+         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
+@@ -2507,6 +2508,9 @@ def with_shared(self, req: dict, api: str) -> dict:
+ 
+     def start_telemetry(self):
+         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
++        if getattr(self, "forge_stats", None) is None:
++            from serve.forge_stats import ForgeStats
++            self.forge_stats = ForgeStats()
+         if getattr(self, "telemetry", None) is None:
+             from serve.telemetry import Telemetry
+             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
+@@ -2626,12 +2630,13 @@ def metrics(self, all_requests=False) -> dict:
+         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
+                   **dict(getattr(self.engine, "info", {}) or {})}
+         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
++        forge = self.forge_stats.snapshot() if getattr(self, "forge_stats", None) else None
+         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+                 "hardware_static":
+-                tel["static"], "history": tel["history"], "time": now}
++                tel["static"], "history": tel["history"], "time": now, "forge": forge}
+ 
+     def v1_status(self) -> dict:
+         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
+diff --git a/serve/telemetry.py b/serve/telemetry.py
+index 6fc1a03048..b494251d66 100644
+--- a/serve/telemetry.py
++++ b/serve/telemetry.py
+@@ -2,26 +2,61 @@
+ 
+ A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
+ - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
+-  pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
+-  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.
++  pip package is needed: load, VRAM, temperature, power, PCIe link and throughput. Multi-card engine readings and
++  histories are also kept per card; NVIDIA cards outside the engine are reported separately and included in
++  all-GPU power. With the AMD backend (#301): the amdgpu driver's Linux sysfs files - load, VRAM, temperature and
++  power.
+ - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
+   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
++- Optional CPU package sensors: LibreHardwareMonitor's local JSON web server at `127.0.0.1:8085`, configurable
++  with `STRATA_LHM_URL`; failures back off for 30 s.
+ Anything that cannot be read is None; nothing here can stop the server.
+ """
+ from __future__ import annotations
+ 
+ import collections
+ import ctypes
++import json
+ import os
+ import platform
++import re
+ import sys
+ import threading
+ import time
++import urllib.request
+ 
+ HISTORY = 60
++CARD_FIELDS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_rx_mb", "pcie_tx_mb",
++               "pcie_gen", "pcie_gen_max", "pcie_width")
++
++
++def _card(index, reading):
++    """One card's entry in `gpus` / `other_gpus`."""
++    return {"index": index, **{k: reading.get(k) for k in CARD_FIELDS}}
+ 
+ 
+ # ------------------------------------------------------------------------------------------------ NVML
++def _load_nvml():
++    """Load and initialize NVML, or return None when it is unavailable."""
++    names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
++                                      "NVIDIA Corporation", "NVSMI", "nvml.dll")] if os.name == "nt" \
++        else ["libnvidia-ml.so.1", "libnvidia-ml.so"]
++    lib = None
++    for name in names:
++        try:
++            lib = ctypes.CDLL(name)
++            break
++        except OSError:
++            continue
++    if lib is None:
++        return None
++    try:
++        init = getattr(lib, "nvmlInit_v2", None) or lib.nvmlInit
++        return lib if init() == 0 else None
++    except (AttributeError, OSError):
++        return None
++
++
+ class _Nvml:
+     class Util(ctypes.Structure):
+         _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+@@ -30,23 +65,10 @@ class Mem(ctypes.Structure):
+         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+ 
+     def __init__(self, index=0):
+-        self.lib = self.dev = None
+-        names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+-                                          "NVIDIA Corporation", "NVSMI", "nvml.dll")] if os.name == "nt" \
+-            else ["libnvidia-ml.so.1", "libnvidia-ml.so"]
+-        for n in names:
+-            try:
+-                self.lib = ctypes.CDLL(n)
+-                break
+-            except OSError:
+-                continue
++        self.lib, self.dev = _load_nvml(), None
+         if self.lib is None:
+             return
+         try:
+-            init = getattr(self.lib, "nvmlInit_v2", None) or self.lib.nvmlInit
+-            if init() != 0:
+-                self.lib = None
+-                return
+             h = ctypes.c_void_p()
+             get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
+             if get(ctypes.c_uint(index), ctypes.byref(h)) != 0:
+@@ -56,6 +78,19 @@ def __init__(self, index=0):
+         except (AttributeError, OSError):
+             self.lib = None
+ 
++    @staticmethod
++    def count():
++        """Number of NVML devices, or zero if NVML cannot report it."""
++        try:
++            lib = _load_nvml()
++            if lib is None:
++                return 0
++            get = getattr(lib, "nvmlDeviceGetCount_v2", None) or lib.nvmlDeviceGetCount
++            count = ctypes.c_uint()
++            return count.value if get(ctypes.byref(count)) == 0 else 0
++        except Exception:  # noqa: BLE001 - an unavailable NVML count is zero
++            return 0
++
+     def ok(self):
+         return self.lib is not None and self.dev is not None
+ 
+@@ -263,28 +298,126 @@ class MS(ctypes.Structure):
+ 
+ 
+ # ------------------------------------------------------------------------------------------------ the sampler
++def _fetch_lhm(url, timeout):
++    with urllib.request.urlopen(url, timeout=timeout) as response:
++        return json.loads(response.read())
++
++
++class _LhmCpu:
++    """Optional CPU package sensors from LibreHardwareMonitor's local JSON web server."""
++    DEFAULT_URL = "http://127.0.0.1:8085/data.json"
++    # The first CPU's sensors, picked by name: LHM numbers them per CPU model (the package temperature is
++    # /intelcpu/0/temperature/10 on an i9-9900KF, another index elsewhere) but names them the same way.
++    CPU_SENSOR = re.compile(r"^/(?:intel|amd)cpu/0/(temperature|power)/\d+$")
++    NAMES = {"temperature": ("CPU Package", "Package", "Core (Tctl/Tdie)", "Core (Tctl)", "Core (Tdie)", "Core Max"),
++             "power": ("CPU Package", "Package")}
++    FIELDS = {"temperature": "cpu_temp", "power": "cpu_power"}
++
++    def __init__(self, url=None, fetch=None, clock=None):
++        self.url = os.environ.get("STRATA_LHM_URL", self.DEFAULT_URL) if url is None else url
++        self.url = self.url.strip()
++        self.enabled = bool(self.url)
++        self.fetch = fetch or _fetch_lhm
++        self.clock = clock or time.monotonic
++        self.next_try = 0.0
++        self.last_success = None
++        self.values = {"cpu_temp": None, "cpu_power": None}
++
++    @staticmethod
++    def _number(value):
++        if not isinstance(value, str):
++            return None
++        match = re.match(r"^\s*([+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+))", value)
++        if not match:
++            return None
++        try:
++            return float(match.group(1).replace(",", "."))
++        except ValueError:
++            return None
++
++    @classmethod
++    def _sensors(cls, tree):
++        named = {kind: {} for kind in cls.NAMES}
++        stack = [tree]
++        while stack:
++            node = stack.pop()
++            if isinstance(node, dict):
++                match = cls.CPU_SENSOR.match(str(node.get("SensorId") or ""))
++                if match and isinstance(node.get("Text"), str):
++                    named[match.group(1)][node["Text"].strip()] = cls._number(node.get("Value"))
++                children = node.get("Children")
++                if isinstance(children, list):
++                    stack.extend(children)
++            elif isinstance(node, list):
++                stack.extend(node)
++        return {cls.FIELDS[kind]: next((named[kind][name] for name in names if named[kind].get(name) is not None), None)
++                for kind, names in cls.NAMES.items()}
++
++    def read(self):
++        if not self.enabled:
++            return {}
++        now = self.clock()
++        if now < self.next_try:
++            if self.last_success is None or now - self.last_success > 10:
++                return {"cpu_temp": None, "cpu_power": None}
++            return dict(self.values)
++        try:
++            self.values = self._sensors(self.fetch(self.url, 0.5))
++            self.last_success = now
++            self.next_try = now + 2
++        except Exception:  # noqa: BLE001 - optional sensors must never stop the sampler
++            self.values = {"cpu_temp": None, "cpu_power": None}
++            self.last_success = None
++            self.next_try = now + 30
++        return dict(self.values)
++
++
+ class Telemetry:
+     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
+         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
+         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
+-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
+-        cards, numbered as HIP numbers them, read from sysfs (#301)."""
++        PCIe traffic), mean (load) or hottest (temperature), and `gpus` and `history.gpus` have each card's own
++        readings. Multi-card entries also include per-card power limit and PCIe link/throughput fields. NVIDIA cards
++        outside the engine appear in `other_gpus`; when any power is readable, `all_gpu_power` sums every NVML card.
++        `amd`: the AMD backend's cards, numbered as HIP numbers them, read from sysfs (#301); NVIDIA-only fields are
++        not emitted for AMD. When `STRATA_LHM_URL` is non-empty (default localhost:8085), CPU package temperature
++        and power are read from LibreHardwareMonitor in this sampling loop, with a 0.5 s timeout and 30 s error
++        back-off. `measured_power` combines readable GPU power with CPU package power."""
+         self.extra = extra
+         self.lock = threading.Lock()
+         self.now: dict = {}
+         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
++        self.gpu_hist = collections.defaultdict(lambda: collections.defaultdict(
++            lambda: collections.deque(maxlen=HISTORY)))
+         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
++        engine_indices = set(idx)
+         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
+         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
+         self.gpu = self.gpus[0][1]
++        self.other_gpus = []
++        if not amd:
++            try:
++                for i in range(_Nvml.count()):
++                    if i in engine_indices:
++                        continue
++                    try:
++                        reader = gpu_reader(i)
++                        if reader.ok():
++                            self.other_gpus.append((i, reader))
++                    except Exception:  # noqa: BLE001 - an extra card must not stop telemetry
++                        continue
++            except Exception:  # noqa: BLE001 - NVML enumeration is optional
++                pass
+         try:
+             import psutil  # noqa: F401
+             self.ps = sys.modules["psutil"]
+         except ImportError:
+             self.ps = None
+         self.fallback = _CpuRamFallback()
++        self.lhm = _LhmCpu()
+         self.static = {
++            "os": platform.system().lower(),
+             "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
+             "gpu_count": len(self.gpus),
+             "cpu_name": _cpu_name(),
+@@ -292,6 +425,8 @@ def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+             "threads": os.cpu_count(),
+             "psutil": self.ps is not None,
+         }
++        if self.other_gpus:
++            self.static["other_gpu_names"] = [g.name() for _, g in self.other_gpus]
+         self._disk_prev = None
+         threading.Thread(target=self._loop, daemon=True).start()
+ 
+@@ -324,10 +459,22 @@ def vals(k):
+                 g["util"] = sum(u) / len(u) if u else None
+                 t = vals("temp")
+                 g["temp"] = max(t) if t else None
+-                s["gpus"] = [{"index": i, "util": r.get("util"), "mem_used": r.get("mem_used"),
+-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
+-                             for i, r in reads]
+             s.update({f"gpu_{k}": v for k, v in g.items()})
++            if len(reads) > 1 or self.other_gpus:
++                s["gpus"] = [_card(i, r) for i, r in reads]
++        if self.other_gpus:
++            others = []
++            for i, reader in self.other_gpus:
++                try:
++                    r = reader.read()
++                except Exception:  # noqa: BLE001 - a bad extra card is just unreadable
++                    r = {}
++                others.append(_card(i, r))
++            s["other_gpus"] = others
++            powers = [s["gpu_power"]] if s.get("gpu_power") is not None else []
++            powers.extend(g["power"] for g in others if g.get("power") is not None)
++            if powers:
++                s["all_gpu_power"] = sum(powers)
+         if self.ps:
+             try:
+                 s["cpu"] = self.ps.cpu_percent(interval=None)
+@@ -344,20 +491,55 @@ def vals(k):
+                 s.update(self.extra())
+             except Exception:  # noqa: BLE001 - telemetry must never take the server down
+                 pass
++        lhm = self.lhm.read()
++        s.update(lhm)
++        if lhm and lhm.get("cpu_power") is not None:
++            gpu_power = s.get("all_gpu_power")
++            if gpu_power is None:
++                gpu_power = s.get("gpu_power")
++            if gpu_power is not None:
++                s["measured_power"] = gpu_power + lhm["cpu_power"]
+         return s
+ 
++    def record(self, sample):
++        """Store one sample and its rolling top-level and multi-card history."""
++        with self.lock:
++            self.now = sample
++            for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "gpu_pcie_tx_mb",
++                      "cpu", "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
++                v = sample.get(k)
++                self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
++            if self.other_gpus:
++                value = sample.get("all_gpu_power")
++                self.hist["all_gpu_power"].append(round(value, 2) if isinstance(value, float) else value)
++            if self.lhm.enabled:
++                for key in ("cpu_temp", "cpu_power", "measured_power"):
++                    value = sample.get(key)
++                    self.hist[key].append(round(value, 2) if isinstance(value, float) else value)
++            cards = list(sample.get("gpus") or [])
++            if self.other_gpus:
++                if len(self.gpus) == 1 and not cards:
++                    index = self.gpus[0][0]
++                    cards.append({"index": index, "util": sample.get("gpu_util"),
++                                  "mem_used": sample.get("gpu_mem_used"), "temp": sample.get("gpu_temp"),
++                                  "power": sample.get("gpu_power"), "pcie_rx_mb": sample.get("gpu_pcie_rx_mb")})
++                cards.extend(sample.get("other_gpus") or [])
++            for card in cards:
++                h = self.gpu_hist[str(card["index"])]
++                for key in ("util", "mem_used", "temp", "power", "pcie_rx_mb"):
++                    value = card.get(key)
++                    h[key].append(round(value, 2) if isinstance(value, float) else value)
++
+     def _loop(self):
+         while True:
+-            s = self.sample()
+-            with self.lock:
+-                self.now = s
+-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
+-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+-                    v = s.get(k)
+-                    self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
++            self.record(self.sample())
+             time.sleep(1.0)
+ 
+     def snapshot(self):
+         with self.lock:
+-            return {"now": dict(self.now), "history": {k: list(v) for k, v in self.hist.items()},
++            history = {k: list(v) for k, v in self.hist.items()}
++            if self.gpu_hist:
++                history["gpus"] = {i: {k: list(v) for k, v in series.items()}
++                                   for i, series in self.gpu_hist.items()}
++            return {"now": dict(self.now), "history": history,
+                     "static": dict(self.static)}
+diff --git a/serve/test_forge_stats.py b/serve/test_forge_stats.py
+new file mode 100644
+index 0000000000..342459cdd0
+--- /dev/null
++++ b/serve/test_forge_stats.py
+@@ -0,0 +1,171 @@
++"""Forge /stats cache tests. All HTTP fixtures bind an ephemeral loopback port."""
++from __future__ import annotations
++
++import json
++import os
++import threading
++import time
++import unittest
++import urllib.request
++from http.server import BaseHTTPRequestHandler, HTTPServer
++from types import SimpleNamespace
++from unittest import mock
++
++from serve.forge_stats import ForgeStats, _fetch
++from serve.server import LOOPBACK_NAMES, Server, Service, make_handler
++
++
++class FakeClock:
++    def __init__(self, value=100.0):
++        self.value = value
++
++    def __call__(self):
++        return self.value
++
++    def advance(self, seconds):
++        self.value += seconds
++
++
++PAYLOAD = {
++    "forge_version": "0.16.87", "day": "2026-10-05",
++    "today": {"turns": 41, "requests": 512, "compactions": 2, "compaction_attempts_failed": 1,
++              "compactions_suppressed": 4, "tool_calls": 486, "tool_failures": 23,
++              "input_tokens": 9120345, "output_tokens": 88213, "turn_errors": 0},
++    "last_request": {"model": "strata-flashnext-iq3s", "input_tokens": 70241,
++                     "context_limit": 200000, "at": 1791182458},
++    "computed_at": 1791182500, "skipped_files": 0,
++}
++
++
++class ForgeHandler(BaseHTTPRequestHandler):
++    payload = PAYLOAD
++
++    def do_GET(self):
++        if self.path != "/stats":
++            self.send_error(404)
++            return
++        raw = json.dumps(self.payload).encode()
++        self.send_response(200)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(raw)))
++        self.end_headers()
++        self.wfile.write(raw)
++
++    def log_message(self, *_args):
++        pass
++
++
++def service_with_forge(reader):
++    """Build only the Service fields needed for its real /metrics path."""
++    svc = object.__new__(Service)
++    svc.api_key = ""
++    svc.host_names = set(LOOPBACK_NAMES)
++    svc.allowed_hosts = []
++    svc.trusted_origins = []
++    svc.cors_origins = []
++    svc.status_lock = threading.Lock()
++    svc.status = {"busy": False, "queued": 0}
++    svc.live_reqs = {}
++    svc.history = []
++    svc.totals = {"since": 100, "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
++                  "prompt_ms": 0, "decode_ms": 0, "drafts_offered": 0, "drafts_accepted": 0}
++    svc.engine = SimpleNamespace(progress=None, batch=0, max_context=200000, info={})
++    svc.vision = None
++    svc.model = "strata-flashnext-iq3s"
++    svc.telemetry = SimpleNamespace(snapshot=lambda: {"now": {}, "history": {}, "static": {}})
++    svc.forge_stats = reader
++    svc.conv_log = SimpleNamespace(poll=lambda *_args: {})
++    svc.loaded = lambda: True
++    svc._tok_s = lambda: 0.0
++    svc._tok_s_mean = lambda: 0.0
++    svc._prefill_tok_s_mean = lambda: 0.0
++    return svc
++
++
++class ForgeStatsTests(unittest.TestCase):
++    def test_fake_forge_is_exposed_by_metrics_with_age(self):
++        httpd = HTTPServer(("127.0.0.1", 0), ForgeHandler)
++        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
++        thread.start()
++        clock = FakeClock()
++        reader = ForgeStats(f"http://127.0.0.1:{httpd.server_address[1]}", clock=clock, start=False)
++        try:
++            self.assertTrue(reader.poll_once())
++            svc = service_with_forge(reader)
++            app = Server(("127.0.0.1", 0), make_handler(svc))
++            app_thread = threading.Thread(target=app.serve_forever, daemon=True)
++            app_thread.start()
++            try:
++                with urllib.request.urlopen(f"http://127.0.0.1:{app.server_address[1]}/metrics", timeout=1) as response:
++                    forge = json.loads(response.read())["forge"]
++                self.assertEqual(forge["today"]["turns"], 41)
++                self.assertEqual(forge["age_s"], 0.0)
++                clock.advance(16)
++                self.assertTrue(reader.snapshot()["stale"])
++                clock.advance(45)
++                self.assertIsNone(reader.snapshot())
++            finally:
++                app.shutdown()
++                app.server_close()
++                app_thread.join(timeout=1)
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++            thread.join(timeout=1)
++
++    def test_forge_down_is_null_and_metrics_does_not_wait(self):
++        closed = HTTPServer(("127.0.0.1", 0), ForgeHandler)
++        url = f"http://127.0.0.1:{closed.server_address[1]}"
++        closed.server_close()
++        reader = ForgeStats(url, start=False)
++        self.assertFalse(reader.poll_once())
++        self.assertIsNone(reader.snapshot())
++        app = Server(("127.0.0.1", 0), make_handler(service_with_forge(reader)))
++        thread = threading.Thread(target=app.serve_forever, daemon=True)
++        thread.start()
++        try:
++            started = time.perf_counter()
++            with urllib.request.urlopen(f"http://127.0.0.1:{app.server_address[1]}/metrics", timeout=1) as response:
++                body = json.loads(response.read())
++            self.assertLess(time.perf_counter() - started, 0.1)
++            self.assertIsNone(body["forge"])
++        finally:
++            app.shutdown()
++            app.server_close()
++            thread.join(timeout=1)
++
++    def test_closed_port_backs_off_for_30_seconds(self):
++        clock = FakeClock()
++        attempts = []
++        closed = HTTPServer(("127.0.0.1", 0), ForgeHandler)
++        url = f"http://127.0.0.1:{closed.server_address[1]}"
++        closed.server_close()
++
++        def refused(url, timeout):
++            attempts.append((url, timeout))
++            return _fetch(url, timeout)
++
++        reader = ForgeStats(url, fetch=refused, clock=clock, start=False)
++        for _ in range(10):
++            reader.poll_once()
++            clock.advance(1)
++        self.assertEqual(len(attempts), 1)
++        self.assertEqual(attempts[0][1], 1)
++
++    def test_empty_environment_disables_poller(self):
++        with mock.patch.dict(os.environ, {"STRATA_FORGE_URL": ""}):
++            reader = ForgeStats(fetch=lambda *_args: self.fail("disabled Forge reader fetched"), start=False)
++        self.assertFalse(reader.enabled)
++        self.assertFalse(reader.poll_once())
++        self.assertIsNone(reader.snapshot())
++
++    def test_no_url_disables_poller_without_attempting_fetch(self):
++        with mock.patch.dict(os.environ, {}, clear=True):
++            reader = ForgeStats(fetch=lambda *_args: self.fail("Forge without a URL fetched"), start=False)
++        self.assertEqual(reader.url, "")
++        self.assertFalse(reader.enabled)
++        self.assertFalse(reader.poll_once())
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/serve/test_lhm.py b/serve/test_lhm.py
+new file mode 100644
+index 0000000000..3d0a99c796
+--- /dev/null
++++ b/serve/test_lhm.py
+@@ -0,0 +1,158 @@
++"""LibreHardwareMonitor CPU sensor reader tests; these do not depend on a live sensor service."""
++import json
++import os
++import threading
++import unittest
++from http.server import BaseHTTPRequestHandler, HTTPServer
++from unittest import mock
++
++from serve import telemetry
++
++
++class FakeClock:
++    def __init__(self):
++        self.now = 100.0
++
++    def __call__(self):
++        return self.now
++
++
++class LhmCpuTests(unittest.TestCase):
++    class Handler(BaseHTTPRequestHandler):
++        def do_GET(self):
++            body = self.server.body
++            self.send_response(200)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(body)))
++            self.end_headers()
++            self.wfile.write(body)
++
++        def log_message(self, *_args):
++            pass
++
++    def server(self, body):
++        httpd = HTTPServer(("127.0.0.1", 0), self.Handler)
++        httpd.body = body
++        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
++        thread.start()
++        return httpd, thread
++
++    @staticmethod
++    def tree(temp="46,0 °C", power="46.0 W"):
++        return {"Children": [{"Text": "CPU", "Children": [
++            {"SensorId": "/intelcpu/0/temperature/0", "Text": "Core Max", "Type": "Temperature", "Value": "99 °C"},
++            {"SensorId": "/intelcpu/0/temperature/10", "Text": "CPU Package", "Type": "Temperature", "Value": temp},
++            {"SensorId": "/intelcpu/0/power/0", "Text": "CPU Package", "Type": "Power", "Value": power},
++            {"SensorId": "/intelcpu/0/power/1", "Text": "CPU Cores", "Type": "Power", "Value": "1 W"},
++        ]}]}
++
++    def test_fetches_tree_and_parses_both_decimal_marks(self):
++        httpd, thread = self.server(json.dumps(self.tree()).encode())
++        clock = FakeClock()
++        timeouts = []
++        def fetch(url, timeout):
++            timeouts.append(timeout)
++            return telemetry._fetch_lhm(url, timeout)
++        try:
++            reader = telemetry._LhmCpu(f"http://127.0.0.1:{httpd.server_port}/data.json", fetch, clock)
++            self.assertEqual(reader.read(), {"cpu_temp": 46.0, "cpu_power": 46.0})
++            clock.now += 2
++            httpd.body = json.dumps(self.tree("46.0 °C", "85,7 W")).encode()
++            self.assertEqual(reader.read(), {"cpu_temp": 46.0, "cpu_power": 85.7})
++            self.assertEqual(timeouts, [0.5, 0.5])
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++            thread.join(timeout=1)
++
++    def test_sensors_are_picked_by_name_for_intel_and_amd(self):
++        pick = telemetry._LhmCpu._sensors
++        def sensor(sid, text, value):
++            return {"SensorId": sid, "Text": text, "Value": value}
++        # An Intel CPU whose package temperature has another index than the i9-9900KF's /temperature/10.
++        intel = {"Children": [sensor("/intelcpu/0/temperature/3", "CPU Package", "51 °C"),
++                              sensor("/intelcpu/0/power/0", "CPU Package", "30 W")]}
++        self.assertEqual(pick(intel), {"cpu_temp": 51.0, "cpu_power": 30.0})
++        # AMD Zen: LHM names the die temperature "Core (Tctl/Tdie)" and the power "Package".
++        amd = {"Children": [sensor("/amdcpu/0/temperature/2", "CCD1 (Tdie)", "60 °C"),
++                            sensor("/amdcpu/0/temperature/0", "Core (Tctl/Tdie)", "64,5 °C"),
++                            sensor("/amdcpu/0/power/0", "Package", "88,1 W")]}
++        self.assertEqual(pick(amd), {"cpu_temp": 64.5, "cpu_power": 88.1})
++        # No package sensor: the hottest core. A motherboard "CPU" reading or a second CPU is never used.
++        other = {"Children": [sensor("/lpc/nct6798d/0/temperature/1", "CPU Package", "10 °C"),
++                              sensor("/intelcpu/1/temperature/9", "CPU Package", "11 °C"),
++                              sensor("/intelcpu/0/temperature/0", "Core Max", "70 °C")]}
++        self.assertEqual(pick(other), {"cpu_temp": 70.0, "cpu_power": None})
++
++    def test_missing_sensor_is_none(self):
++        body = json.dumps({"Children": [{"SensorId": "/intelcpu/0/power/0", "Text": "CPU Package", "Value": "38,4 W"}]}).encode()
++        httpd, thread = self.server(body)
++        try:
++            reader = telemetry._LhmCpu(f"http://127.0.0.1:{httpd.server_port}/data.json", clock=FakeClock())
++            self.assertEqual(reader.read(), {"cpu_temp": None, "cpu_power": 38.4})
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++            thread.join(timeout=1)
++
++    def test_bad_json_returns_none(self):
++        httpd, thread = self.server(b"{")
++        try:
++            reader = telemetry._LhmCpu(f"http://127.0.0.1:{httpd.server_port}/data.json", clock=FakeClock())
++            self.assertEqual(reader.read(), {"cpu_temp": None, "cpu_power": None})
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++            thread.join(timeout=1)
++
++    def test_closed_port_backs_off_for_ten_samples(self):
++        httpd = HTTPServer(("127.0.0.1", 0), self.Handler)
++        port = httpd.server_port
++        httpd.server_close()
++        attempts = []
++        clock = FakeClock()
++        def fetch(url, timeout):
++            attempts.append((url, timeout))
++            return telemetry._fetch_lhm(url, timeout)
++        reader = telemetry._LhmCpu(f"http://127.0.0.1:{port}/data.json", fetch, clock)
++        for _ in range(10):
++            self.assertEqual(reader.read(), {"cpu_temp": None, "cpu_power": None})
++            clock.now += 1
++        self.assertEqual(len(attempts), 1)
++        self.assertEqual(attempts[0][1], 0.5)
++
++    def test_telemetry_records_cpu_and_measured_power_history(self):
++        class Gpu:
++            def ok(self):
++                return True
++
++            def name(self):
++                return "Fake GPU"
++
++            def read(self):
++                return {"power": 30.0}
++
++        from serve import telemetry as telemetry_module
++        with mock.patch.dict(os.environ, {"STRATA_LHM_URL": ""}), \
++                mock.patch.object(telemetry_module, "gpu_reader", return_value=Gpu()), \
++                mock.patch.object(telemetry_module._Nvml, "count", return_value=1), \
++                mock.patch.object(telemetry_module.threading.Thread, "start"):
++            instance = telemetry_module.Telemetry()
++        instance.lhm = telemetry_module._LhmCpu(
++            "http://unused", fetch=lambda _url, _timeout: self.tree("55,5 °C", "85,7 W"), clock=FakeClock())
++        sample = instance.sample()
++        instance.record(sample)
++        self.assertEqual(sample["measured_power"], 115.7)
++        history = instance.snapshot()["history"]
++        self.assertEqual(history["cpu_temp"], [55.5])
++        self.assertEqual(history["cpu_power"], [85.7])
++        self.assertEqual(history["measured_power"], [115.7])
++
++    def test_empty_url_disables_reader(self):
++        reader = telemetry._LhmCpu(url="", fetch=mock.Mock(side_effect=AssertionError("fetch called")))
++        self.assertFalse(reader.enabled)
++        self.assertEqual(reader.read(), {})
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/serve/test_monitor.py b/serve/test_monitor.py
+index 0c82cb0b53..d481b5bfc9 100644
+--- a/serve/test_monitor.py
++++ b/serve/test_monitor.py
+@@ -256,6 +256,107 @@ def test_the_card_is_on_the_page(self):
+             self.assertIn(f'id="{el}"', html)
+             self.assertIn(f'"{el}"', js)
+ 
++    def test_gpu_selector_is_on_the_page(self):
++        web = Path(__file__).parent / "web"
++        html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
++        self.assertIn('id="gpu-seg"', html)
++        state_card = html.split('<div class="st-card state-card">', 1)[1].split('<div class="metric-area"', 1)[0]
++        self.assertIn('id="gpu-selector"', state_card)
++        self.assertIn('id="gpu-seg"', state_card)
++        self.assertIn('id="gpu-select-wrap"', state_card)
++        self.assertIn('GPU to show</span>', state_card)
++        self.assertIn('"gpu-seg"', js)
++        self.assertIn('"monitor.gpu"', js)
++        self.assertIn("hw.other_gpus", js)
++        self.assertIn("other_gpu_names", js)
++        self.assertIn("is not in use by the model", js)
++        self.assertIn("not in use", js)
++        self.assertIn('id="gn-${card.key}"', js)
++        self.assertIn("graph after 2 requests", js)
++        self.assertIn("No requests yet", js)
++        self.assertIn("Not reported by this engine", js)
++        self.assertIn("options.mutedValue", js)
++        self.assertIn('options.graphState === "unreported"', js)
++        self.assertIn("if (cards.length === 1) return {text: full, title: full}", js)
++        for card in ("speculation", "reuse", "prefill-time", "vram-free", "all-power", "session", "forge"):
++            self.assertIn(f'key: "{card}"', js)
++        self.assertIn('label: "Forge", icon: "forge", spark: false', js)
++        self.assertIn('name === "forge"', js)
++        self.assertIn('viewBox="0 0 24 24"', js)
++        self.assertIn('m.forge', js)
++        self.assertIn('forge.stale', js)
++        self.assertIn('cardTitle: forgeTitle', js)
++        self.assertIn('"session" in forge', js)  # the active chat, not the day
++        self.assertIn('No active Forge chat', js)
++        self.assertIn('Forge · this chat', js)
++
++    def test_optional_cpu_sensors_are_on_the_page(self):
++        web = Path(__file__).parent / "web"
++        html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
++        for el in ("cpu-temp-text", "cpu-temp-bar"):
++            self.assertIn(f'id="{el}"', html)
++            self.assertIn(f'"{el}"', js)
++        self.assertIn("hw.cpu_temp", js)
++        self.assertIn("hw.cpu_power", js)
++        self.assertIn('key: "cpu-temp", label: "CPU temp", icon: "thermometer", spark: true', js)
++        self.assertIn('"power", "all-power", "pcie", "cpu-temp"', js)
++        self.assertIn('const cpuTempNotice = cpuTempMissing && st.os === "windows"', js)
++        self.assertIn('Needs LibreHardwareMonitor', js)
++        self.assertIn('Options > Remote Web Server, port 8085', js)
++        self.assertIn('"os": platform.system().lower()', (Path(__file__).parent / "telemetry.py").read_text(encoding="utf-8"))
++        self.assertIn('hw.cpu_power == null ? "" : `${fmt(hw.cpu_power, 1)} W package`', js)
++        self.assertIn("hw.measured_power", js)
++        self.assertIn('"GPUs + CPU"', js)
++
++    def test_recent_requests_clear_is_page_local_and_uses_row_time(self):
++        web = Path(__file__).parent / "web"
++        html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
++        self.assertIn('id="req-clear"', html)
++        self.assertIn('let reqClearedAfter = null', js)
++        self.assertIn('$("req-clear").addEventListener("click"', js)
++        self.assertIn('Math.max(...rows.map((r) => r.time))', js)
++        self.assertIn('requests.filter((r) => r.time > reqClearedAfter)', js)
++        self.assertIn('Cleared. New requests will appear here (refresh to see all)', js)
++        self.assertIn('reqClearedAfter == null ? (kept == null ? requests.length : kept) : visibleRequests.length', js)
++
++    def test_metric_cards_can_be_hidden(self):
++        web = Path(__file__).parent / "web"
++        js, css = (web / "app.js").read_text(encoding="utf-8"), (web / "app.css").read_text(encoding="utf-8")
++        self.assertIn('data-hide-card="${m.key}"', js)
++        self.assertIn('data-hide-card="${card.key}"', js)
++        self.assertIn('title="Hide ${esc(m.label)}"', js)
++        self.assertIn('document.addEventListener("click"', js)
++        self.assertIn('userHiddenCards.add(button.dataset.hideCard)', js)
++        self.assertIn('card.hidden = Boolean(dataHidden) || userHiddenCards.has(card.dataset.cardKey || card.id)', js)
++        self.assertIn('setCardHidden(card, options.hidden)', js)
++        self.assertNotIn('updateMetricSections', js)
++        self.assertIn('.metric-card:hover .metric-card__hide', css)
++        self.assertIn('.metric-card:focus-within .metric-card__hide', css)
++        self.assertIn('@media (hover: none)', css)
++
++    def test_metric_cards_can_be_reordered_anywhere(self):
++        web = Path(__file__).parent / "web"
++        js, html = (web / "app.js").read_text(encoding="utf-8"), (web / "index.html").read_text(encoding="utf-8")
++        self.assertIn('const CARD_ORDER_KEY = "monitor.cardOrder"', js)
++        self.assertIn('store.set(CARD_ORDER_KEY', js)
++        self.assertIn('if (cardDrag) event.preventDefault(); }, {passive: false}', js)
++        self.assertIn('id="reset-card-order"', html)
++        self.assertIn('id="card-position-live"', html)
++        self.assertIn('drag.grid.insertBefore(drag.card, drag.placeholder)', js)
++        # One grid holds every card, so a card can move to any row; no row headings.
++        self.assertIn('<div class="metric-grid" id="metric-cards"></div>', html)
++        self.assertEqual(html.count('class="metric-grid"'), 1)
++        self.assertNotIn('metric-section__head', html)
++        self.assertIn('store.set(CARD_ORDER_KEY, cardKeys())', js)
++        self.assertIn('?.closest("#metrics")', js)
++        # Hidden cards persist; the reset link counts them and clears them.
++        self.assertIn('const HIDDEN_CARDS_KEY = "monitor.hiddenCards"', js)
++        self.assertIn('store.set(HIDDEN_CARDS_KEY, [...userHiddenCards])', js)
++        self.assertIn('localStorage.removeItem("strata." + HIDDEN_CARDS_KEY)', js)
++        self.assertIn('icon${hidden === 1 ? "" : "s"} hidden', js)
++        self.assertIn('event.altKey || !["ArrowLeft", "ArrowRight"].includes(event.key)', js)
++        self.assertIn('Moved ${label} to position ${next + 1} of ${cards.length}', js)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 590cf05cab..6be7cbe336 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -31,6 +31,18 @@
+ ANSWER = "xy" * 1000                             # longer than the old 1024 fallback: one token per byte (#606: not
+ #                                                one token repeated, which the server ends at 256)
+ 
++_forge_env = None
++
++
++def setUpModule():
++    global _forge_env
++    _forge_env = mock.patch.dict(os.environ, {"STRATA_FORGE_URL": ""})
++    _forge_env.start()
++
++
++def tearDownModule():
++    _forge_env.stop()
++
+ 
+ class RecordingEngine(MockEngine):
+     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+@@ -3218,7 +3230,7 @@ def test_readings(self):
+         from serve import telemetry
+         with tempfile.TemporaryDirectory() as d:
+             self.tree(d)
+-            with mock.patch.object(telemetry, "SYSFS", d):
++            with mock.patch.object(telemetry, "SYSFS", d), mock.patch.dict(os.environ, {"STRATA_LHM_URL": ""}):
+                 self.assertTrue(telemetry.amd_device_dir(0).endswith(os.path.join("renderD129", "device")))
+                 self.assertTrue(telemetry.amd_device_dir(1).endswith(os.path.join("renderD128", "device")))
+                 self.assertIsNone(telemetry.amd_device_dir(2))
+@@ -3236,6 +3248,7 @@ def test_readings(self):
+                 self.assertEqual(t.static["gpu_name"], "AMD Radeon AI PRO R9700 + AMD Radeon AI PRO R9700")
+                 self.assertEqual((s["gpu_mem_used"], s["gpu_util"], s["gpu_temp"], s["gpu_power"]),
+                                  (8 << 30, 68.0, 64.0, 205.0))
++                self.assertNotIn("other_gpus", s)
+         with tempfile.TemporaryDirectory() as d:                    # no amdgpu: nothing, and nothing breaks
+             with mock.patch.object(telemetry, "SYSFS", d):
+                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
+@@ -3252,6 +3265,136 @@ def test_free_vram_on_hip(self):
+                 self.assertEqual(svc.free_vram_mib(), 26 << 10)
+ 
+ 
++class NvidiaTelemetry(unittest.TestCase):
++    """Per-card and all-NVIDIA-card telemetry can be checked without a GPU."""
++
++    class Reader:
++        def __init__(self, index, power):
++            self.index, self.power = index, power
++            self.reads = 0
++            self.unreadable = False
++
++        def ok(self):
++            return True
++
++        def name(self):
++            return f"Fake GPU {self.index}"
++
++        def read(self):
++            self.reads += 1
++            if self.unreadable:
++                raise OSError("fake NVML read failure")
++            return {"util": 10 + self.index, "mem_used": (2 + self.index) << 30, "mem_total": 8 << 30,
++                    "temp": 50 + self.index, "power": self.power, "power_limit": 200 + self.index,
++                    "pcie_rx_mb": 1.5 + self.index, "pcie_tx_mb": 2.5 + self.index, "pcie_gen": 4,
++                    "pcie_gen_max": 5, "pcie_width": 16}
++
++    def make(self, indices, count, readers):
++        from serve import telemetry
++        def reader(index, amd=False):
++            return readers[index]
++        with mock.patch.dict(os.environ, {"STRATA_LHM_URL": ""}), \
++                mock.patch.object(telemetry, "gpu_reader", side_effect=reader), \
++                mock.patch.object(telemetry._Nvml, "count", return_value=count), \
++                mock.patch.object(telemetry.threading.Thread, "start"):
++            instance = telemetry.Telemetry(gpu_index=indices[0], gpu_indices=indices)
++        return instance
++
++    def test_multi_card_fields_totals_and_history(self):
++        from serve import telemetry
++        readers = {i: self.Reader(i, 30 + i) for i in range(2)}
++        t = self.make([0, 1], 2, readers)
++        s = t.sample()
++        self.assertEqual(s["gpu_power"], 61)
++        self.assertEqual(s["gpu_util"], 10.5)
++        self.assertEqual(s["gpus"][1], {"index": 1, "util": 11, "mem_used": 3 << 30, "mem_total": 8 << 30,
++                                          "temp": 51, "power": 31, "power_limit": 201, "pcie_rx_mb": 2.5,
++                                          "pcie_tx_mb": 3.5, "pcie_gen": 4, "pcie_gen_max": 5, "pcie_width": 16})
++        for _ in range(3):
++            t.record(s)
++        history = t.snapshot()["history"]
++        self.assertEqual(len(history["gpus"]["1"]["power"]), 3)
++        self.assertEqual(history["gpu_pcie_tx_mb"], [6.0, 6.0, 6.0])
++        self.assertEqual(readers[0].reads, 1)
++        self.assertEqual(readers[1].reads, 1)
++
++    def test_single_card_has_no_per_card_container(self):
++        t = self.make([0], 1, {0: self.Reader(0, 30)})
++        s = t.sample()
++        t.record(s)
++        self.assertNotIn("gpus", s)
++        self.assertNotIn("gpus", t.snapshot()["history"])
++        self.assertNotIn("all_gpu_power", t.snapshot()["history"])
++
++    def test_other_card_power_is_in_all_card_total(self):
++        t = self.make([0], 2, {0: self.Reader(0, 30), 1: self.Reader(1, 40)})
++        s = t.sample()
++        self.assertEqual(s["gpus"][0]["index"], 0)
++        self.assertEqual(s["other_gpus"], [{"index": 1, "util": 11, "mem_used": 3 << 30, "mem_total": 8 << 30,
++                                             "temp": 51, "power": 40, "power_limit": 201, "pcie_rx_mb": 2.5,
++                                             "pcie_tx_mb": 3.5, "pcie_gen": 4, "pcie_gen_max": 5,
++                                             "pcie_width": 16}])
++        self.assertEqual(s["all_gpu_power"], 70)
++        self.assertEqual(t.static["other_gpu_names"], ["Fake GPU 1"])
++        t.record(s)
++        no_power = dict(s)
++        no_power.pop("all_gpu_power")
++        t.record(no_power)
++        self.assertEqual(t.snapshot()["history"]["all_gpu_power"], [70, None])
++        self.assertEqual(t.gpus[0][1].reads, 1)
++        history = t.snapshot()["history"]["gpus"]
++        self.assertEqual(history["0"]["power"], [30, 30])
++        self.assertEqual(history["1"]["power"], [40, 40])
++        self.assertEqual(history["1"]["pcie_rx_mb"], [2.5, 2.5])
++        self.assertEqual(t.other_gpus[0][1].reads, 1)
++
++    def test_unreadable_other_card_is_reported_with_null_fields(self):
++        readers = {0: self.Reader(0, 30), 1: self.Reader(1, 40)}
++        readers[1].unreadable = True
++        t = self.make([0], 2, readers)
++        card = t.sample()["other_gpus"][0]
++        self.assertEqual(card, {"index": 1, "util": None, "mem_used": None, "mem_total": None,
++                                "temp": None, "power": None, "power_limit": None, "pcie_rx_mb": None,
++                                "pcie_tx_mb": None, "pcie_gen": None, "pcie_gen_max": None, "pcie_width": None})
++
++    def test_eight_engine_cards_and_two_other_cards(self):
++        readers = {i: self.Reader(i, 30 + i) for i in range(10)}
++        t = self.make(list(range(8)), 10, readers)
++        sample = t.sample()
++        self.assertEqual(len(sample["gpus"]), 8)
++        self.assertEqual([g["index"] for g in sample["other_gpus"]], [8, 9])
++        self.assertEqual(sample["all_gpu_power"], sum(range(30, 40)))
++        t.record(sample)
++        self.assertEqual(set(t.snapshot()["history"]["gpus"]), {str(i) for i in range(10)})
++
++    def test_count_failure_does_not_stop_sampling(self):
++        from serve import telemetry
++        for result in (0, RuntimeError("NVML unavailable")):
++            with self.subTest(result=result):
++                with mock.patch.dict(os.environ, {"STRATA_LHM_URL": ""}), \
++                        mock.patch.object(telemetry, "gpu_reader", return_value=self.Reader(0, 30)), \
++                        mock.patch.object(telemetry._Nvml, "count", side_effect=result if isinstance(result, Exception)
++                                          else None, return_value=result), \
++                        mock.patch.object(telemetry.threading.Thread, "start"):
++                    t = telemetry.Telemetry(gpu_index=0)
++                sample = t.sample()
++                self.assertNotIn("other_gpus", sample)
++                self.assertEqual(sample["gpu_power"], 30)
++
++    def test_nvml_count_error_code_returns_zero(self):
++        from serve import telemetry
++        class FakeLib:
++            @staticmethod
++            def nvmlInit_v2():
++                return 0
++
++            @staticmethod
++            def nvmlDeviceGetCount_v2(_ptr):
++                return 3
++        with mock.patch.object(telemetry.ctypes, "CDLL", return_value=FakeLib()):
++            self.assertEqual(telemetry._Nvml.count(), 0)
++
++
+ class SilentEngine(unittest.TestCase):
+     """#481: an engine that prints nothing for engine_silence_s during a request (or never acknowledges a STOP) has
+     lost step with the server: it is ended and the request fails with EngineDied, instead of waiting forever."""
+diff --git a/serve/web/app.css b/serve/web/app.css
+index dd9a3e1fe3..b056b3f39e 100644
+--- a/serve/web/app.css
++++ b/serve/web/app.css
+@@ -87,8 +87,40 @@ main { flex: 1; min-height: 0; display: flex; }
+ .badges .st-badge.on { opacity: 1; }
+ .state-card__row { display: flex; justify-content: space-between; gap: var(--st-s-4); font-size: var(--st-fs-sm);
+                    font-weight: var(--st-fw-medium); font-variant-numeric: tabular-nums; }
+-.metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--st-s-4); }
+-.metric-card { padding: var(--st-s-4) var(--st-s-5); }
++.gpu-selector { display: flex; align-items: center; gap: var(--st-s-4); margin-left: auto; max-width: 100%; }
++.gpu-selector__seg { display: flex; align-items: center; gap: var(--st-s-2); max-width: 100%; }
++.seg.gpu-seg { display: flex; flex-wrap: wrap; grid-template-columns: none; width: max-content; max-width: 100%; }
++.gpu-seg button { flex: 0 0 auto; min-width: 64px; padding: 0 12px; }
++.seg.gpu-seg[hidden], .gpu-select-wrap[hidden] { display: none; }
++.gpu-seg__other { color: var(--st-ink-muted); }
++.gpu-select-wrap { display: flex; align-items: center; gap: var(--st-s-2); width: max-content; max-width: 100%; }
++.gpu-select-wrap select { min-width: 180px; height: 36px; padding: 0 var(--st-s-3); border: 1px solid var(--st-line);
++                         border-radius: var(--st-r-md); background: var(--st-surface); color: var(--st-ink); font: inherit; }
++.metric-area { display: flex; flex-direction: column; gap: var(--st-s-2); }
++.metric-toolbar { display: flex; justify-content: flex-end; }
++.metric-toolbar[hidden] { display: none; }
++.metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--st-s-4); align-items: stretch; }
++.metric-grid > .st-card { min-width: 0; }
++.stats-card { min-width: 0; }
++.stats-card[hidden] { display: none; }
++.stats-card[data-tone="warn"] .st-metric__value, .stats-card[data-tone="warn"] .st-metric__spark { color: var(--st-warn); }
++.stats-card[data-tone="danger"] .st-metric__value { color: var(--st-danger); }
++.stats-empty-value { color: var(--st-ink-muted); font-size: var(--st-fs-sm); font-weight: var(--st-fw-regular);
++                    letter-spacing: normal; line-height: 1.2; }
++.stats-vram-bar { margin-top: 4px; }
++.stats-card .st-metric__sub { overflow-wrap: anywhere; }
++.stats-graph-note { height: 32px; color: var(--st-ink-muted); font-size: var(--st-fs-xs); }
++.stats-graph-note[hidden], .st-metric__spark[hidden] { display: none; }
++.metric-card { position: relative; padding: var(--st-s-4) var(--st-s-5); }
++.metric-grid > .metric-card { cursor: grab; -webkit-touch-callout: none; }
++.metric-grid > .metric-card button, .metric-grid > .metric-card a, .metric-grid > .metric-card select { cursor: auto; }
++.metric-card.is-dragging { cursor: grabbing; opacity: .92; box-shadow: var(--st-sh-card); pointer-events: none; }
++.metric-card-placeholder { border: 1px dashed var(--st-line); border-radius: var(--st-r-md); background: var(--st-surface-2); }
++.metric-order-reset { border: 0; padding: 0; background: transparent; color: var(--st-ink-muted); font: inherit; font-size: var(--st-fs-xs); text-decoration: underline; cursor: pointer; }
++.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
++.metric-card__hide { position: absolute; top: var(--st-s-1); right: var(--st-s-1); width: 28px; height: 28px; opacity: 0; }
++.metric-card:hover .metric-card__hide, .metric-card:focus-within .metric-card__hide { opacity: 1; }
++@media (hover: none) { .metric-card__hide { opacity: 1; } }
+ .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
+ .st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em; }
+ .st-metric__spark { display: block; overflow: visible; }
+@@ -111,7 +143,11 @@ main { flex: 1; min-height: 0; display: flex; }
+            margin-top: var(--st-s-2); font-variant-numeric: tabular-nums; }
+ .req-card { display: flex; flex-direction: column; gap: var(--st-s-3); min-width: 0; }
+ .table-wrap { overflow-x: auto; }
++#req-wrap .st-table td { white-space: nowrap; }
++#req-wrap .st-table td:nth-child(9) .muted { display: block; }
++#req-wrap .st-table th, #req-wrap .st-table td { padding-left: 8px; padding-right: 8px; }
+ .req-head { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-2); }
++.req-actions { display: flex; align-items: center; gap: var(--st-s-2); }
+ .table-wrap.all { max-height: 420px; overflow-y: auto; }
+ .req-totals { margin: 0; font-size: var(--st-fs-sm); }
+ .req-totals:empty { display: none; }
+@@ -164,7 +200,7 @@ main { flex: 1; min-height: 0; display: flex; }
+ 
+ /* ---------------------------------------------------------------- narrow screens */
+ @media (max-width: 1000px) {
+-  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+   .monitor-row { grid-template-columns: 1fr; }
+   .cc-bars { grid-template-columns: 1fr; }
+   .cfg-form { grid-template-columns: 1fr; gap: 4px; }
+@@ -179,6 +215,9 @@ main { flex: 1; min-height: 0; display: flex; }
+   .chat { padding: var(--st-s-5) var(--st-s-4); }
+   .composer-wrap { padding: 0 var(--st-s-3) var(--st-s-3); }
+   .monitor, .about { padding: var(--st-s-4); }
++  .gpu-selector { flex: 0 0 100%; margin-left: 0; }
++  .gpu-selector__seg { flex-wrap: wrap; }
++  .gpu-select-wrap { flex-wrap: wrap; }
+   .facts { grid-template-columns: 1fr; gap: 2px; }
+   .facts dd { margin-bottom: var(--st-s-2); }
+ }
+diff --git a/serve/web/app.js b/serve/web/app.js
+index ade19016ba..99a4579c45 100644
+--- a/serve/web/app.js
++++ b/serve/web/app.js
+@@ -4,7 +4,10 @@
+ 
+ const $ = (id) => document.getElementById(id);
+ const SPRITE = "web/sprite.svg";
+-const icon = (name, cls = "st-icon") => `<svg class="${cls}" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
++const icon = (name, cls = "st-icon") => name === "forge"
++  ? `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor"/><rect x="9" y="4" width="1.5" height="3" rx="0.5" fill="currentColor"/><rect x="13.5" y="4" width="1.5" height="3" rx="0.5" fill="currentColor"/><rect x="9" y="17" width="1.5" height="3" rx="0.5" fill="currentColor"/><rect x="13.5" y="17" width="1.5" height="3" rx="0.5" fill="currentColor"/><rect x="4" y="9" width="3" height="1.5" rx="0.5" fill="currentColor"/><rect x="4" y="13.5" width="3" height="1.5" rx="0.5" fill="currentColor"/><rect x="17" y="9" width="3" height="1.5" rx="0.5" fill="currentColor"/><rect x="17" y="13.5" width="3" height="1.5" rx="0.5" fill="currentColor"/></svg>`
++  : name === "close" ? `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`
++  : `<svg class="${cls}" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
+ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+ const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
+ const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000 ? 0 : 1)}k` : fmt(n));
+@@ -116,12 +119,12 @@ const METRICS = [
+   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
+   {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
+   {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
+-  {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
++  {key: "cpu", label: "CPU load", icon: "cpu", unit: "%", series: "cpu", max: 100},
+   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
+ ];
+-$("metrics").innerHTML = METRICS.map((m) => `
+-  <div class="st-card metric-card"><div class="st-metric">
+-    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
++const metricMarkup = Object.fromEntries(METRICS.map((m) => [m.key, `
++  <div class="st-card metric-card" id="${m.key}" data-card-key="${m.key}"><button class="metric-card__hide st-btn st-btn--icon" data-hide-card="${m.key}" aria-label="Hide ${esc(m.label)}" title="Hide ${esc(m.label)}">${icon("close", "st-icon st-icon--sm")}</button><div class="st-metric">
++    <span class="st-metric__label" id="ml-${m.key}">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
+     ${m.key === "speed" ? `<div class="speed-values">
+       <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
+       <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
+@@ -133,28 +136,369 @@ $("metrics").innerHTML = METRICS.map((m) => `
+       ${m.key === "speed" ? `<g id="sp-prefill" class="speed-prefill"><path class="area" fill="currentColor" opacity=".12"/>
+         <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
+         stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
+-  </div></div>`).join("");
++  </div></div>`]));
+ 
+-function spark(id, values, max) {
++const STAT_CARDS = [
++  {key: "speculation", label: "Speculation", icon: "bolt", spark: true},
++  {key: "reuse", label: "Prompt reuse", icon: "layers", spark: true},
++  {key: "prefill-time", label: "Prefill time", icon: "clock", spark: true},
++  {key: "vram-free", label: "VRAM free", icon: "layers", spark: true},
++  {key: "cpu-temp", label: "CPU temp", icon: "thermometer", spark: true},
++  {key: "all-power", label: "All GPU power", icon: "bolt", spark: true},
++  {key: "session", label: "Session", icon: "clock", spark: false},
++  {key: "forge", label: "Forge", icon: "forge", spark: false},
++];
++const statMarkup = Object.fromEntries(STAT_CARDS.map((card) => [card.key, `
++  <div class="st-card metric-card stats-card" id="${card.key}" data-card-key="${card.key}"${["all-power", "cpu-temp", "forge"].includes(card.key) ? " hidden" : ""}>
++    <button class="metric-card__hide st-btn st-btn--icon" data-hide-card="${card.key}" aria-label="Hide ${esc(card.label)}" title="Hide ${esc(card.label)}">${icon("close", "st-icon st-icon--sm")}</button>
++    <div class="st-metric">
++      <span class="st-metric__label" id="sl-${card.key}">
++        ${icon(card.icon, "st-icon st-icon--sm")}<span id="slt-${card.key}">${esc(card.label)}</span></span>
++      <span class="st-metric__value" id="sv-${card.key}">–</span>
++      <span class="st-metric__sub" id="ss-${card.key}"></span>
++      ${card.key === "vram-free" ? `<div class="st-progress stats-vram-bar" id="vram-free-progress">
++        <div class="st-progress__bar" id="vram-free-bar" style="width:0%"></div></div>` : ""}
++      ${card.spark ? `<svg class="st-metric__spark" id="sp-${card.key}" viewBox="0 0 100 32"
++        preserveAspectRatio="none">
++        <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
++        stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"
++        vector-effect="non-scaling-stroke"/></svg>` : ""}
++      ${["reuse", "prefill-time"].includes(card.key)
++        ? `<div class="stats-graph-note" id="gn-${card.key}" hidden>graph after 2 requests</div>` : ""}
++    </div>
++  </div>`]));
++
++// One grid for every Monitor card, so a card can be dragged to any position; the rows come from wrapping.
++const METRIC_CARDS = ["speed", "prefill-time", "reuse", "speculation", "gpu", "vram", "vram-free", "temp",
++  "power", "all-power", "pcie", "cpu-temp", "cpu", "disk", "session", "forge"];
++const metricGrid = $("metric-cards");
++metricGrid.innerHTML = METRIC_CARDS.map((key) => metricMarkup[key] || statMarkup[key]).join("");
++const CARD_ORDER_KEY = "monitor.cardOrder";
++// Cards hidden with the x stay hidden across reloads; Reset layout brings them back.
++const HIDDEN_CARDS_KEY = "monitor.hiddenCards";
++const savedHidden = store.get(HIDDEN_CARDS_KEY, []);
++const userHiddenCards = new Set(Array.isArray(savedHidden) ? savedHidden.filter((key) => METRIC_CARDS.includes(key)) : []);
++for (const key of userHiddenCards) $(key).hidden = true;
++const cardKeys = () => [...metricGrid.children].map((card) => card.dataset.cardKey);
++function updateResetCardOrder() {
++  const hidden = userHiddenCards.size;
++  const button = $("reset-card-order");
++  button.textContent = hidden ? `Reset layout · ${hidden} icon${hidden === 1 ? "" : "s"} hidden` : "Reset layout";
++  button.parentElement.hidden = !hidden && cardKeys().join("\0") === METRIC_CARDS.join("\0");
++}
++function applySavedCardOrder() {
++  const saved = store.get(CARD_ORDER_KEY, null);
++  const known = Array.isArray(saved)
++    ? saved.filter((key, index, list) => METRIC_CARDS.includes(key) && list.indexOf(key) === index) : [];
++  const cards = new Map([...metricGrid.children].map((card) => [card.dataset.cardKey, card]));
++  for (const key of [...known, ...METRIC_CARDS.filter((key) => !known.includes(key))]) metricGrid.appendChild(cards.get(key));
++  updateResetCardOrder();
++}
++function saveCardOrder() {
++  store.set(CARD_ORDER_KEY, cardKeys());
++  updateResetCardOrder();
++}
++applySavedCardOrder();
++$("reset-card-order").addEventListener("click", () => {
++  try {
++    localStorage.removeItem("strata." + CARD_ORDER_KEY);
++    localStorage.removeItem("strata." + HIDDEN_CARDS_KEY);
++  } catch (e) { /* storage unavailable */ }
++  userHiddenCards.clear();
++  for (const key of METRIC_CARDS) {
++    const card = metricGrid.querySelector(`[data-card-key="${key}"]`);
++    metricGrid.appendChild(card);
++    card.hidden = card.dataset.metricDataHidden === "true";
++  }
++  updateResetCardOrder();
++});
++const cardPositionLive = $("card-position-live");
++let cardDrag = null;
++let pendingCardDrag = null;
++function startCardDrag(card, event) {
++  if (cardDrag) return;
++  const rect = card.getBoundingClientRect();
++  const placeholder = document.createElement("div");
++  placeholder.className = "metric-card-placeholder";
++  placeholder.style.width = `${rect.width}px`;
++  placeholder.style.height = `${rect.height}px`;
++  card.parentNode.insertBefore(placeholder, card);
++  cardDrag = {card, placeholder, grid: card.parentNode,
++    next: placeholder.nextSibling, x: event.clientX, y: event.clientY, style: card.getAttribute("style")};
++  card.classList.add("is-dragging");
++  card.style.position = "fixed";
++  card.style.left = `${rect.left}px`;
++  card.style.top = `${rect.top}px`;
++  card.style.width = `${rect.width}px`;
++  card.style.height = `${rect.height}px`;
++  card.style.zIndex = "10";
++  card.setPointerCapture(event.pointerId);
++}
++function placeCardDrag(event) {
++  if (!cardDrag) return;
++  const {card, placeholder, grid, x, y} = cardDrag;
++  card.style.transform = `translate3d(${event.clientX - x}px, ${event.clientY - y}px, 0)`;
++  const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(".metric-card");
++  if (!target || target === card || target.parentNode !== grid || target.hidden) return;
++  const rect = target.getBoundingClientRect();
++  const before = event.clientY < rect.top + rect.height / 2 ||
++    (event.clientY <= rect.bottom && event.clientX < rect.left + rect.width / 2);
++  grid.insertBefore(placeholder, before ? target : target.nextSibling);
++}
++function finishCardDrag(event, cancel = false) {
++  if (!cardDrag) return;
++  const drag = cardDrag;
++  cardDrag = null;
++  // Released outside the card area (over the state card, say): the card goes back where it was.
++  const valid = !cancel && Boolean(document.elementFromPoint(event.clientX, event.clientY)?.closest("#metrics"));
++  drag.card.classList.remove("is-dragging");
++  if (drag.style === null) drag.card.removeAttribute("style");
++  else drag.card.setAttribute("style", drag.style);
++  if (valid) {
++    drag.grid.insertBefore(drag.card, drag.placeholder);
++    saveCardOrder();
++  } else if (drag.next?.parentNode === drag.grid) drag.grid.insertBefore(drag.card, drag.next);
++  else drag.grid.appendChild(drag.card);
++  drag.placeholder.remove();
++}
++document.addEventListener("pointerdown", (event) => {
++  if (event.button !== 0 || !(event.target instanceof Element)) return;
++  const card = event.target.closest(".metric-card[data-card-key]");
++  if (!card || card.hidden || event.target.closest("button,a,select,input,textarea,[contenteditable='true']")) return;
++  const touch = event.pointerType === "touch";
++  const pending = {card, event, x: event.clientX, y: event.clientY, timer: null, started: false};
++  pendingCardDrag = pending;
++  if (touch) pending.timer = setTimeout(() => {
++    pending.started = true;
++    startCardDrag(card, event);
++  }, 250);
++});
++document.addEventListener("pointermove", (event) => {
++  const pending = pendingCardDrag;
++  if (pending && !pending.started && Math.hypot(event.clientX - pending.x, event.clientY - pending.y) >= 6) {
++    clearTimeout(pending.timer);
++    if (event.pointerType !== "touch") { pending.started = true; startCardDrag(pending.card, event); }
++    else pendingCardDrag = null;
++  }
++  if (cardDrag) placeCardDrag(event);
++});
++document.addEventListener("pointerup", (event) => {
++  if (pendingCardDrag) { clearTimeout(pendingCardDrag.timer); pendingCardDrag = null; }
++  if (cardDrag) finishCardDrag(event);
++});
++// Touch: once the press-and-hold has started a drag, the finger must move the card, not scroll the page (the
++// browser would take the gesture for a pan and cancel the pointer). Needs a non-passive listener.
++document.addEventListener("touchmove", (event) => { if (cardDrag) event.preventDefault(); }, {passive: false});
++document.addEventListener("contextmenu", (event) => { if (cardDrag || pendingCardDrag?.started) event.preventDefault(); });
++document.addEventListener("pointercancel", (event) => {
++  if (pendingCardDrag) { clearTimeout(pendingCardDrag.timer); pendingCardDrag = null; }
++  if (cardDrag) finishCardDrag(event, true);
++});
++document.addEventListener("keydown", (event) => {
++  if (event.key === "Escape" && cardDrag) { finishCardDrag(event, true); return; }
++  if (!event.altKey || !["ArrowLeft", "ArrowRight"].includes(event.key) || !(event.target instanceof Element)) return;
++  if (!event.target.closest("[data-hide-card]")) return;
++  const card = event.target.closest(".metric-card[data-card-key]");
++  if (!card) return;
++  const cards = [...card.parentNode.children].filter((candidate) => !candidate.hidden);
++  const index = cards.indexOf(card), next = index + (event.key === "ArrowLeft" ? -1 : 1);
++  if (next < 0 || next >= cards.length) return;
++  event.preventDefault();
++  card.parentNode.insertBefore(card, event.key === "ArrowLeft" ? cards[next] : cards[next].nextSibling);
++  saveCardOrder();
++  const label = card.querySelector(".st-metric__label, [id^='slt-']")?.textContent.trim() || card.dataset.cardKey;
++  cardPositionLive.textContent = `Moved ${label} to position ${next + 1} of ${cards.length}`;
++});
++function setCardHidden(card, dataHidden) {
++  card.dataset.metricDataHidden = String(Boolean(dataHidden));
++  card.hidden = Boolean(dataHidden) || userHiddenCards.has(card.dataset.cardKey || card.id);
++}
++document.addEventListener("click", (event) => {
++  const button = event.target.closest("[data-hide-card]");
++  if (!button) return;
++  const card = $(button.dataset.hideCard);
++  if (!card) return;
++  const order = [...document.querySelectorAll(".metric-card")];
++  const index = order.indexOf(card);
++  if (!("metricDataHidden" in card.dataset)) card.dataset.metricDataHidden = String(card.hidden);
++  userHiddenCards.add(button.dataset.hideCard);
++  store.set(HIDDEN_CARDS_KEY, [...userHiddenCards]);
++  card.hidden = true;
++  updateResetCardOrder();
++  const next = order.slice(index + 1).find((candidate) => !candidate.hidden)
++    || order.slice(0, index).reverse().find((candidate) => !candidate.hidden);
++  if (next) next.querySelector("[data-hide-card]").focus();
++  else document.querySelector('.st-tab[data-tab="monitor"]')?.focus();
++});
++
++// `fit`: scale to the series' own range (at least 10 units) instead of from 0, so a temperature moving between
++// 25 and 30 degrees is visible rather than a flat line near the top.
++function spark(id, values, max, fit) {
+   const svg = $(id);
+   const v = (values || []).map((x) => (x == null ? 0 : x));
+   if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
+-  const top = Math.max(max || 0, ...v, 1e-9);
+-  const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
++  let bottom = 0, top = Math.max(max || 0, ...v, 1e-9);
++  const known = fit ? (values || []).filter((x) => x != null) : [];
++  if (known.length) {
++    bottom = Math.max(0, Math.min(...known) - 2);
++    top = Math.max(Math.max(...known) + 2, bottom + 10);
++  }
++  const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (Math.max(0, x - bottom) / (top - bottom)) * 26]);
+   const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
+   svg.querySelector(".line").setAttribute("d", line);
+   svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
+ }
+-function setMetric(key, value, unit, sub) {
++function setMetric(key, value, unit, sub, options = {}) {
+   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
+   $(`ms-${key}`).textContent = sub || "";
++  $(`ms-${key}`).title = "";
++  const card = $(key);   // "prefill" is a value inside the Speed card, not a card of its own
++  if (card) setCardHidden(card, options.hidden);
++}
++
++let gpuSelection = String(store.get("monitor.gpu", "all"));
++let gpuSelectorSignature = "";
++function updateGpuSelector(hw, st) {
++  const engineCards = (Array.isArray(hw.gpus) ? hw.gpus : []).map((g) => ({...g, inModel: true}));
++  const otherCards = (Array.isArray(hw.other_gpus) ? hw.other_gpus : []).map((g) => ({...g, inModel: false}));
++  const cards = [...engineCards, ...otherCards];
++  const indexes = cards.map((g) => String(g.index));
++  if (gpuSelection !== "all" && !indexes.includes(gpuSelection)) {
++    gpuSelection = "all";
++    store.set("monitor.gpu", gpuSelection);
++  }
++  const multiple = cards.length > 1;
++  const buttonsMode = cards.length <= 6;
++  const seg = $("gpu-seg"), selectWrap = $("gpu-select-wrap"), select = $("gpu-select"), selector = $("gpu-selector");
++  selector.hidden = !multiple;
++  $("gpu-seg-label").hidden = !multiple || !buttonsMode;
++  seg.hidden = !multiple || !buttonsMode;
++  selectWrap.hidden = !multiple || buttonsMode;
++  const splitNames = typeof st.gpu_name === "string" ? st.gpu_name.split(" + ") : [];
++  const engineNames = splitNames.length === engineCards.length ? splitNames : [];
++  const otherNames = Array.isArray(st.other_gpu_names) ? st.other_gpu_names : [];
++  const names = [...engineCards.map((_, i) => engineNames[i] || ""),
++    ...otherCards.map((_, i) => otherNames[i] || "")];
++  const signature = JSON.stringify([buttonsMode, indexes, names, engineCards.length]);
++  if (signature !== gpuSelectorSignature) {
++    gpuSelectorSignature = signature;
++    const options = [{value: "all", label: "All", card: null},
++      ...cards.map((card, i) => ({value: String(card.index), label: `GPU ${card.index}`, card, name: names[i]}))];
++    const optionTitle = (option) => !option.card ? "" : option.card.inModel ? option.name || ""
++      : `${option.label}${option.name ? ` (${option.name})` : ""} is not in use by the model`;
++    if (buttonsMode) {
++      seg.replaceChildren();
++      for (const option of options) {
++        const button = document.createElement("button");
++        button.type = "button";
++        button.setAttribute("role", "radio");
++        button.dataset.value = option.value;
++        button.appendChild(document.createTextNode(option.label));
++        if (option.card && !option.card.inModel) {
++          const marker = document.createElement("span");
++          marker.className = "gpu-seg__other";
++          marker.setAttribute("aria-hidden", "true");
++          marker.textContent = " (not in use)";
++          button.appendChild(marker);
++        }
++        button.title = optionTitle(option);
++        seg.appendChild(button);
++      }
++    } else {
++      select.replaceChildren();
++      for (const option of options) {
++        const el = document.createElement("option");
++        el.value = option.value;
++        el.textContent = `${option.label}${option.card && !option.card.inModel ? " (not in use)" : ""}`;
++        el.title = optionTitle(option);
++        select.appendChild(el);
++      }
++    }
++  }
++  for (const button of seg.querySelectorAll('[role="radio"]')) {
++    button.setAttribute("aria-checked", String(button.dataset.value === gpuSelection));
++  }
++  select.value = gpuSelection;
++  return {cards, engineCards, otherCards, indexes, names};
++}
++function setGpuSelection(value, refocus = false) {
++  gpuSelection = value;
++  store.set("monitor.gpu", gpuSelection);
++  if (lastMetrics) render(lastMetrics);
++  if (refocus) {
++    const button = [...$("gpu-seg").querySelectorAll('[role="radio"]')]
++      .find((el) => el.dataset.value === gpuSelection);
++    if (button) button.focus();
++  }
++}
++$("gpu-seg").addEventListener("click", (event) => {
++  const button = event.target.closest('[role="radio"]');
++  if (button) setGpuSelection(button.dataset.value, true);
++});
++$("gpu-seg").addEventListener("keydown", (event) => {
++  if (!["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp"].includes(event.key)) return;
++  const buttons = [...$("gpu-seg").querySelectorAll('[role="radio"]')];
++  if (!buttons.length) return;
++  event.preventDefault();
++  const current = buttons.findIndex((button) => button === document.activeElement);
++  const from = current < 0 ? Math.max(0, buttons.findIndex((button) => button.dataset.value === gpuSelection)) : current;
++  const step = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : -1;
++  const next = buttons[(from + step + buttons.length) % buttons.length];
++  setGpuSelection(next.dataset.value, true);
++});
++$("gpu-select").addEventListener("change", (event) => setGpuSelection(event.target.value));
++
++function gpuMetricData(hw, h, selector) {
++  const cards = selector.cards;
++  const selected = cards.length > 1 && gpuSelection !== "all"
++    ? cards.find((g) => String(g.index) === gpuSelection) : null;
++  if (!selected) return {hw, history: h, cards, engineCards: selector.engineCards,
++    otherCards: selector.otherCards, selected: null, names: selector.names};
++  const history = h.gpus && h.gpus[gpuSelection] ? h.gpus[gpuSelection] : {};
++  return {
++    hw: {...hw, gpu_util: selected.util, gpu_mem_used: selected.mem_used, gpu_mem_total: selected.mem_total,
++      gpu_temp: selected.temp, gpu_power: selected.power, gpu_power_limit: selected.power_limit,
++      gpu_pcie_rx_mb: selected.pcie_rx_mb, gpu_pcie_tx_mb: selected.pcie_tx_mb,
++      gpu_pcie_gen: selected.pcie_gen, gpu_pcie_gen_max: selected.pcie_gen_max,
++      gpu_pcie_width: selected.pcie_width},
++    history, cards, engineCards: selector.engineCards, otherCards: selector.otherCards,
++    selected, names: selector.names,
++  };
++}
++
++// A one-line summary of a reading over several cards (the tightest or the highest); `title` lists every card.
++function perCardLine(cards, value, format, options = {}) {
++  const rows = cards.map((card) => ({card, score: value(card), text: `GPU ${card.index} ${format(card)}`}));
++  const full = rows.map((row) => row.text).join(" · ");
++  if (cards.length === 1) return {text: full, title: full};
++  if (options.summary === "tightest") {
++    const tightest = rows.filter((row) => Number.isFinite(row.score)).reduce(
++      (best, row) => !best || row.score < best.score ? row : best, null);
++    return {text: tightest ? `${cards.length} cards · GPU ${tightest.card.index} tightest` : `${cards.length} cards`,
++      title: full};
++  }
++  const highest = rows.filter((row) => Number.isFinite(row.score)).reduce(
++    (best, row) => !best || row.score > best.score ? row : best, null);
++  const count = `${cards.length} ${options.countLabel || "cards"}`;
++  return {text: highest ? `${count} · max ${format(highest.card)} on GPU ${highest.card.index}` : count, title: full};
++}
++
++function allGpuLine(engineCards, otherCards, value, format) {
++  const rows = [...engineCards, ...otherCards].map((card) => ({card,
++    text: `GPU ${card.index} ${format(card)}${card.inModel ? "" : " (not in use)"}`}));
++  const details = rows.map((row) => row.text).join(" · ");
++  if (engineCards.length + otherCards.length <= 3) return {text: details, title: ""};
++  const summary = perCardLine(engineCards, value, format, {countLabel: "cards in use"});
++  return {text: `${summary.text}${otherCards.length ? ` · ${otherCards.length} not in use` : ""}`,
++    title: details};
+ }
+ 
+ let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
+ let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
++let reqClearedAfter = null;
+ async function poll() {
+   try {
+-    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
++    const r = await fetch(reqShowAll || reqClearedAfter != null ? "metrics?requests=all" : "metrics", {headers: headers()});
+     if (r.status === 401) {
+       setPill("error", "API key needed");
+       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+@@ -190,7 +534,7 @@ function render(m) {
+     setPill("idle", "Idle");
+   }
+   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
++  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.forge);
+   if (tab === "monitor") renderConvCache(m.conversation_cache);
+   if (tab === "about") renderAbout(eng, hw, st);
+ }
+@@ -237,7 +581,198 @@ function renderTotals(t) {
+   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
+          `${fmt(t.output_tokens)} written${oSpeed}`;
+ }
+-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
++function setStat(key, value, unit, sub, values, max, options = {}) {
++  $(`sv-${key}`).innerHTML = options.mutedValue
++    ? `<span class="stats-empty-value">${esc(options.mutedValue)}</span>`
++    : value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
++  $(`ss-${key}`).textContent = sub || "";
++  $(`ss-${key}`).title = options.subTitle || "";
++  $(`sl-${key}`).title = options.title || "";
++  const card = $(key);
++  setCardHidden(card, options.hidden);
++  card.title = options.cardTitle || "";
++  if (options.tone) card.dataset.tone = options.tone; else delete card.dataset.tone;
++  if (key === "vram-free") {
++    const progress = $("vram-free-progress");
++    const bar = $("vram-free-bar");
++    if (options.tone) progress.dataset.tone = options.tone; else delete progress.dataset.tone;
++    bar.style.width = `${options.ratio == null ? 0 : Math.max(0, Math.min(100, options.ratio))}%`;
++  }
++  if (values !== undefined) {
++    spark(`sp-${key}`, values, max, key === "cpu-temp");
++    if (key === "reuse" || key === "prefill-time") {
++      const graph = $(`sp-${key}`), note = $(`gn-${key}`);
++      if (options.graphState === "unreported") {
++        graph.hidden = true;
++        note.hidden = true;
++      } else {
++        const waiting = options.graphState === "waiting" || values.length < 2;
++        graph.hidden = waiting;
++        note.hidden = !waiting;
++      }
++    }
++  }
++}
++const pct = (part, whole) => Number.isFinite(part) && Number.isFinite(whole) && whole > 0 ? 100 * part / whole : null;
++function renderStats(eng, hw, st, h, requests, totals, forge) {
++  const cpuTempMissing = hw.cpu_temp == null;
++  const cpuTempNotice = cpuTempMissing && st.os === "windows";
++  const cpuTempHint = "Run LibreHardwareMonitor with its web server on (Options > Remote Web Server, port 8085), or set STRATA_LHM_URL.";
++  setStat("cpu-temp", cpuTempMissing ? null : fmt(hw.cpu_temp), "°C",
++    cpuTempMissing ? "" : st.cpu_name || "", h.cpu_temp, 100,
++    {tone: "warn", hidden: cpuTempMissing && !cpuTempNotice,
++      mutedValue: cpuTempNotice ? "Needs LibreHardwareMonitor" : "", title: cpuTempNotice ? cpuTempHint : "",
++      cardTitle: cpuTempNotice ? cpuTempHint : ""});
++  const rows = Array.isArray(requests) ? requests : [];
++  const newest = rows[0] || null;
++  const noRequests = !rows.length || Number(totals && totals.requests) === 0;
++  const offeredTotal = Number(totals && totals.drafts_offered);
++  const acceptedTotal = Number(totals && totals.drafts_accepted);
++  const specEnabled = Number(eng && eng.spec) > 0;
++  const specSeries = rows.slice().reverse().filter((r) => Number.isFinite(r.drafts_offered) && r.drafts_offered > 0 &&
++    Number.isFinite(r.drafts_accepted)).map((r) => pct(r.drafts_accepted, r.drafts_offered));
++  const specValue = newest && pct(newest.drafts_accepted, newest.drafts_offered);
++  const specSince = pct(acceptedTotal, offeredTotal);
++  setStat("speculation", noRequests || specValue == null ? null : fmt(specValue, 1), "%",
++    noRequests ? "" : specSince == null ? "" : `since start ${fmt(specSince, 1)}%`, specSeries, 100,
++    {hidden: !specEnabled || !(offeredTotal > 0), mutedValue: noRequests ? "No requests yet" : ""});
++
++  const reuseSeries = rows.slice().reverse().filter((r) => Number.isFinite(r.prompt_tokens) && r.prompt_tokens > 0 &&
++    Number.isFinite(r.reused)).map((r) => pct(r.reused, r.prompt_tokens));
++  const reuseReported = rows.some((r) => Number.isFinite(r.prompt_tokens) && Number.isFinite(r.reused));
++  const reuseValue = newest && pct(newest.reused, newest.prompt_tokens);
++  const reuseSince = pct(Number(totals && totals.reused), Number(totals && totals.prompt_tokens));
++  const reuseEmpty = noRequests ? "No requests yet" : !reuseReported ? "Not reported by this engine" : "";
++  setStat("reuse", reuseEmpty || reuseValue == null ? null : fmt(reuseValue, 1), "%",
++    reuseEmpty ? "" : `since start ${reuseSince == null ? "–" : `${fmt(reuseSince, 1)}%`} · ` +
++      `${fmt(totals && totals.reused || 0)} tokens`, reuseSeries, 100,
++    {mutedValue: reuseEmpty, graphState: noRequests ? "waiting" : !reuseReported ? "unreported" : ""});
++
++  const newTokens = newest && Number.isFinite(newest.prompt_tokens)
++    ? Math.max(0, newest.prompt_tokens - (Number.isFinite(newest.reused) ? newest.reused : 0)) : null;
++  const promptMs = newest && Number.isFinite(newest.prompt_ms) ? newest.prompt_ms : null;
++  const promptSpeed = promptMs > 0 && newTokens != null ? newTokens / (promptMs / 1000) : null;
++  const prefillSeries = rows.slice().reverse().filter((r) => Number.isFinite(r.prompt_ms))
++    .map((r) => r.prompt_ms / 1000);
++  const prefillReported = rows.some((r) => Number.isFinite(r.prompt_ms));
++  const prefillEmpty = noRequests ? "No requests yet" : !prefillReported ? "Not reported by this engine" : "";
++  setStat("prefill-time", prefillEmpty || promptMs == null ? null : fmt(promptMs / 1000, 1), "s",
++    prefillEmpty ? "" : newTokens == null ? "" : `${fmt(newTokens)} new tokens${promptSpeed == null ? "" : ` at ${fmt(promptSpeed)} t/s`}`,
++    prefillSeries, undefined,
++    {mutedValue: prefillEmpty, graphState: noRequests ? "waiting" : !prefillReported ? "unreported" : ""});
++
++  const engineCards = Array.isArray(hw.gpus) && hw.gpus.length ? hw.gpus :
++    hw.gpu_mem_total != null && hw.gpu_mem_used != null
++      ? [{index: null, mem_total: hw.gpu_mem_total, mem_used: hw.gpu_mem_used}] : [];
++  const otherGpuCards = Array.isArray(hw.other_gpus) ? hw.other_gpus : [];
++  const selectedEngineCard = gpuSelection !== "all"
++    ? engineCards.find((g) => String(g.index) === gpuSelection) : null;
++  const selectedOtherCard = gpuSelection !== "all"
++    ? otherGpuCards.find((g) => String(g.index) === gpuSelection) : null;
++  const selectedCard = selectedEngineCard || selectedOtherCard;
++  const freeCards = selectedCard ? [selectedCard] : engineCards;
++  const freeInfo = freeCards.map((g) => ({...g,
++    free: Number.isFinite(g.mem_total) && Number.isFinite(g.mem_used) ? g.mem_total - g.mem_used : null}));
++  const readableFree = freeInfo.filter((x) => Number.isFinite(x.free));
++  const tightest = readableFree.reduce((best, x) => !best || x.free < best.free ? x : best, null);
++  const freeGiB = tightest ? tightest.free / 1073741824 : null;
++  const totalGiB = tightest ? tightest.mem_total / 1073741824 : null;
++  const engineCount = Number.isFinite(Number(st.gpu_count)) ? Number(st.gpu_count) : engineCards.length;
++  const freeLine = !selectedCard && engineCards.length > 1
++    ? perCardLine(freeInfo, (g) => g.free, (g) => g.free == null ? "–" : `${fmt(g.free / 1073741824, 2)} GiB free`,
++      {summary: "tightest"}) : null;
++  let freeSub = "";
++  if (tightest && selectedOtherCard) freeSub = `GPU ${tightest.index} · not in use · of ${fmt(totalGiB, 1)} GiB`;
++  else if (tightest && engineCards.length === 1) freeSub = `of ${fmt(totalGiB, 1)} GiB`;
++  else if (tightest && selectedCard) freeSub = `GPU ${tightest.index} selected · ${engineCount} cards · ` +
++    `of ${fmt(totalGiB, 1)} GiB`;
++  else if (tightest) freeSub = `${freeLine.text} · of ${fmt(totalGiB, 1)} GiB`;
++  else if (engineCount > 1) freeSub = `${engineCount} cards · free VRAM unavailable`;
++  const freeTitle = freeLine ? freeLine.title : freeInfo.map((gpu) => {
++    const label = gpu.index == null ? "GPU" : `GPU ${gpu.index}`;
++    return `${label}: ${gpu.free == null ? "–" : `${fmt(gpu.free / 1073741824, 2)} GiB free`}`;
++  }).join(" · ");
++  let freeSeries = [];
++  if (tightest && engineCards.length === 1 && tightest.index == null) {
++    freeSeries = (h.gpu_mem_used || []).map((used) => used == null ? null : hw.gpu_mem_total - used);
++    freeSeries = freeSeries.map((free) => free == null ? null : free / 1073741824);
++  } else if (tightest && h.gpus && h.gpus[String(tightest.index)]) {
++    const total = tightest.mem_total;
++    freeSeries = (h.gpus[String(tightest.index)].mem_used || []).map((used) =>
++      used == null ? null : (total - used) / 1073741824);
++  }
++  const tone = freeGiB == null ? "" : freeGiB < 0.5 ? "danger" : freeGiB < 1 ? "warn" : "";
++  setStat("vram-free", freeGiB == null ? null : fmt(freeGiB, 2), "GiB", freeSub, freeSeries,
++    totalGiB, {tone, ratio: freeGiB == null || !totalGiB ? 0 : 100 * freeGiB / totalGiB,
++      title: tone ? "little VRAM left: a growing context or the vision encoder may not fit"
++        : selectedCard ? "free VRAM on the selected GPU" : "the smallest free VRAM over the cards that run the model",
++      subTitle: freeTitle});
++
++  const measuredPower = hw.measured_power != null;
++  $("slt-all-power").textContent = measuredPower ? "GPUs + CPU" : "All GPU power";
++  const power = measuredPower ? hw.measured_power : hw.all_gpu_power;
++  const powerHistory = measuredPower ? h.measured_power : h.all_gpu_power;
++  setStat("all-power", power == null ? null : fmt(power), "W",
++    measuredPower && hw.cpu_power != null
++      ? `GPUs ${fmt(hw.measured_power - hw.cpu_power)} W · CPU ${fmt(hw.cpu_power)} W`
++      : `${engineCount + otherGpuCards.length} NVIDIA cards · ${engineCount} in use`, powerHistory,
++    undefined, {hidden: otherGpuCards.length === 0 && !measuredPower});
++
++  const since = Number(totals && totals.since);
++  const elapsed = Number.isFinite(since) ? Math.max(0, Math.floor(Date.now() / 1000 - since)) : null;
++  const minutes = elapsed == null ? null : Math.floor(elapsed / 60);
++  const uptime = minutes == null ? null : minutes >= 60
++    ? `${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ""}` : `${minutes} min`;
++  const sessionSub = `${fmt(totals && totals.requests || 0)} requests · ` +
++    `${fmt(totals && totals.output_tokens || 0)} tokens written`;
++  setStat("session", uptime, "", sessionSub);
++
++  // Forge's `session` block is the chat open in its sidebar (null: none open). A Forge without the field
++  // predates it; its day-wide totals are shown, labelled as such.
++  const hasSession = Boolean(forge) && "session" in forge;
++  const forgeChat = hasSession ? forge.session : null;
++  const forgeToday = (hasSession ? forgeChat : forge && forge.today) || {};
++  const forgeLast = hasSession ? forgeChat && forgeChat.last_request : forge && forge.last_request;
++  $("slt-forge").textContent = hasSession ? "Forge · this chat" : forge ? "Forge · today" : "Forge";
++  const compact = (n) => {
++    if (!Number.isFinite(Number(n))) return "?";
++    const value = Number(n), abs = Math.abs(value);
++    if (abs >= 1e6) return `${fmt(value / 1e6, 1)}M`;
++    if (abs >= 1e3) return `${fmt(value / 1e3, abs >= 10000 ? 0 : 1)}K`;
++    return fmt(value);
++  };
++  const tools = Number(forgeToday.tool_calls) || 0;
++  const failures = Number(forgeToday.tool_failures) || 0;
++  const failedPct = tools > 0 ? fmt(100 * failures / tools, 1) : "0";
++  let forgeSub = `${fmt(forgeToday.compactions || 0)} compactions` +
++    (Number(forgeToday.compaction_attempts_failed) > 0 ? ` (${fmt(forgeToday.compaction_attempts_failed)} failed)` : "") +
++    ` · ${fmt(tools)} tools, ${failedPct}% failed · in ${compact(forgeToday.input_tokens)} / out ${compact(forgeToday.output_tokens)} tokens`;
++  if (Number(forgeToday.turn_errors) > 0) forgeSub += ` · ${fmt(forgeToday.turn_errors)} errors`;
++  let forgeTitle = "";
++  if (forgeLast) {
++    const input = fmt(forgeLast.input_tokens);
++    const limit = Number(forgeLast.context_limit);
++    const context = forgeLast.context_limit == null ? (input === "?" ? "" : " tokens")
++      : ` / ${fmt(limit)} tokens${limit > 0 ? ` (${fmt(100 * forgeLast.input_tokens / limit, 1)}%)` : ""}`;
++    forgeTitle = `${forgeLast.model || "Forge"} · last request ${input}${context}`;
++  }
++  if (forge && forge.stale) forgeTitle += `${forgeTitle ? " · " : ""}stale`;
++  if (hasSession && !forgeChat) {
++    setStat("forge", null, "", "", undefined, undefined,
++      {hidden: false, cardTitle: forgeTitle, mutedValue: "No active Forge chat"});
++    return;
++  }
++  setStat("forge", forge ? fmt(forgeToday.turns || 0) : null, "turns", forgeSub,
++    undefined, undefined, {hidden: !forge, cardTitle: forgeTitle});
++}
++function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, forge) {
++  const gpu = gpuMetricData(hw, h, updateGpuSelector(hw, st));
++  const ghw = gpu.hw, gh = gpu.history, cards = gpu.cards, selected = gpu.selected;
++  const engineCards = gpu.engineCards, otherCards = gpu.otherCards;
++  const multi = cards.length > 1 && !selected;
++  const multiEngine = engineCards.length > 1 && !selected;
++  const cardName = selected ? gpu.names[cards.indexOf(selected)] || `GPU ${selected.index}` : "";
++  const selectedSub = selected && !selected.inModel ? `${cardName} · not in use` : cardName;
+   // model state
+   const on = live.queued > 0 ? "queued" : live.state;
+   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
+@@ -276,26 +811,81 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+   spark("sp-speed", h.tok_s);
+   spark("sp-prefill", h.prefill_tok_s_mean);
+   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
+-  const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
+-  const multi = (hw.gpus || []).length > 1;
+-  setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
+-            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || "");
+-  spark("sp-gpu", h.gpu_util, 100);
+-  setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
+-            multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
+-                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : "");
+-  spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
+-  setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
+-            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
+-  spark("sp-temp", h.gpu_temp, 90);
+-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
+-  spark("sp-power", h.gpu_power, hw.gpu_power_limit);
+-  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
+-  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
+-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
+-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
+-  spark("sp-pcie", h.gpu_pcie_rx_mb);
+-  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
++  const loadLine = multi ? allGpuLine(engineCards, otherCards, (g) => g.util,
++    (g) => g.util == null ? "–" : `${fmt(g.util)}%`) : null;
++  setMetric("gpu", ghw.gpu_util == null ? null : fmt(ghw.gpu_util), "%",
++            selected ? selectedSub : multi ? loadLine.text : st.gpu_name || "");
++  if (loadLine) $("ms-gpu").title = loadLine.title;
++  spark("sp-gpu", selected ? gh.util : h.gpu_util, 100);
++
++  const vramLine = multi ? allGpuLine(engineCards, otherCards, (g) => g.mem_used,
++    (g) => g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`) : null;
++  setMetric("vram", ghw.gpu_mem_used == null ? null : gb(ghw.gpu_mem_used),
++            ghw.gpu_mem_total ? `/ ${gb(ghw.gpu_mem_total, 0)} GB` : "GB",
++            selected ? selectedSub : multi ? vramLine.text
++              : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : "");
++  if (vramLine) $("ms-vram").title = vramLine.title;
++  spark("sp-vram", selected ? gh.mem_used : h.gpu_mem_used, ghw.gpu_mem_total);
++
++  const tempLine = multi ? allGpuLine(engineCards, otherCards, (g) => g.temp,
++    (g) => g.temp == null ? "–" : `${fmt(g.temp)}°`) : null;
++  setMetric("temp", ghw.gpu_temp == null ? null : fmt(ghw.gpu_temp), "°C",
++            selected ? selectedSub : multi ? tempLine.text : "");
++  if (tempLine) $("ms-temp").title = tempLine.title;
++  spark("sp-temp", selected ? gh.temp : h.gpu_temp, 90, true);
++
++  const powerLine = multi ? allGpuLine(engineCards, otherCards, (g) => g.power,
++    (g) => g.power == null ? "–" : `${fmt(g.power)} W`) : null;
++  setMetric("power", ghw.gpu_power == null ? null : fmt(ghw.gpu_power), "W",
++            selected ? !selected.inModel ? selectedSub : ghw.gpu_power_limit == null ? "" : `of ${fmt(ghw.gpu_power_limit)} W limit`
++              : multi ? powerLine.text : ghw.gpu_power_limit ? `of ${fmt(ghw.gpu_power_limit)} W limit` : "");
++  if (powerLine) $("ms-power").title = powerLine.title;
++  const limitLine = multi ? allGpuLine(engineCards, otherCards, (g) => g.power_limit,
++    (g) => g.power_limit == null ? "–" : `${fmt(g.power_limit)} W limit`) : null;
++  const limits = selected
++    ? (ghw.gpu_power_limit == null ? selectedSub : `${selectedSub}: ${fmt(ghw.gpu_power_limit)} W limit`)
++    : multi ? limitLine.title || limitLine.text : "";
++  $("ml-power").title = limits;
++  spark("sp-power", selected ? gh.power : h.gpu_power, ghw.gpu_power_limit);
++
++  const gen = ghw.gpu_pcie_gen_max || ghw.gpu_pcie_gen;
++  let pcieSub = "", pcieTitle = "";
++  const idle = ghw.gpu_pcie_gen && gen && ghw.gpu_pcie_gen < gen ? `idle Gen${ghw.gpu_pcie_gen}` : "";
++  const hasCardPcie = engineCards.some((g) => g.pcie_rx_mb != null || g.pcie_tx_mb != null);
++  if (selected) {
++    pcieSub = `in ${ghw.gpu_pcie_rx_mb == null ? "–" : fmt(ghw.gpu_pcie_rx_mb, ghw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
++      ` · out ${ghw.gpu_pcie_tx_mb == null ? "–" : fmt(ghw.gpu_pcie_tx_mb, ghw.gpu_pcie_tx_mb < 10 ? 1 : 0)} MB/s`;
++    if (!selected.inModel) pcieSub += " · not in use";
++    pcieTitle = "in = host to GPU, out = GPU to host";
++  } else if (multiEngine && hasCardPcie) {
++    const rates = (g) => `${g.pcie_rx_mb == null ? "–" : fmt(g.pcie_rx_mb, g.pcie_rx_mb < 10 ? 1 : 0)} in / ` +
++      `${g.pcie_tx_mb == null ? "–" : fmt(g.pcie_tx_mb, g.pcie_tx_mb < 10 ? 1 : 0)} out`;
++    const rows = engineCards.map((g) => ({gpu: g, score: g.pcie_rx_mb == null && g.pcie_tx_mb == null
++      ? null : (g.pcie_rx_mb || 0) + (g.pcie_tx_mb || 0), text: `GPU ${g.index}: ${rates(g)}`}));
++    const full = rows.map((row) => `${row.text} MB/s`).join(" · ");
++    if (engineCards.length <= 3) {
++      pcieSub = `${rows.map((row) => row.text).join(" · ")} MB/s`;
++      pcieTitle = "in = host to GPU, out = GPU to host";
++    } else {
++      const busiest = rows.filter((row) => Number.isFinite(row.score)).reduce(
++        (best, row) => !best || row.score > best.score ? row : best, null);
++      pcieSub = busiest ? `${engineCards.length} cards · busiest GPU ${busiest.gpu.index}: ${rates(busiest.gpu)} MB/s`
++                         : `${engineCards.length} cards`;
++      pcieTitle = `${full} · in = host to GPU, out = GPU to host`;
++    }
++  } else {
++    // One card, or several without per-card PCIe readings: the aggregate wording.
++    pcieSub = ghw.gpu_pcie_rx_mb == null ? ""
++      : `to GPU ${fmt(ghw.gpu_pcie_rx_mb, ghw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s`;
++  }
++  if (idle) pcieSub += `${pcieSub ? " · " : ""}${idle}`;
++  setMetric("pcie", gen ? `Gen${gen}` : null, ghw.gpu_pcie_width ? `x${ghw.gpu_pcie_width}` : "", pcieSub);
++  $("ms-pcie").title = pcieTitle;
++  spark("sp-pcie", selected ? gh.pcie_rx_mb : h.gpu_pcie_rx_mb);
++  const cpuSensors = hw.cpu_power == null ? "" : `${fmt(hw.cpu_power, 1)} W package`;
++  const cpuThreads = st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "";
++  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", cpuSensors || cpuThreads);
++  $("ms-cpu").title = cpuSensors && cpuThreads ? cpuThreads : "";
+   spark("sp-cpu", h.cpu, 100);
+   if (hw.disk_read_mb == null) {
+     setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
+@@ -325,32 +915,44 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+   if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
+   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
+   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
++  $("cpu-temp-text").textContent = hw.cpu_temp == null ? "–" : `${fmt(hw.cpu_temp)} °C`;
++  $("cpu-temp-bar").style.width = hw.cpu_temp == null ? "0%" : `${Math.min(100, hw.cpu_temp)}%`;
+ 
+   // recent requests
+   const body = $("req-body");
+-  if (!requests.length) {
+-    body.innerHTML = `<tr><td colspan="8" class="muted">No requests yet</td></tr>`;
++  const visibleRequests = reqClearedAfter == null ? requests : requests.filter((r) => r.time > reqClearedAfter);
++  if (!visibleRequests.length) {
++    body.innerHTML = `<tr><td colspan="10" class="muted">${reqClearedAfter == null ? "No requests yet" : "Cleared. New requests will appear here (refresh to see all)"}</td></tr>`;
+   } else {
+     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
+                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+-    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
++    body.innerHTML = visibleRequests.slice(0, reqShowAll ? visibleRequests.length : 12).map((r) => {
+       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
+       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
+       // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
+       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
+         (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
++      const prefill = r.prompt_ms == null ? "–" : `${fmt(r.prompt_ms / 1000, 1)} s`;
++      const drafts = Number.isFinite(r.drafts_offered) && r.drafts_offered > 0 && Number.isFinite(r.drafts_accepted)
++        ? `${fmt(100 * r.drafts_accepted / r.drafts_offered, 1)}%` : "–";
++      const draftTitle = drafts === "–" ? "No draft tokens offered"
++        : `${fmt(r.drafts_accepted)} accepted / ${fmt(r.drafts_offered)} offered`;
+       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
++        <td class="num">${fmt(r.reused)}</td>
++        <td class="num" title="time spent reading the new prompt tokens">${prefill}</td>
++        <td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
++        <td class="num" title="${draftTitle}">${drafts}</td>
+         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+     }).join("");
+   }
+   const all = $("req-all");
+-  kept = kept == null ? requests.length : kept;
++  kept = reqClearedAfter == null ? (kept == null ? requests.length : kept) : visibleRequests.length;
+   all.hidden = kept <= 12;
+   all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
+   $("req-wrap").classList.toggle("all", reqShowAll);
+   $("req-totals").textContent = renderTotals(totals);
++  renderStats(eng, hw, st, h, requests, totals, forge);
+ }
+ 
+ function facts(el, rows) {
+@@ -395,6 +997,12 @@ document.addEventListener("click", (e) => {
+   if (b) copyText(b.dataset.copy, b);
+ });
+ $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
++$("req-clear").addEventListener("click", () => {
++  const rows = lastMetrics && Array.isArray(lastMetrics.requests) ? lastMetrics.requests : [];
++  reqClearedAfter = rows.length ? Math.max(...rows.map((r) => r.time)) : Date.now() / 1000;
++  if (lastMetrics) render(lastMetrics);
++  poll();
++});
+ 
+ // ------------------------------------------------------------------ MCP servers (GET /mcp)
+ // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
+diff --git a/serve/web/index.html b/serve/web/index.html
+index 5c26ad8279..2c54e675b2 100644
+--- a/serve/web/index.html
++++ b/serve/web/index.html
+@@ -83,14 +83,26 @@
+             <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
+             <span class="st-badge st-badge--error" data-s="error">Error</span>
+           </span>
++          <div class="gpu-selector" id="gpu-selector" hidden>
++            <div class="gpu-selector__seg">
++              <span class="muted small" id="gpu-seg-label">GPU to show</span>
++              <div class="seg gpu-seg" id="gpu-seg" role="radiogroup" aria-label="GPU to show" hidden></div>
++            </div>
++            <label class="gpu-select-wrap" id="gpu-select-wrap" hidden>
++              <span class="muted small">GPU to show</span><select id="gpu-select" aria-label="GPU to show"></select>
++            </label>
++          </div>
+         </div>
+         <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
+         <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+       </div>
+ 
+-      <div class="metrics" id="metrics">
+-        <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
++      <div class="metric-area" id="metrics">
++        <!-- filled by app.js: one grid of every card (METRIC_CARDS); drag a card to any position -->
++        <div class="metric-toolbar" hidden><button class="metric-order-reset" id="reset-card-order" type="button">Reset layout</button></div>
++        <div class="metric-grid" id="metric-cards"></div>
+       </div>
++      <span id="card-position-live" class="visually-hidden" aria-live="polite" aria-atomic="true"></span>
+ 
+       <div class="monitor-row">
+         <div class="st-card ctx-card">
+@@ -110,15 +122,22 @@
+           <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
+           <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
+           <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
++          <div class="bar-row"><span>CPU temperature</span><span class="muted" id="cpu-temp-text">&ndash;</span></div>
++          <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="cpu-temp-bar" style="width:0%"></div></div>
+         </div>
+         <div class="st-card req-card">
+           <div class="req-head"><span class="card-title">Recent requests</span>
+-            <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div>
++            <div class="req-actions"><button class="st-btn st-btn--secondary" id="req-clear">Clear</button>
++              <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div></div>
+           <div class="table-wrap" id="req-wrap">
+             <table class="st-table">
+-              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
+-                <th class="num">Tok/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
+-              <tbody id="req-body"><tr><td colspan="8" class="muted">No requests yet</td></tr></tbody>
++              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th>
++                <th class="num" title="time spent reading the new prompt tokens">Prefill</th>
++                <th class="num">Output</th>
++                <th class="num">Tok/s</th><th class="num">Drafts</th>
++                <th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th>
++                <th class="num">Duration</th></tr></thead>
++              <tbody id="req-body"><tr><td colspan="10" class="muted">No requests yet</td></tr></tbody>
+             </table>
+           </div>
+           <p class="muted req-totals" id="req-totals"></p>

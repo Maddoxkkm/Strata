@@ -1,0 +1,200 @@
+diff --git a/docs/AMD_HIP.md b/docs/AMD_HIP.md
+index 5996177e1e..e3df961a10 100644
+--- a/docs/AMD_HIP.md
++++ b/docs/AMD_HIP.md
+@@ -368,11 +368,41 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
+   matrix cores; `hip_prefill_hipblaslt_gemm`, no hipBLASLt table) and 3 that fail for reasons outside the engine
+   (`ple_parity` needs a Q2_0 PLE file that is not on that machine, `expert_multi_test` refuses the CPU without AVX-512,
+   `platform_memory_test` cannot `mlock` at the shell's default `ulimit -l`).
++- **Prompt GEMMs as SGEMMs (engine 0.1.39 + `Gemm::rdna2_sgemm`):** the rocBLAS in setup's ROCm (10.2.0a20260930)
++  has tuned gfx1030 kernels for FP16 -> FP16, int8 and FP32 -> FP32 only. The prompt path's dense GEMMs take FP16 or
++  BF16 inputs and write FP32 (rocBLAS's HS / BS types), which run its fallback kernels at about 5 TFLOPS. On gfx103x
++  the engine widens both inputs to FP32 (exact) and runs SGEMM, which accumulates in FP32 like the native call
++  (`src/prefill/gemm.cu`; N < 64 keeps the native call; `STRATA_RDNA2_SGEMM=0` / `=1` turns it off / on for any AMD
++  card). Measured on an RX 6800 16 GB over OCuLink (PCIe 4.0 x4, 7.1 GB/s), Ryzen 7 8845HS, 28.8 GB RAM, Windows 11,
++  Coder IQ1_M with setup's arguments (64K context, MTP), fresh 12K-token prompts, 4 per arm, A/B in one binary:
++
++  | | native GEMMs | SGEMM route |
++  |---|---|---|
++  | prompt | 312 tok/s | 452 tok/s |
++  | prompt GPU timeline (`STRATA_PREFILL_TIMING`) | 37.2 s | 25.5 s |
++  | of which gdn / qsa proj / hc read | 9.4 / 3.6 / 3.85 s | 2.8 / 1.4 / 2.84 s |
++  | decode | 29-34 tok/s | 29-35 tok/s |
++
++  The exact calls on the card (opA = T, opB = N, FP32 out): N 10240 x T 8192 x K 2560 86.7 -> 27.7 ms including
++  the widening; N 320 x T 8192 x K 10240 (BF16) 10.9 -> 7.5 ms. Against a float64 reference on random inputs in
++  [-1, 1], the SGEMM route is as close as or closer than the native call on all 10 FP16 / BF16 shapes checked; the
++  two differ by at most 4.3e-6 of the largest output. A 9-task code-repair benchmark (the model patches seeded bugs
++  in a browser game until 38 browser checks pass) solved 9/9 on the first try with both, model time 458 -> 374 s.
++  The SGEMM route is the default on gfx103x when `STRATA_HIP_PROMPT_F16` is unset; with `STRATA_HIP_PROMPT_F16=1`
++  the FP16 route above runs first and the SGEMM route takes the products it leaves (`beta != 0`). Same RX 6800, one
++  session, fresh 12K-token prompts: native 310, SGEMM 439, FP16 (#835) 494 tok/s; `STRATA_F16_RANGE=1` on the Coder
++  IQ1_M peaked at 105.3 (activations) and 424.8 (FP16 outputs) with nothing beyond 65504, and the repair benchmark
++  solved 9/9 on the first try with both (model time 374 s SGEMM, 307 s FP16). The SGEMM route is the slower of the
++  two; no value passes through FP16, so it has no 65504 limit to stay under. It is not bit-identical to the native
++  call (at most 4.3e-6 of the largest output apart), which can flip a near-tied greedy token like any such change.
++- **Windows** (the report above): setup's ready-made Windows engine 0.1.39 runs the RX 6800 beside a 780M iGPU
++  (HIP numbers the RX 6800 1; setup points the engine at it), and `tools/hip/build_windows.bat` with
++  `STRATA_HIP_ARCHS=gfx1030` builds a working engine from the `gfx103X-all` 10.2.0a20260930 wheels.
+ - **gfx1031** (RX 6700 XT, #524): setup knows it (the `gfx103X-all` wheels, unvalidated); its reporter runs it daily
+   on one card.
+-- **Not validated:** gfx1032 (the same `dp4a` path, no hardware report), setup's own build path and the
+-  `gfx103X-all` wheels on gfx1030, images, answer-quality benchmarks. RDNA1 (gfx1012, RX 5500 XT) builds by hand:
+-  [OLDER_GPUS.md](OLDER_GPUS.md#amd-building-gfx906-and-gfx1012).
++- **Not validated:** gfx1032 (the same `dp4a` path, no hardware report), setup's Linux build path and the
++  `gfx103X-all` wheels on Linux for gfx1030, images, answer-quality benchmarks. RDNA1 (gfx1012, RX 5500 XT) builds
++  by hand: [OLDER_GPUS.md](OLDER_GPUS.md#amd-building-gfx906-and-gfx1012).
+ 
+ ## gfx906 (Instinct MI50 / MI60, Radeon VII): wave64, built from source
+ 
+diff --git a/include/strata/prefill/gemm.hpp b/include/strata/prefill/gemm.hpp
+index 1eae68b45b..64308b3bd4 100644
+--- a/include/strata/prefill/gemm.hpp
++++ b/include/strata/prefill/gemm.hpp
+@@ -68,7 +68,11 @@ class Gemm {
+     bool external_ = false;
+     void* hipblaslt_state_ = nullptr;
+     bool f16_io_ = false;
+-    // below sm_80: FP16 (Pascal: fp32) copies of a BF16 product's weight and activation slice (Gemm::bf16)
++    // RDNA2 (gfx103x, HIP): the product as an SGEMM on FP32 copies (tc_w_, tc_x_); false: the native call runs (gemm.cu)
++    bool rdna2_sgemm(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
++                     float beta, bool bf16);
++    // below sm_80: FP16 (Pascal: fp32) copies of a BF16 product's weight and activation slice (Gemm::bf16);
++    // RDNA2: FP32 copies of the weight and an activation slice (Gemm::rdna2_sgemm)
+     uint16_t* tc_w_ = nullptr;
+     int64_t tc_w_elems_ = 0;
+     uint16_t* tc_x_ = nullptr;
+diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
+index 2c1db6de28..378a7e8c4c 100644
+--- a/src/prefill/gemm.cu
++++ b/src/prefill/gemm.cu
+@@ -568,6 +568,92 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
+ #endif
+ }
+ 
++#if defined(__HIPCC__)
++// ---- RDNA2 (gfx103x): the prompt path's GEMMs as FP32 SGEMMs ------------------------------------------------------
++// The GEMMs here take 16-bit inputs (FP16 or BF16) and write FP32 (rocBLAS's "HS" / "BS" types).  The rocBLAS the engine
++// ships has tuned gfx1030 kernels for FP16 -> FP16 ("HH"), int8 and FP32 -> FP32 ("SS") only: every 16-bit-input,
++// FP32-output GEMM runs a "fallback" kernel at ~5 TFLOPS.  Measured on an RX 6800 (ROCm 10.2.0a20260930) with the
++// engine's exact calls (opA = T, opB = N, fp32 compute): at the Coder's prompt shapes the FP16 GEMMs of one fresh
++// 12K-token prompt take 14.1 s, the same GEMMs as SGEMM on widened copies 4.7 s including the widening (e.g.
++// N 10240 x T 8192 x K 2560: 86.7 -> 27.7 ms); the BF16 hyper-connection GEMMs 10.9 -> 7.5 ms (N 320, K 10240).
++// Widening FP16 / BF16 to FP32 is exact and SGEMM accumulates in FP32 like the native call, so the products are the
++// same up to summation order.  The weight is widened once per call, the activations in slices of up to 128 MiB of
++// FP32 (an 8,192-token chunk at K = 2560 is one slice).  Small N (< 64: routers, gates) keeps the native call:
++// there the widening costs more than the GEMM gains.  If the FP32 buffers cannot be allocated, the native call runs.
++//   Default: on for gfx103x, off for every other AMD architecture.  STRATA_RDNA2_SGEMM=0 / =1 turns it off / on for
++//   any AMD card (the A/B arms).
++namespace {
++__global__ void rdna2_bf16_to_f32_kernel(const uint16_t* __restrict__ in, float* __restrict__ out, int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) out[i] = __uint_as_float((uint32_t) in[i] << 16);
++}
++__global__ void rdna2_f16_to_f32_kernel(const __half* __restrict__ in, float* __restrict__ out, int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) out[i] = __half2float(in[i]);
++}
++void rdna2_widen(const uint16_t* in, float* out, int64_t n, bool bf16, cudaStream_t st) {
++    if (n <= 0) return;
++    const unsigned blocks = (unsigned) ((n + 255) / 256);
++    if (bf16) rdna2_bf16_to_f32_kernel<<<blocks, 256, 0, st>>>(in, out, n);
++    else rdna2_f16_to_f32_kernel<<<blocks, 256, 0, st>>>(reinterpret_cast<const __half*>(in), out, n);
++}
++// whether this GEMM runs as an SGEMM (see above)
++bool rdna2_sgemm_on(int64_t N) {
++    static const int forced = [] {
++        const char* v = std::getenv("STRATA_RDNA2_SGEMM");
++        return v != nullptr && v[0] != '\0' ? std::atoi(v) : -1;
++    }();
++    if (forced == 0 || N < 64) return false;
++    if (forced > 0) return true;
++    static std::atomic<int> arch[64] = {};   // per device: 0 not known, 1 gfx103x, 2 another architecture
++    int dev = 0;
++    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { (void) hipGetLastError(); return false; }
++    int v = arch[dev].load(std::memory_order_relaxed);
++    if (v == 0) {
++        hipDeviceProp_t prop{};
++        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
++        v = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ? 1 : 2;
++        arch[dev].store(v, std::memory_order_relaxed);
++    }
++    return v == 1;
++}
++// `have`, `want`: FP32 elements (the buffers are the instance's 2-byte tc_ buffers, sized in 2-byte elements)
++bool rdna2_grow(uint16_t*& p, int64_t& have_u16, int64_t want_f32) {
++    const int64_t want = 2 * want_f32;
++    if (have_u16 >= want) return true;
++    if (p) cudaFree(p);
++    p = nullptr;
++    have_u16 = 0;
++    if (cudaMalloc((void**) &p, (size_t) want * 2) != cudaSuccess) { (void) cudaGetLastError(); p = nullptr; return false; }
++    have_u16 = want;
++    return true;
++}
++constexpr int64_t kRdna2SliceF32 = 32ll << 20;   // 128 MiB of FP32 activations per slice
++}  // namespace
++
++// Y^T[N, T] (+)= W[N, K] . X^T[K, T] as SGEMMs on FP32 copies; false: not this card / shape, or no buffers (the caller
++// runs its native GEMM, nothing was written)
++bool Gemm::rdna2_sgemm(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
++                       float beta, bool bf16) {
++    if (K <= 0 || !rdna2_sgemm_on(N)) return false;
++    const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(T, kRdna2SliceF32 / K));
++    if (!rdna2_grow(tc_w_, tc_w_elems_, N * K) || !rdna2_grow(tc_x_, tc_x_elems_, rows * K)) return false;
++    float* const wf = reinterpret_cast<float*>(tc_w_);
++    float* const xf = reinterpret_cast<float*>(tc_x_);
++    const float alpha = 1.0f;
++    rdna2_widen(W, wf, N * K, bf16, (cudaStream_t) stream_);
++    for (int64_t t0 = 0; t0 < T; t0 += rows) {
++        const int64_t n = std::min<int64_t>(rows, T - t0);
++        rdna2_widen(X + t0 * K, xf, n * K, bf16, (cudaStream_t) stream_);
++        // every slice is a disjoint block of Y, so each gets the caller's beta
++        ck(hipblasSgemm((hipblasHandle_t) handle_, HIPBLAS_OP_T, HIPBLAS_OP_N, (int) N, (int) n, (int) K, &alpha, wf,
++                        (int) K, xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
++           "hipblasSgemm (RDNA2)");
++    }
++    return true;
++}
++#endif
++
+ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                 float beta, int64_t ldx) {
+     if (T <= 0 || N <= 0) return;
+@@ -605,6 +691,10 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+         return;
+     }
+ #endif
++#if defined(__HIPCC__)
++    // a padded X (STRATA_PF_PAD, ldx > K) keeps the native call: the widening copies contiguous rows
++    if (ldx == 0 && rdna2_sgemm(X, W, Y, T, N, K, ldy, beta, true)) return;
++#endif
+ #if !defined(__HIPCC__)
+     if (const int path = K > 0 ? bf16_path() : 0; path == 1 && N > 1 && beta == 0.0f) {
+         // a single output row stays cuBLAS's GEMV, faster than the conversions; beta = 1: see above
+@@ -673,6 +763,9 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
+         STRATA_ABSORB_HIPBLAS_STICKY("hipBLASLt f16");
+         return;
+     }
++#endif
++#if defined(__HIPCC__)
++    if (rdna2_sgemm(X, W, Y, T, N, K, ldy, beta, false)) return;
+ #endif
+     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                     CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+diff --git a/tests/hip/prefill_gemm.cpp b/tests/hip/prefill_gemm.cpp
+index 1536c89eba..9b4d5863e3 100644
+--- a/tests/hip/prefill_gemm.cpp
++++ b/tests/hip/prefill_gemm.cpp
+@@ -87,6 +87,11 @@ int main() {
+         ok=run(gemm,stream,true,17,48,2560,64,1) && ok;
+         ok=run(gemm,stream,false,32,640,2560,648,0) && ok;
+         ok=run(gemm,stream,false,64,2560,640,2560,1) && ok;
++        // RDNA2 (gfx103x) runs N >= 64 as an SGEMM on FP32 copies, the activations in slices of 32M floats
++        // (Gemm::rdna2_sgemm): at K = 10240 a slice is 3,276 rows, so these cross a slice boundary (padded ldy, beta 1).
++        // Other cards run them on the native path.
++        ok=run(gemm,stream,false,3300,64,10240,72,1) && ok;
++        ok=run(gemm,stream,true,3300,64,10240,64,0) && ok;
+     }
+     CHECK(hipStreamDestroy(stream));
+     return ok?0:1;

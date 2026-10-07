@@ -1,0 +1,550 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cd60517799..1d0a6af507 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -458,6 +458,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     target_link_libraries(vmm_test PRIVATE strata_engine)
+     add_test(NAME vmm_test COMMAND vmm_test)
+     set_tests_properties(vmm_test PROPERTIES TIMEOUT 60)
++    # The resident RAM mode with a layer split: the copy keeps each stage's lend region, and the experts the
++    # prompt path borrows are served from RAM (the file source reads none of them).  The device calls are
++    # wrapped - conversation_transfer_test's pattern - and `pin = false` keeps the copy pageable, so this
++    # runs on a CPU-only PC.
++    if(NOT STRATA_ENABLE_HIP AND UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
++      add_executable(split_lend_complement_test tests/core/split_lend_complement_test.cpp)
++      target_link_libraries(split_lend_complement_test PRIVATE strata_engine)
++      target_link_options(split_lend_complement_test PRIVATE
++        -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaFree -Wl,--wrap=cudaMemset -Wl,--wrap=cudaMemcpy
++        -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaDeviceSynchronize
++        -Wl,--wrap=cudaGetLastError -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaSetDevice
++        -Wl,--wrap=cudaMemGetInfo -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost)
++      add_test(NAME split_lend_complement_test COMMAND split_lend_complement_test)
++      set_tests_properties(split_lend_complement_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
++    endif()
+   endif()
+   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
+   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_save_test.cpp")
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 3eda5a0866..b76532b868 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -112,6 +112,18 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
+ /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
+ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out);
+ 
++/// A layer split: add each stage's lend region to a plan built from the complement plus every stage's
++/// cache (the `additional_gpu_pairs` shape).  Each region lists one stage's (layer, expert) pairs, the
++/// pairs in its cache's highest slots first - the slots the prompt path borrows, from the tail in.  A pair
++/// already in the plan is passed over; a stage's walk stops at the first pair that does not fit `cap_bytes`
++/// and the NEXT stage's walk still runs (the pairs past the cap keep the mapped-file fallback they had).
++/// Returns the pairs added, or -1 - leaving the plan untouched - when a pair is outside the geometry or a
++/// region repeats one.
++int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
++                                  std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
++                                  const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
++                                  std::string& err);
++
+ }  // namespace detail
+ 
+ 
+@@ -478,6 +490,15 @@ class FileExpertSource : public ExpertSource {
+         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
+         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
+         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
++    /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
++    /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
++    /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,
++    /// as the borrowing takes them.  Pairs past the budget keep the mapped-file fallback.  Empty (the
++    /// default) keeps #848's shape: with `additional_gpu_pairs` the single lend region is off and the copy
++    /// holds only the complement.
++    void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
++        stage_lend_regions_ = std::move(regions);
++    }
+     void close();
+ 
+     bool mapped() const { return base_ != nullptr; }
+@@ -665,6 +686,7 @@ class FileExpertSource : public ExpertSource {
+     bool complement_ready_ = false;
+     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
+     int64_t complement_lent_slots_ = 0;
++    std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
+     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
+     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
+     std::vector<Exchange> staged_;
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index d0ff201ec6..f9073677dc 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -183,6 +183,46 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
+     return keep;
+ }
+ 
++int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
++                                  std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
++                                  const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
++                                  std::string& err) {
++    const size_t blobs = (size_t) (n_layers * n_expert);
++    if (n_layers <= 0 || n_expert <= 0 || layer_blob_bytes.size() != (size_t) n_layers || offsets.size() != blobs) {
++        err = "append_stage_lend_regions: the plan does not match the geometry";
++        return -1;
++    }
++    std::vector<std::pair<int32_t, int32_t>> sorted;
++    for (const auto& region : regions) {   // validate the whole request before touching the plan
++        for (const auto& pair : region)
++            if (pair.first < 0 || pair.first >= n_layers || pair.second < 0 || pair.second >= n_expert) {
++                err = "append_stage_lend_regions: a lend-region expert is outside the model";
++                return -1;
++            }
++        sorted = region;
++        std::sort(sorted.begin(), sorted.end());
++        for (size_t i = 1; i < sorted.size(); ++i)
++            if (sorted[i] == sorted[i - 1]) {
++                err = "append_stage_lend_regions: a stage's lend region repeats an expert";
++                return -1;
++            }
++    }
++    int64_t kept = 0;
++    for (const auto& region : regions) {
++        for (const auto& pair : region) {
++            const size_t index = (size_t) pair.first * (size_t) n_expert + (size_t) pair.second;
++            if (offsets[index] != kNoCacheComplement) continue;   // already in the copy: the complement, or a
++                                                                  // CUDA0 lend slot the region is asked to skip
++            const uint64_t b = layer_blob_bytes[(size_t) pair.first];
++            if (b > cap_bytes - bytes) break;                     // this stage's rest keeps the file fallback
++            offsets[index] = bytes;
++            bytes += b;
++            ++kept;
++        }
++    }
++    return kept;
++}
++
+ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out) {
+     if (in == out || in >= offsets.size() || out >= offsets.size() || offsets[in] == kNoCacheComplement ||
+         offsets[out] != kNoCacheComplement) return false;
+@@ -1790,6 +1830,36 @@ bool FileExpertSource::pin_cache_complement(
+         }
+     }
+ 
++    // A layer split: generate hands the copy every stage's lend region (`stage_lend_regions`, set before the
++    // call).  The prompt path borrows the tail slots of EVERY part's cache, and with `additional_gpu_pairs`
++    // non-empty the single lend region above is off - so without this the borrowed experts sat in neither
++    // VRAM nor RAM during a prompt and came back through page faults from the mapped shards: measured
++    // 2026-10-06 on an RTX 2000 Ada + 5060 Ti rig (17/48 split, IQ3_S mapped from the GGUF, --prefill auto,
++    // one 73K-token prompt) 3.7 GiB read from the NVMe for the one prompt (arena mode reads 1.1 GiB), and one
++    // 8192-token chunk spent 1.5 s of its 3.9 s on host staging (arena: 0.37 s).  The regions walk each
++    // stage's highest slots first, as the borrowing does; the whole copy - complement and regions
++    // together - stays within one budget, and experts past it keep the file fallback they had.
++    int64_t stage_lent = 0;
++    uint64_t stage_lent_bytes = 0;
++    if (!stage_lend_regions_.empty()) {
++        if (budget == std::numeric_limits<uint64_t>::max()) {   // #403: the one reading, taken now
++            uint64_t physical = budget_physical, commit = budget_commit;
++            if (physical == 0 && !available_memory_bytes(physical, &commit)) {
++                err = "FileExpertSource: cannot determine available memory for the stage lend regions";
++                return false;
++            }
++            const uint64_t available = std::min(physical, commit);
++            budget = available > headroom_bytes ? available - headroom_bytes : 0;
++        }
++        uint64_t cap = budget;   // an explicit --resident-budget-gib caps the whole copy, regions included
++        if (budget_bytes > 0 && budget_bytes != kResidentWhatFits && budget_bytes < cap) cap = budget_bytes;
++        const uint64_t before = bytes;
++        stage_lent = detail::append_stage_lend_regions(n_layers_, n_expert_, layer_blob_bytes_, offsets, bytes, cap,
++                                                       stage_lend_regions_, err);
++        if (stage_lent < 0) return false;
++        stage_lent_bytes = bytes - before;
++    }
++
+     void* arena = nullptr;
+     const uint8_t* host = nullptr;
+     const uint8_t* device = nullptr;
+@@ -2042,6 +2112,7 @@ bool FileExpertSource::pin_cache_complement(
+     complement_locked_ = locked;
+     complement_lock_off_ = lock_off;
+     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
++    complement_lent_slots_ += stage_lent;   // and the split stages' regions: pairs the copy kept of them
+     complement_ready_ = true;
+     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
+                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
+@@ -2053,6 +2124,14 @@ bool FileExpertSource::pin_cache_complement(
+                              "too%s\n", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
+                      complement_lent_slots_ < n_slots - lend_from_slot
+                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
++    if (!stage_lend_regions_.empty()) {
++        int64_t offered = 0;
++        for (const auto& region : stage_lend_regions_) offered += (int64_t) region.size();
++        std::fprintf(stderr, "FileExpertSource: the split stages lend %lld slots to the prompt path: %lld keep "
++                             "their experts in RAM too (%.2f GiB)%s\n",
++                     (long long) offered, (long long) stage_lent, (double) stage_lent_bytes / 1073741824.0,
++                     stage_lent < offered ? " (the rest are read from the file when lent: not enough RAM for them)" : "");
++    }
+     if (!additional_gpu_pairs.empty()) {
+         std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",
+                      additional_gpu_pairs.size());
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3b551f3aaf..87b6185684 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -5459,11 +5459,72 @@ int main(int argc, char** argv) {
+         }
+         // a layer split: the experts every later stage's cache holds are left out of the RAM copy, as CUDA0's are
+         // (with them the copy keeps no lend region: pin_cache_complement turns the loan off)
++        // (true of the single lend region only: the stage_lend_regions block below hands every part's
++        // borrowed tail to the copy as well, so under a split the copy keeps a lend region per part again)
+         std::vector<std::pair<int32_t, int32_t>> stage_pairs;
+         for (auto& st : stages)
+             for (int64_t l = st->lb; l < st->le; ++l)
+                 for (int64_t e = 0; e < g.n_expert; ++e)
+                     if (st->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
++        // The split's lend regions.  The serve scan lends the tail slots of EVERY part's cache - CUDA0's own
++        // part first, then every stage (the `pf_parts` loop below) - and `lend_from` above is switched off in
++        // pin_cache_complement the moment `additional_gpu_pairs` is non-empty, so until now none of those experts
++        // were in the RAM copy: during a prompt they came back through page faults from the mapped files.
++        // Measured 2026-10-06 on an RTX 2000 Ada + 5060 Ti rig (17/48 split, IQ3_S mapped from the GGUF,
++        // --prefill auto, one 73K-token prompt): 3.7 GiB read from the NVMe for the one prompt (the arena
++        // mode reads 1.1 GiB), and one 8192-token chunk spent 1.5 s of its 3.9 s on host staging (arena:
++        // 0.37 s).  Size each part's region at the largest chunk the scan can ever pick - auto's ceiling, or an
++        // explicit --prefill, which the scan only walks down - take its tail slots with the scan's own
++        // arithmetic, and list the pairs from the highest slot down, as the borrowing takes them.  #340 is
++        // honoured the same way (the same free-VRAM test, at this startup moment): a part whose card can
++        // fund the bound chunk's buffers outright lends nothing at any pick, so it gets no region and no RAM
++        // is spent on it.  The single-GPU loan is untouched: without a split the lend region stays in
++        // pin_cache_complement's own path, and no regions are set.
++        std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lends;
++        if (pf_borrow && d_res != nullptr && o.prefill_chunk > 0 && multi_gpu && !stages.empty()) {
++            const int64_t bound = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
++            static const bool own_ok = [] {
++                const char* v = std::getenv("STRATA_SPLIT_OWN_BUFFERS");
++                return v == nullptr || v[0] != '0';
++            }();
++            for (size_t i = 0; i <= stages.size(); ++i) {   // the scan's part order: CUDA0, then every stage
++                strata::core::ExpertCache& xc = i == 0 ? xcache : stages[i - 1]->cache;
++                const strata::core::SessionState& ses = i == 0 ? ss : stages[i - 1]->ss;
++                const int64_t dev = i == 0 ? -1 : stages[i - 1]->dev;
++                const int64_t lb = i == 0 ? 0 : stages[i - 1]->lb;
++                const int64_t le = i == 0 ? split_at[0] : stages[i - 1]->le;
++                if (xc.slots() <= 0 || le <= lb) continue;
++                const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ses, bound);
++                if (own_ok) {   // the card funds its buffers at any chunk the scan can pick: nothing is lent
++                    const strata::core::OnDevice on(dev);
++                    size_t fb = 0, tb = 0;
++                    if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
++                        if ((uint64_t) fb >= need + (3ull << 29)) continue;
++                    } else (void) cudaGetLastError();
++                }
++                int64_t k = 0;   // its tail slots, as the scan's `cache_slots_for` counts them
++                if (xc.slot_offsets() != nullptr) {
++                    while (k < xc.slots() &&
++                           (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
++                } else {
++                    const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
++                    k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
++                }
++                k = std::min(k, xc.slots() - 128);                       // the scan's 128-slot floor
++                if (o.prefill_auto) k = std::min(k, kAutoLendPct * xc.slots() / 100);   // the auto cap
++                if (k <= 0) continue;
++                std::vector<std::pair<int32_t, int32_t>> region;
++                for (int64_t l = lb; l < le; ++l)
++                    for (int64_t e = 0; e < g.n_expert; ++e)
++                        if (xc.slot_of(l, e) >= xc.slots() - k) region.emplace_back((int32_t) l, (int32_t) e);
++                std::sort(region.begin(), region.end(),
++                          [&](const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) {
++                              return xc.slot_of(a.first, a.second) > xc.slot_of(b.first, b.second);
++                          });
++                if (!region.empty()) stage_lends.push_back(std::move(region));
++            }
++            src.stage_lend_regions(std::move(stage_lends));
++        }
+         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
+         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
+                                                     o.resident_headroom, o.resident_budget, &rank_all);
+diff --git a/tests/core/file_expert_source_test.cpp b/tests/core/file_expert_source_test.cpp
+index 56590970a9..ce8dc43930 100644
+--- a/tests/core/file_expert_source_test.cpp
++++ b/tests/core/file_expert_source_test.cpp
+@@ -291,6 +291,51 @@ void test_resident_lend_region() {
+     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
+ }
+ 
++void test_split_lend_regions() {
++    using namespace strata::core::detail;
++    // two layers, three experts; a layer-0 blob is 5 bytes and a layer-1 blob 3.  The plan under
++    // construction already holds the (0,1) expert (an expert no cache holds); stage 0's region lends
++    // (0,2) and (0,1) from its highest slots, stage 1's lends (1,2), (1,0), (1,1) in that order.
++    const std::vector<uint64_t> blobs{5, 3};
++    const std::vector<std::vector<std::pair<int32_t, int32_t>>> regions = {{{0, 2}, {0, 1}}, {{1, 2}, {1, 0}, {1, 1}}};
++    std::string err;
++    std::vector<uint64_t> offsets;
++    uint64_t bytes = 0;
++
++    // room for everything: (0,1) is already in the copy and is passed over, not counted twice
++    offsets = {kNoCacheComplement, 0, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement};
++    bytes = 5;
++    require(append_stage_lend_regions(2, 3, blobs, offsets, bytes, 100, regions, err) == 4,
++            "both stage lend regions must be kept");
++    require(bytes == 19 &&
++                offsets == std::vector<uint64_t>{kNoCacheComplement, 0, 5, 13, 16, 10},
++            "the stage lend regions got wrong compact offsets");
++
++    // the cap is the whole copy's: the stage-0 walk fits (0,2) and stage 1 stops at the first pair that
++    // does not fit; that stage's rest stays on the file
++    offsets = {kNoCacheComplement, 0, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement};
++    bytes = 5;
++    require(append_stage_lend_regions(2, 3, blobs, offsets, bytes, 10, regions, err) == 1, "cap 10 keeps only (0,2)");
++    require(bytes == 10 && offsets[2] == 5 && offsets[3] == kNoCacheComplement && offsets[5] == kNoCacheComplement,
++            "the walk placed experts past the cap");
++
++    // (0,2)'s 5 bytes do not fit in the 4 left: stage 0 keeps nothing, and stage 1's own walk still runs -
++    // its (1,2) fits, its (1,0) stops that stage
++    offsets = {kNoCacheComplement, 0, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement};
++    bytes = 5;
++    require(append_stage_lend_regions(2, 3, blobs, offsets, bytes, 9, regions, err) == 1,
++            "a stage refused at the cap must not stop the next stage's walk");
++    require(bytes == 8 && offsets[2] == kNoCacheComplement && offsets[5] == 5 && offsets[3] == kNoCacheComplement,
++            "the refused stage's experts entered the copy, or the next stage's did not");
++
++    // a pair outside the geometry is an error, and the plan is left untouched: validate before appending
++    offsets = {kNoCacheComplement, 0, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement};
++    bytes = 5;
++    require(append_stage_lend_regions(2, 3, blobs, offsets, bytes, 100, {{{0, 2}, {2, 0}}}, err) == -1 &&
++                !err.empty() && bytes == 5 && offsets[2] == kNoCacheComplement,
++            "an out-of-range lend-region pair was accepted, or a rejected walk touched the plan");
++}
++
+ void test_resident_exchange() {
+     using namespace strata::core;
+     using namespace strata::core::detail;
+@@ -607,6 +652,7 @@ int main(int argc, char** argv) {
+     try {
+         test_complement_plan();
+         test_resident_lend_region();
++        test_split_lend_regions();
+         test_resident_exchange();
+         test_resident_memory_budget();
+         test_cgroup_memory_budget();
+diff --git a/tests/core/split_lend_complement_test.cpp b/tests/core/split_lend_complement_test.cpp
+new file mode 100644
+index 0000000000..c6d5dd5153
+--- /dev/null
++++ b/tests/core/split_lend_complement_test.cpp
+@@ -0,0 +1,219 @@
++// The resident RAM mode with a layer split: the compact copy holds the experts no stage's cache holds AND each
++// stage's LEND REGION - the experts in the cache slots the prompt path borrows - so a prompt streams the
++// borrowed experts from RAM instead of reading the model files through page faults.  Runs on a CPU-only
++// PC: the device calls are wrapped at the link (`--wrap` in CMakeLists.txt, conversation_transfer_test's
++// pattern), the memory is ordinary memory, and `pin = false` keeps the copy pageable.
++#include "strata/core/expert_source.hpp"
++#include "strata/kernels/cpu/expert_layout.hpp"
++
++#include <cuda_runtime.h>
++
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++#include <system_error>
++#include <utility>
++#include <vector>
++
++// ---- the wrapped device calls: memory is ordinary memory and every operation completes at once.
++extern "C" cudaError_t __wrap_cudaMalloc(void** p, size_t n) {
++    *p = std::malloc(n);
++    return *p ? cudaSuccess : cudaErrorMemoryAllocation;
++}
++extern "C" cudaError_t __wrap_cudaFree(void* p) { std::free(p); return cudaSuccess; }
++extern "C" cudaError_t __wrap_cudaMemset(void* d, int v, size_t n) { std::memset(d, v, n); return cudaSuccess; }
++extern "C" cudaError_t __wrap_cudaMemcpy(void* d, const void* s, size_t n, cudaMemcpyKind k) {
++    std::memcpy(d, s, n);
++    return cudaSuccess;
++}
++extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* d, const void* s, size_t n, cudaMemcpyKind k, cudaStream_t st) {
++    std::memcpy(d, s, n);
++    return cudaSuccess;
++}
++extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t st) { return cudaSuccess; }
++extern "C" cudaError_t __wrap_cudaDeviceSynchronize(void) { return cudaSuccess; }
++extern "C" cudaError_t __wrap_cudaGetLastError(void) { return cudaSuccess; }
++extern "C" cudaError_t __wrap_cudaGetDevice(int* d) { *d = 0; return cudaSuccess; }
++extern "C" cudaError_t __wrap_cudaSetDevice(int d) { return cudaSuccess; }
++extern "C" cudaError_t __wrap_cudaMemGetInfo(size_t* free_b, size_t* total_b) {
++    *free_b = 64ull << 30;
++    *total_b = 128ull << 30;
++    return cudaSuccess;
++}
++extern "C" cudaError_t __wrap_cudaHostAlloc(void** p, size_t n, unsigned f) {
++    *p = std::malloc(n);
++    return *p ? cudaSuccess : cudaErrorMemoryAllocation;
++}
++extern "C" cudaError_t __wrap_cudaFreeHost(void* p) { std::free(p); return cudaSuccess; }
++
++namespace fs = std::filesystem;
++
++namespace {
++
++constexpr int64_t kLayers = 2;      // stage 0 owns layer 0, stage 1 owns layer 1 (the split's `claimed` layers)
++constexpr int64_t kExperts = 4;
++
++void require(bool ok, const std::string& message) {
++    if (!ok) throw std::runtime_error(message);
++}
++
++struct TempDirectory {
++    fs::path path;
++
++    explicit TempDirectory(const fs::path& base = fs::temp_directory_path()) {
++        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++        path = base / ("strata-split-lend-test-" + std::to_string(stamp));
++        fs::create_directories(path);
++    }
++
++    ~TempDirectory() {
++        std::error_code ignored;
++        fs::remove_all(path, ignored);
++    }
++};
++
++const uint8_t truth_byte(int64_t l, int64_t e, size_t i) {
++    return (uint8_t) ((i * 131u + (size_t) (l * kExperts + e) * 37u) ^ (i >> 8));
++}
++
++// one fully-built fixture: experts.bin written, the source open, both stage caches open with their
++// own layer's experts admitted and filled (highest slot = highest expert, as the
++// cache fills from slot 0 up)
++struct Rig {
++    std::vector<std::vector<uint8_t>> truth;   // [layer * kExperts + expert]
++    TempDirectory dir;
++    strata::core::FileExpertSource src;
++    strata::core::ExpertCache stage0, stage1;   // the two split stages' caches
++    size_t blob = 0;
++
++    explicit Rig(const char* tag) {
++        std::string err;
++        require(strata::kernels::cpu::expert_layout_load(dir.path.string(), kLayers, kExperts, err), err);
++        blob = (size_t) strata::kernels::cpu::BLOB;
++        truth.resize((size_t) kLayers * kExperts);
++        {
++            std::ofstream out(dir.path / "experts.bin", std::ios::binary);
++            for (int64_t l = 0; l < kLayers; ++l)
++                for (int64_t e = 0; e < kExperts; ++e) {
++                    std::vector<uint8_t>& t = truth[(size_t) l * kExperts + e];
++                    t.resize(blob);
++                    for (size_t i = 0; i < blob; ++i) t[i] = truth_byte(l, e, i);
++                    out.write((const char*) t.data(), (std::streamsize) blob);
++                }
++            require((bool) out, std::string(tag) + ": fixture write failed");
++        }
++        require(src.open(dir.path.string(), kLayers, kExperts, err), err);
++        // kExperts slots each: every layer of the stage, and the tail the prompt path borrows
++        require(stage0.open(kExperts, kLayers, kExperts, blob, err), err);
++        require(stage1.open(kExperts, kLayers, kExperts, blob, err), err);
++        for (int64_t e = 0; e < kExperts; ++e) {
++            const int32_t s0 = stage0.admit(0, e);
++            require(s0 >= 0 && stage0.fill_slot_blocking(s0, truth[(size_t) e].data(), err), err);
++            const int32_t s1 = stage1.admit(1, e);
++            require(s1 >= 0 && stage1.fill_slot_blocking(s1, truth[(size_t) kExperts + e].data(), err), err);
++        }
++    }
++
++    // every expert of stage 1's cache, the way generate hands the later stages to pin_cache_complement
++    std::vector<std::pair<int32_t, int32_t>> stage1_pairs() const {
++        std::vector<std::pair<int32_t, int32_t>> pairs;
++        for (int64_t e = 0; e < kExperts; ++e) pairs.emplace_back(1, (int32_t) e);
++        return pairs;
++    }
++};
++
++// both stage caches hold everything of their layer: the complement - the experts NO cache
++// holds - is empty, so before this feature the copy kept no bytes at all and every expert a prompt borrowed
++// came back through page faults from the mapped files.
++void test_split_lend_region_served_from_ram() {
++    Rig rig("split lend region");
++    std::string err;
++
++    // each stage lends its two highest slots to the prompt path: pairs listed highest slot first,
++    // as the borrowing takes them
++    rig.src.stage_lend_regions({{{0, 3}, {0, 2}}, {{1, 3}, {1, 2}}});
++    require(rig.src.pin_cache_complement(rig.stage0, err, false, rig.stage1_pairs(), -1, 0, 0), err);
++
++    require(rig.src.resident_bytes() == 4 * (uint64_t) rig.blob,
++            "the copy is the empty complement plus the two stages' lend regions");
++    require(rig.src.resident_lent_slots() == 4, "the copy reports both stages' lend regions");
++    for (int64_t l = 0; l < kLayers; ++l)
++        for (int64_t e = 0; e < kExperts; ++e) {
++            const bool in_a_cache = true;   // every pair is held by some stage's cache: none is in the complement
++            require(rig.src.has_resident(l, e) == (e >= 2), "the copy holds exactly the two stages' lent experts");
++        }
++
++    // the borrowed experts are served from the RAM copy: the lookup resolves into the copy, the bytes match
++    // the file's, and not one read touched the file source
++    std::vector<uint8_t> dst(rig.blob);
++    for (int64_t l = 0; l < kLayers; ++l)
++        for (int64_t e = 2; e < kExperts; ++e) {
++            require(rig.src.blob(l, e) == rig.src.resident_blob(l, e), "a lent expert is not served from the copy");
++            require(rig.src.copy_blob(l, e, dst.data()) &&
++                        dst == rig.truth[(size_t) l * kExperts + e],
++                    "the copy serves wrong bytes for a lent expert");
++        }
++    require(rig.src.file_reads() == 0 && rig.src.file_read_bytes() == 0,
++            "the prompt path's borrowed experts came from the file source, not the RAM copy");
++}
++
++// a --resident-budget-gib smaller than the regions: the copy keeps the bytes it can - the same budget
++// caps the region walk - and the experts past it keep the file fallback that reads the same bytes
++void test_split_lend_region_budget() {
++    Rig rig("split lend region budget");
++    std::string err;
++
++    rig.src.stage_lend_regions({{{0, 3}, {0, 2}}, {{1, 3}, {1, 2}}});
++    const uint64_t budget = 2 * (uint64_t) rig.blob;   // room for one stage's region, not both
++    require(rig.src.pin_cache_complement(rig.stage0, err, false, rig.stage1_pairs(), -1, 0, budget), err);
++
++    require(rig.src.resident_bytes() == budget, "the budget did not cap the stage lend regions");
++    require(rig.src.resident_lent_slots() == 2, "the clamped regions kept the wrong count");
++    require(rig.src.has_resident(0, 3) && rig.src.has_resident(0, 2), "the first stage's region was not kept");
++    require(!rig.src.has_resident(1, 3) && !rig.src.has_resident(1, 2), "bytes past the budget entered the copy");
++
++    std::vector<uint8_t> dst(rig.blob);
++    require(rig.src.copy_blob(0, 3, dst.data()) && dst == rig.truth[3], "wrong bytes from the region inside the cap");
++    require(rig.src.file_reads() == 0, "an expert the copy holds was read from the file");
++    require(rig.src.copy_blob(1, 3, dst.data()) && dst == rig.truth[kExperts + 3],
++            "the expert past the budget lost its file fallback");
++    require(rig.src.file_reads() == 0 && rig.src.file_read_bytes() == (uint64_t) rig.blob,
++            "the expert past the budget was served by the file source, exactly one blob read");
++}
++
++// the #848 shape, with no stage regions set: with the later stage's pairs handed over as
++// `additional_gpu_pairs` the copy keeps NOTHING (the complement is empty and the single lend region is off), so
++// this is the state that measured 3.7 GB of NVMe reads over one 73K-token prompt on 2026-10-06
++void test_split_without_regions_keeps_nothing() {
++    Rig rig("split without regions");
++    std::string err;
++
++    require(rig.src.pin_cache_complement(rig.stage0, err, false, rig.stage1_pairs(), -1, 0, 0), err);
++    require(rig.src.complement_ready(), "the empty complement did not complete");
++    require(rig.src.resident_bytes() == 0 && rig.src.resident_lent_slots() == 0,
++            "without stage regions the copy should hold no expert at all");
++    for (int64_t l = 0; l < kLayers; ++l)
++        for (int64_t e = 0; e < kExperts; ++e)
++            require(!rig.src.has_resident(l, e), "an expert neither in a cache's complement region entered the copy");
++}
++
++}  // namespace
++
++int main() {
++    try {
++        test_split_lend_region_served_from_ram();
++        test_split_lend_region_budget();
++        test_split_without_regions_keeps_nothing();
++        std::cout << "split_lend_complement_test: PASS\n";
++        return 0;
++    } catch (const std::exception& error) {
++        std::cerr << "split_lend_complement_test: " << error.what() << '\n';
++        return 1;
++    }
++}

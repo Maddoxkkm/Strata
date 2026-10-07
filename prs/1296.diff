@@ -1,0 +1,1625 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cd60517799..598d8e19f9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -708,6 +708,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   target_include_directories(iq_multi_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(iq_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME iq_multi_parity COMMAND iq_multi_parity)
++  # the WY-form chunk-parallel GDN recurrence: algebra proof of the host chunked reference against the
++  # serial token loop (GPU kernel ground truth; HIP-portable - no cp.async)
++  # GPU-only: the .cu targets have no linker language on a CPU-only configure
++  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
++    add_executable(gdn_wy_check src/prefill/gdn_wy_check.cu)
++    target_link_libraries(gdn_wy_check PRIVATE ${_strata_gpu_runtime_target})
++    add_test(NAME gdn_wy_check COMMAND gdn_wy_check)
++  # the WMMA-folds WY arm (revised checkpoint 2026-10-05 9): device wmma kernel vs the fp64 oracle inside
++  # the pre-derived fp16-class bound, plus the +2.5*B negative control; SKIPs cleanly without rocwmma
++    add_executable(gdn_wy_wmma_check src/prefill/gdn_wy_wmma_check.cu)
++    target_link_libraries(gdn_wy_wmma_check PRIVATE ${_strata_gpu_runtime_target})
++    add_test(NAME gdn_wy_wmma_check COMMAND gdn_wy_wmma_check)
++  endif()
+   # the prompt path's DeltaNet recurrence: gdn_rec_kh_kernel against gdn_rec_cols_pipe_kernel, bitwise (GPU,
+   # synthetic, no model; --bench adds timings).  NVIDIA only: cp.async and the CUDA occupancy API (not on gfx906)
+   if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+diff --git a/src/prefill/gdn_rec_wy_wmma.cuh b/src/prefill/gdn_rec_wy_wmma.cuh
+new file mode 100644
+index 0000000000..d70a41fd58
+--- /dev/null
++++ b/src/prefill/gdn_rec_wy_wmma.cuh
+@@ -0,0 +1,429 @@
++// GDN WY-recurrence kernel using rocWMMA tensor cores (gfx1100/RDNA3).
++// Included inside namespace strata::prefill { namespace { ... } } after gdn_rec_wy_kernel.
++// Assumes S, HK, HV, C, CB, RG, RPG, NCB, WY are defined in the enclosing scope.
++
++// rocwmma must be included at GLOBAL scope (see gdn_rec_wy_wmma_rocwmma.hpp, which defines
++// STRATA_GDN_WY_HAVE_ROCWMMA and runs the macro lift/restore dance). This header is included
++// INSIDE namespace strata::prefill { namespace { ... } }, so the include here is only the
++// guarded no-op that makes this header self-contained for reviewers.
++#if !defined(STRATA_GDN_WY_HAVE_ROCWMMA)
++#if defined(__HIPCC__) && defined(__has_include)
++#if __has_include(<rocwmma/rocwmma.hpp>)
++#define STRATA_GDN_WY_HAVE_ROCWMMA 1
++#endif
++#endif
++#endif
++#if defined(STRATA_GDN_WY_HAVE_ROCWMMA)
++#include <rocwmma/rocwmma.hpp>
++#endif
++
++static_assert(WY % 16 == 0 && CB % 16 == 0 && S % 16 == 0, "GDN WY WMMA requires multiples of 16");
++
++#if defined(STRATA_GDN_WY_HAVE_ROCWMMA)
++
++__global__ void __launch_bounds__(CB * RG) gdn_rec_wy_wmma_kernel(
++    float* __restrict__ state, const float* __restrict__ h,
++    const float* __restrict__ gate, const float* __restrict__ beta,
++    float* __restrict__ oc_out, int64_t T) {
++
++    // LDS Budget (~61.4 KiB):
++    // kt16 16384 B + qt16 16384 B (overlaid with P16 cols [0..64) after site 3) +
++    // Sin16 8192 B (overlaid with pk32 [WY][CB] fp32 after site 3) +
++    // U16 4096 B + A 16384 B (o32 [WY][CB] in the lower half and pq32 [WY][CB] in the upper
++    // half after the solve, then S_out [S][CB] over the whole array after the oc write)
++    // + dec ~260 B = ~61.4 KiB < 64 KiB.
++    // rocWMMA 7.1.1 store_matrix_sync static-asserts fragment/pointer type equality (no
++    // converting stores), so the fold results stay fp32 in LDS; the only fp16 tiles are GEMM
++    // operand tiles (kt16, qt16/P16, Sin16, U16) - the recorded bound counts those roundings.
++    __shared__ __half kt16[WY][S];
++    __shared__ __half qt16[WY][S];
++    __shared__ __half Sin16[S][CB];
++    __shared__ __half U16[WY][CB];
++    __shared__ float A[WY * WY]; // o32 lower half + pq32 upper half, then S_out over all of it
++    __shared__ float dec[WY + 1];
++    // Sin16 storage alias: pk32 lives here after site 3, and it doubles as the warp-private
++    // f32 conversion scratch (4 x 256 floats) at site 5 - both dead by then
++    float* const pf = (float*)Sin16;
++
++    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
++    const int c = threadIdx.x, rg = threadIdx.y, col = cb * CB + c, tid = rg * CB + c;
++    const int qh = head % HK;
++    float s[RPG];
++    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
++    const size_t rs = (size_t) HV * S;
++
++    #pragma unroll
++    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
++
++    for (int64_t t0 = 0; t0 < T; t0 += WY) {
++        const int w = (int) min((int64_t) WY, T - t0);
++        
++        // Compute dec array
++        if (threadIdx.x == 0) {
++            dec[0] = 1.0f;
++            for (int t = 0; t < w; ++t) dec[t + 1] = dec[t] * __expf(gate[(t0 + t) * HV + head]);
++        }
++        __syncthreads();
++
++        // Load k and q into fp16 LDS, zero-padding rows >= w
++        for (int t = 0; t < WY; ++t) {
++            if (t < w) {
++                const float* src_k = h + HK * S + qh * S + (t0 + t) * C;
++                const float* src_q = h + (t0 + t) * C + qh * S;
++                for (int i = tid; i < S; i += CB * RG) {
++                    kt16[t][i] = __float2half_rn(src_k[i]);
++                    qt16[t][i] = __float2half_rn(src_q[i]);
++                }
++            } else {
++                for (int i = tid; i < S; i += CB * RG) {
++                    kt16[t][i] = __float2half_rn(0.0f);
++                    qt16[t][i] = __float2half_rn(0.0f);
++                }
++            }
++        }
++        
++        // Build Sin16 from register state s
++        // F1: Each thread writes ONLY its own column to avoid races
++        for (int r = 0; r < RPG; ++r) {
++            Sin16[rg * RPG + r][c] = __float2half_rn(s[r]);
++        }
++        __syncthreads();
++
++        // Site 1: A-build GEMM (WY x WY, K=S)
++        // Warp assignment: 4 warps, each handles 16 rows of A (M dim).
++        // Fragment: A (row_major), B (col_major).
++        {
++            int warpId = tid >> 5;
++            int row_start = warpId * 16;
++            
++            #pragma unroll
++            for (int nt = 0; nt < WY / 16; ++nt) {
++                rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc_n;
++                rocwmma::fill_fragment(acc_n, 0.0f);
++                
++                #pragma unroll
++                for (int ks = 0; ks < S / 16; ++ks) {
++                    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::row_major> a_frag;
++                    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::col_major> b_frag;
++                    
++                    rocwmma::load_matrix_sync(a_frag, &kt16[row_start][ks * 16], S);
++                    rocwmma::load_matrix_sync(b_frag, &kt16[nt * 16][ks * 16], S);
++                    
++                    rocwmma::mma_sync(acc_n, a_frag, b_frag, acc_n);
++                }
++                
++                // Store to A LDS
++                // A is float[WY*WY]. Row-major.
++                // We store to A[row_start .. row_start+15][nt*16 .. nt*16+15]
++                rocwmma::store_matrix_sync(&A[row_start * WY + nt * 16], acc_n, WY, rocwmma::mem_row_major);
++            }
++        }
++        __syncthreads();
++
++        // Site 1 Scale: A[t][s2] = beta * prod_gate * Araw
++        for (int p = tid; p < WY * WY; p += CB * RG) {
++            int t = p / WY, s2 = p % WY;
++            if (t >= w) { A[p] = 0.0f; continue; }
++            if (s2 > t) { A[p] = 0.0f; continue; }
++            if (s2 == t) { A[p] = 1.0f; continue; }
++            
++            float b = beta[(t0 + t) * HV + head];
++            float dec_ratio = 1.0f;
++            for (int j = s2 + 1; j <= t; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
++            A[p] = b * dec_ratio * A[p];
++        }
++        __syncthreads();
++
++        // Site 2: rhs fold pk (WY x CB, K=S)
++        // Warp assignment: 4 warps, each handles 16 rows of pk (M dim).
++        // F4: Compute into per-nt accumulator fragments but DO NOT store yet.
++        rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc_pk[CB / 16];
++        {
++            int warpId = tid >> 5;
++            int row_start = warpId * 16;
++            
++            #pragma unroll
++            for (int nt = 0; nt < CB / 16; ++nt) {
++                rocwmma::fill_fragment(acc_pk[nt], 0.0f);
++                
++                #pragma unroll
++                for (int ks = 0; ks < S / 16; ++ks) {
++                    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::row_major> a_frag;
++                    // F7: matrix_b row_major for Sin16 (row-major [K][N] tile)
++                    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::row_major> b_frag;
++                    
++                    rocwmma::load_matrix_sync(a_frag, &kt16[row_start][ks * 16], S);
++                    rocwmma::load_matrix_sync(b_frag, &Sin16[ks * 16][nt * 16], CB);
++                    
++                    rocwmma::mma_sync(acc_pk[nt], a_frag, b_frag, acc_pk[nt]);
++                }
++            }
++        }
++        // No __syncthreads() here, Sin16 is still needed for Site 3
++
++        // Site 3: pq fold (WY x CB, K=S)
++        // Warp assignment: 4 warps, each handles 16 rows of pq (M dim).
++        // F5: Accumulators in registers, no store.
++        rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc_pq[CB / 16];
++        {
++            int warpId = tid >> 5;
++            int row_start = warpId * 16;
++            
++            #pragma unroll
++            for (int nt = 0; nt < CB / 16; ++nt) {
++                rocwmma::fill_fragment(acc_pq[nt], 0.0f);
++                
++                #pragma unroll
++                for (int ks = 0; ks < S / 16; ++ks) {
++                    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::row_major> a_frag;
++                    // F7: matrix_b row_major for Sin16
++                    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::row_major> b_frag;
++                    
++                    rocwmma::load_matrix_sync(a_frag, &qt16[row_start][ks * 16], S);
++                    rocwmma::load_matrix_sync(b_frag, &Sin16[ks * 16][nt * 16], CB);
++                    
++                    rocwmma::mma_sync(acc_pq[nt], a_frag, b_frag, acc_pq[nt]);
++                }
++            }
++        }
++        __syncthreads();
++
++        // F6: store pk32 into Sin16's storage (Sin16 is dead after site 3); acc_pq stays in
++        // registers - pq32 lands in A's upper half only after the solve has finished reading A
++        {
++            int warpId = tid >> 5;
++            int row_start = warpId * 16;
++
++            #pragma unroll
++            for (int nt = 0; nt < CB / 16; ++nt) {
++                rocwmma::store_matrix_sync(&pf[row_start * CB + nt * 16], acc_pk[nt], CB, rocwmma::mem_row_major);
++            }
++        }
++        __syncthreads();
++
++        // Site 4: Forward substitution
++        float uj[WY];
++        for (int t = 0; t < w; ++t) {
++            float vj = h[2 * HK * S + head * S + (t0 + t) * C + col];
++            float b = beta[(t0 + t) * HV + head];
++            float g = __expf(gate[(t0 + t) * HV + head]);
++            // F8: rhs reads pk32 from the Sin16 storage overlay
++            float rhs = b * (vj - g * dec[t] * pf[t * CB + c]);
++            
++            float acc = rhs;
++            for (int s2 = 0; s2 < t; ++s2) {
++                acc -= A[t * WY + s2] * uj[s2];
++            }
++            uj[t] = acc;
++        }
++        
++        // Build U16
++        // F9: Single writer guard
++        if (rg == 0) {
++            for (int t = 0; t < WY; ++t) {
++                U16[t][c] = (t < w) ? __float2half_rn(uj[t]) : __float2half_rn(0.0f);
++            }
++        }
++        __syncthreads();
++        // pq32 -> A's upper half (the solve is done reading A; o32 occupies the lower half later)
++        {
++            int warpId = tid >> 5;
++            int row_start = warpId * 16;
++
++            #pragma unroll
++            for (int nt = 0; nt < CB / 16; ++nt) {
++                rocwmma::store_matrix_sync(&A[WY * CB + row_start * CB + nt * 16], acc_pq[nt], CB, rocwmma::mem_row_major);
++            }
++        }
++        __syncthreads();
++
++        // Site 5: P GEMM (WY x WY, K=S)
++        // Warp assignment: 4 warps, each handles 16 rows of P (M dim).
++        // Overlay qt16 with P16. qt16 is dead after Site 3 - BUT the mma loads read the whole
++        // qt16 row (ld=S) every nt iteration, so ALL K-loops must finish before ANY P16 store
++        // lands: K outer, nt inner, one accumulator fragment per nt tile (the per-nt-then-K
++        // order self-clobbered a_frag with freshly stored P16 rows - the T=1 oracle FAIL class).
++        {
++            int warpId = tid >> 5;
++            int row_start = warpId * 16;
++
++            rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc[WY / 16];
++            #pragma unroll
++            for (int nt = 0; nt < WY / 16; ++nt) rocwmma::fill_fragment(acc[nt], 0.0f);
++
++            #pragma unroll
++            for (int ks = 0; ks < S / 16; ++ks) {
++                rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::row_major> a_frag;
++                rocwmma::load_matrix_sync(a_frag, &qt16[row_start][ks * 16], S);
++                #pragma unroll
++                for (int nt = 0; nt < WY / 16; ++nt) {
++                    // F7: col_major is correct for kt16-transposed trick here
++                    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::col_major> b_frag;
++                    rocwmma::load_matrix_sync(b_frag, &kt16[nt * 16][ks * 16], S);
++                    rocwmma::mma_sync(acc[nt], a_frag, b_frag, acc[nt]);
++                }
++            }
++
++            // Store P16: rocWMMA 7.1.1 has no converting store, so each f32 fragment lands in
++            // a warp-private 16x16 region of the dead pk32 scratch and is hand-converted into
++            // the fp16 tile (same row-major layout, ld=S).
++            #pragma unroll
++            for (int nt = 0; nt < WY / 16; ++nt) {
++                __syncthreads();   // scratch free (previous nt) + everyone past the mma loads
++                rocwmma::store_matrix_sync(&pf[warpId * 256], acc[nt], 16, rocwmma::mem_row_major);
++                __syncthreads();
++                for (int i = (tid & 31); i < 256; i += 32)   // this warp's own 16x16 scratch region
++                    qt16[row_start + i / 16][nt * 16 + i % 16] = __float2half_rn(pf[warpId * 256 + i]);
++                __syncthreads();
++            }
++        }
++        __syncthreads();
++
++        // Site 5 Scale: P16[t][s2] = ratio * P16[t][s2]
++        // P16 is in qt16.
++        for (int p = tid; p < WY * WY; p += CB * RG) {
++            int t = p / WY, s2 = p % WY;
++            if (t >= w) { qt16[t][s2] = __float2half_rn(0.0f); continue; }
++            if (s2 > t) { qt16[t][s2] = __float2half_rn(0.0f); continue; }
++            
++            float ratio = 1.0f;
++            if (s2 < t) {
++                for (int j = s2 + 1; j <= t; ++j) ratio *= __expf(gate[(t0 + j) * HV + head]);
++            }
++            // s2 == t is included with ratio 1
++            float val = ratio * (float)qt16[t][s2];
++            qt16[t][s2] = __float2half_rn(val);
++        }
++        __syncthreads();
++
++        // Site 6: O_intra GEMM (WY x CB, K=WY)
++        // Warp assignment: 4 warps, each handles 16 rows of O (M dim).
++        // Overlay A with o32. A is dead after Site 4.
++        {
++            int warpId = tid >> 5;
++            int row_start = warpId * 16;
++            
++            #pragma unroll
++            for (int nt = 0; nt < CB / 16; ++nt) {
++                rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc;
++                rocwmma::fill_fragment(acc, 0.0f);
++                
++                #pragma unroll
++                for (int ks = 0; ks < WY / 16; ++ks) {
++                    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::row_major> a_frag;
++                    // F7: matrix_b row_major for U16 (row-major [K][N] tile)
++                    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::row_major> b_frag;
++                    
++                    // A is P16 (qt16). B is U16.
++                    rocwmma::load_matrix_sync(a_frag, &qt16[row_start][ks * 16], S);
++                    rocwmma::load_matrix_sync(b_frag, &U16[ks * 16][nt * 16], CB);
++                    
++                    rocwmma::mma_sync(acc, a_frag, b_frag, acc);
++                }
++                rocwmma::store_matrix_sync(&A[row_start * CB + nt * 16], acc, CB, rocwmma::mem_row_major);
++            }
++        }
++        __syncthreads();
++
++        // Write oc
++        if (rg == 0) {
++            for (int t = 0; t < w; ++t) {
++                // F10: pq32 lives in A's upper half
++                float o = dec[t + 1] * A[WY * CB + t * CB + c] + A[t * CB + c];
++                oc_out[(t0 + t) * HV * S + head * S + col] = o * rsqrtf((float) S);
++            }
++        }
++        // F11: NEW WAR barrier
++        __syncthreads();
++
++        // State fold
++        // Rescale U16 in place
++        // F13: Single writer guard
++        if (rg == 0) {
++            for (int t = 0; t < WY; ++t) {
++                if (t < w) {
++                    float dec_ratio = 1.0f;
++                    for (int j = t + 1; j < w; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
++                    U16[t][c] = __float2half_rn(dec_ratio * (float)U16[t][c]);
++                }
++            }
++        }
++        __syncthreads();
++
++        // State GEMM (S x CB, K=WY)
++        // Warp assignment: 4 warps x TWO 16-row M-tiles each = all 128 state rows
++        // (a single 16-row tile per warp covered only half the state - the oracle caught it).
++        // Matrix A is kt16^T (S x WY). Matrix B is U16 (WY x CB).
++        {
++            int warpId = tid >> 5;
++            int row_start = warpId * 32; // 4 warps * 32 rows = 128 rows
++
++            #pragma unroll
++            for (int nt = 0; nt < CB / 16; ++nt) {
++                rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc[2];
++                rocwmma::fill_fragment(acc[0], 0.0f);
++                rocwmma::fill_fragment(acc[1], 0.0f);
++
++                #pragma unroll
++                for (int ks = 0; ks < WY / 16; ++ks) {
++                    // F7: matrix_b row_major for U16; matrix_a col_major = the kt16^T view
++                    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::col_major> a_frag;
++                    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::row_major> b_frag;
++
++                    // A[m][k] = kt16[ks*16 + k][row_start + m] (col_major, ld=S)
++                    rocwmma::load_matrix_sync(a_frag, &kt16[ks * 16][row_start], S);
++                    rocwmma::load_matrix_sync(b_frag, &U16[ks * 16][nt * 16], CB);
++                    rocwmma::mma_sync(acc[0], a_frag, b_frag, acc[0]);
++                    rocwmma::load_matrix_sync(a_frag, &kt16[ks * 16][row_start + 16], S);
++                    rocwmma::mma_sync(acc[1], a_frag, b_frag, acc[1]);
++                }
++
++                // F12: Store S_out into A's storage (o32 is dead after the oc write)
++                // A's storage holds: o32 [WY][CB] then S_out [S][CB] - both fit, barrier-separated
++                rocwmma::store_matrix_sync(&A[row_start * CB + nt * 16], acc[0], CB, rocwmma::mem_row_major);
++                rocwmma::store_matrix_sync(&A[(row_start + 16) * CB + nt * 16], acc[1], CB, rocwmma::mem_row_major);
++            }
++        }
++        __syncthreads();
++
++        // Update state registers
++        // F12: s[r] = dec[w] * s[r] + A[(rg * RPG + r) * CB + c];
++        for (int r = 0; r < RPG; ++r) {
++            int i = rg * RPG + r;
++            s[r] = dec[w] * s[r] + A[i * CB + c];
++        }
++        __syncthreads();
++    }
++
++    #pragma unroll
++    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
++}
++
++bool gdn_wy_wmma_supported() {
++    static int arch[64] = {};
++    int dev = 0;
++    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { hipGetLastError(); return false; }
++    if (arch[dev] == 0) {
++        hipDeviceProp_t p{};
++        if (hipGetDeviceProperties(&p, dev) != hipSuccess) { hipGetLastError(); return false; }
++        arch[dev] = (p.gcnArchName[0] == 'g' && p.gcnArchName[1] == 'f' && p.gcnArchName[2] == 'x' &&
++                     p.gcnArchName[3] == '1' && p.gcnArchName[4] == '1' && p.gcnArchName[5] == '0' &&
++                     p.gcnArchName[6] == '0') ? 1 : -1;
++    }
++    return arch[dev] == 1;
++}
++
++#else
++
++__global__ void __launch_bounds__(CB * RG) gdn_rec_wy_wmma_kernel(
++    float* __restrict__ state, const float* __restrict__ h,
++    const float* __restrict__ gate, const float* __restrict__ beta,
++    float* __restrict__ oc_out, int64_t T) {
++    // Stub
++}
++
++bool gdn_wy_wmma_supported() {
++    return false;
++}
++
++#endif
+diff --git a/src/prefill/gdn_rec_wy_wmma_rocwmma.hpp b/src/prefill/gdn_rec_wy_wmma_rocwmma.hpp
+new file mode 100644
+index 0000000000..27f5ebaf58
+--- /dev/null
++++ b/src/prefill/gdn_rec_wy_wmma_rocwmma.hpp
+@@ -0,0 +1,36 @@
++// The rocWMMA include for the GDN WY WMMA arm - GLOBAL SCOPE ONLY (include this BEFORE
++// namespace strata::prefill opens).  rocwmma's headers spell std:: names that would resolve
++// against strata::prefill's anonymous namespace if the headers were pulled in inside it
++// (amdclang: "no member named 'max' in namespace 'strata::prefill::(anonymous namespace)::std'").
++// The macro lift/restore is the qsa_select.cu pattern: the CUDA-compat shim
++// (hip_compat/intrinsics.hpp, force-included via <cuda_runtime.h>) renames the CUDA warp
++// intrinsics with macros, and hip's own bf16/fp8 headers (which rocwmma pulls in) use those
++// same tokens as function names - so the macros are lifted while rocwmma parses and put back
++// after; they must match intrinsics.hpp exactly.  gdn_rec_wy_wmma.cuh (inside the namespace)
++// then re-includes <rocwmma/rocwmma.hpp> as a guarded no-op and sees the real ::std entities.
++#if defined(__HIPCC__) && defined(__has_include)
++#if __has_include(<rocwmma/rocwmma.hpp>)
++#ifndef STRATA_GDN_WY_HAVE_ROCWMMA
++#define STRATA_GDN_WY_HAVE_ROCWMMA 1
++#undef __dp4a
++#undef __vsub4
++#undef __vsubss4
++#undef __vcmpne4
++#undef __shfl_xor_sync
++#undef __shfl_down_sync
++#undef __shfl_up_sync
++#undef __shfl_sync
++#undef __ballot_sync
++#include <rocwmma/rocwmma.hpp>
++#define __dp4a(a, b, c) (::strata::hip_compat::dp4a((a), (b), (c)))
++#define __vsub4(a, b) (::strata::hip_compat::vsub4((a), (b)))
++#define __vsubss4(a, b) (::strata::hip_compat::vsubss4((a), (b)))
++#define __vcmpne4(a, b) (::strata::hip_compat::vcmpne4((a), (b)))
++#define __shfl_xor_sync(...) (::strata::hip_compat::shfl_xor_sync(__VA_ARGS__))
++#define __shfl_down_sync(...) (::strata::hip_compat::shfl_down_sync(__VA_ARGS__))
++#define __shfl_up_sync(...) (::strata::hip_compat::shfl_up_sync(__VA_ARGS__))
++#define __shfl_sync(...) (::strata::hip_compat::shfl_sync(__VA_ARGS__))
++#define __ballot_sync(...) (::strata::hip_compat::ballot_sync(__VA_ARGS__))
++#endif
++#endif
++#endif
+diff --git a/src/prefill/gdn_wy_check.cu b/src/prefill/gdn_wy_check.cu
+new file mode 100644
+index 0000000000..4df19caa45
+--- /dev/null
++++ b/src/prefill/gdn_wy_check.cu
+@@ -0,0 +1,542 @@
++// src/prefill/gdn_wy_check.cu - the WY-form chunk-parallel GDN recurrence: algebra, device kernel, bound.
++//
++// the chunk-parallel design campaign.  The engine's serial recurrence (gdn_rec_cols_pipe_kernel,
++// copied verbatim from src/prefill/kernels.cu) is ground truth; the checks:
++//   1. host serial64 (fp64 token loop) vs host wy64 (fp64 chunked WY, C=64): the chunk-parallel ALGEBRA
++//      - exact to double epsilon on every fixture class (boundary T, no/fast decay, beta=0, long).
++//   2. device gdn_rec_wy_kernel vs the engine's serial kernel on the GPU, fp32, within a derived bound
++//      - the C3 gate for wiring STRATA_GDN_WY=1 into the engine.
++// Synthetic inputs at model shape (S=128, HK=16, HV=48); q/k rows L2-normalized per key head as
++// gdn_l2_kernel leaves them; v random per column.  NOTE: no blanket padding wipe over the token row -
++// it silently zeroed k and v and blinded the first algebra check (fixed 2026-10-05).
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++namespace {
++
++constexpr int S = 128, HK = 16, HV = 48, C = 10240;   // as kernels.cu: head size, key heads, value heads, q|k|v width
++constexpr int RG = 4, RPG = S / RG, CB = 32, NCB = S / CB;
++constexpr int WY = 64;   // the WY sub-chunk
++__device__ int g_wy_dbg;   // set from the host to dump block 0 (WY_DBG=1)
++
++void ck(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
++        std::exit(2);
++    }
++}
++
++__global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __restrict__ state, const float* __restrict__ h,
++                                                                    const float* __restrict__ gate,
++                                                                    const float* __restrict__ beta,
++                                                                    float* __restrict__ oc_out, int64_t T) {
++    constexpr int NT = CB * RG, LPT = S / NT;
++    __shared__ float sk[S], sq[S], red[RG][CB];
++    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
++    const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
++    const int qh = head % HK;
++    float s[RPG];
++    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
++    const size_t rs = (size_t) HV * S;
++#pragma unroll
++    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
++    float nq[LPT], nk[LPT], nv = 0.0f, ng = 0.0f, nb = 0.0f;
++    auto fetch = [&](int64_t t) {
++        const float* ht = h + t * C;
++#pragma unroll
++        for (int u = 0; u < LPT; ++u) { nq[u] = ht[qh * S + tid + u * NT]; nk[u] = ht[HK * S + qh * S + tid + u * NT]; }
++        nv = ht[2 * HK * S + head * S + col];
++        ng = gate[t * HV + head];
++        nb = beta[t * HV + head];
++    };
++    if (T > 0) fetch(0);
++    for (int64_t t = 0; t < T; ++t) {
++        float cq[LPT], ck[LPT];
++#pragma unroll
++        for (int u = 0; u < LPT; ++u) { cq[u] = nq[u]; ck[u] = nk[u]; }
++        const float cv = nv, cg = ng, cbt = nb;
++        __syncthreads();
++#pragma unroll
++        for (int u = 0; u < LPT; ++u) { sq[tid + u * NT] = cq[u]; sk[tid + u * NT] = ck[u]; }
++        __syncthreads();
++        if (t + 1 < T) fetch(t + 1);
++        const float g = __expf(cg);
++        float kv = 0.0f;
++#pragma unroll
++        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
++        red[rg][c] = kv;
++        __syncthreads();
++        const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
++        const float delta = (cv - g * kv_col) * cbt;
++        float o = 0.0f;
++#pragma unroll
++        for (int r = 0; r < RPG; ++r) {
++            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
++            o = fmaf(s[r], sq[rg * RPG + r], o);
++        }
++        __syncthreads();
++        red[rg][c] = o;
++        __syncthreads();
++        if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
++    }
++#pragma unroll
++    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
++}
++
++
++// ---------------------------------------------------------- the WY device kernel (C3)
++// Same grid/thread/column layout as the serial kernel (thread owns RPG rows of one column; grid = HV*NCB),
++// tokens processed in WY-token sub-chunks: stage the head's key rows in LDS, build the CxC coefficient
++// matrix A (S0-independent), per-column prefix products p^K/p^Q by block reductions, then the per-column
++// forward substitution, outputs and the state update run per-THREAD with A rows broadcast from LDS - the
++// block syncs O(1) per sub-chunk instead of per token.
++__global__ void __launch_bounds__(CB * RG) gdn_rec_wy_kernel(float* __restrict__ state, const float* __restrict__ h,
++                                                             const float* __restrict__ gate,
++                                                             const float* __restrict__ beta,
++                                                             float* __restrict__ oc_out, int64_t T) {
++    __shared__ float kt[WY][S];
++    __shared__ float A[WY * WY];
++    __shared__ float dec[WY + 1];
++    __shared__ float redk[RG][CB], redq[RG][CB];
++    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
++    const int c = threadIdx.x, rg = threadIdx.y, col = cb * CB + c;
++    const int tid = rg * CB + c;   // flat id in [0, CB*RG) - the launch is dim3(CB, RG), so threadIdx.x
++                                   // alone is only c in [0, 32): the two strided loops below MUST stride
++                                   // tid, or kt keeps 3/4 of its columns and A 3/4 of its entries
++                                   // unwritten (uninitialized LDS -> the run-varying NaN/Inf)
++    const int qh = head % HK;
++    float s[RPG];
++    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
++    const size_t rs = (size_t) HV * S;
++#pragma unroll
++    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
++
++    for (int64_t t0 = 0; t0 < T; t0 += WY) {
++        const int w = (int) min((int64_t) WY, T - t0);
++        if (threadIdx.x == 0) {
++            dec[0] = 1.0f;
++            for (int t = 0; t < w; ++t) dec[t + 1] = dec[t] * __expf(gate[(t0 + t) * HV + head]);
++        }
++        for (int t = 0; t < w; ++t) {
++            const float* src = h + HK * S + qh * S + (t0 + t) * C;
++            for (int i = tid; i < S; i += CB * RG) kt[t][i] = src[i];
++        }
++        __syncthreads();
++        // A[t][s] (s < t) = beta_t g_t dec[t] (dec[t]/dec[s+1]) (k_t . k_s); unit diagonal
++        for (int p = tid; p < WY * WY; p += CB * RG) {
++            const int t = p / WY, s2 = p % WY;
++            if (t >= w) continue;
++            if (s2 > t) { A[p] = 0.0f; continue; }
++            if (s2 == t) { A[p] = 1.0f; continue; }
++            const float b = beta[(t0 + t) * HV + head];
++            float dk = 0.0f;
++#pragma unroll 4
++            for (int i = 0; i < S; ++i) dk += kt[t][i] * kt[s2][i];
++            // the decay factor as a product, not g * dec[t]/dec[s+1]: fp32 cumulative products underflow to 0
++            // under fast decay and the ratio becomes 0/0 = NaN (the serial path multiplies and lands at 0).
++            // g * (dec[t]/dec[s+1]) = prod of gates s+1..t exactly - the standalone g is consumed.
++            float dec_ratio = 1.0f;
++            for (int j = s2 + 1; j <= t; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
++            A[p] = b * dec_ratio * dk;
++        }
++        __syncthreads();
++        float uj[WY], pk[WY], pq[WY];
++        for (int t = 0; t < w; ++t) {
++            const float* qt = h + (t0 + t) * C + qh * S;
++            float kpart = 0.0f, qpart = 0.0f;
++#pragma unroll
++            for (int r = 0; r < RPG; ++r) { kpart += s[r] * kt[t][rg * RPG + r]; qpart += s[r] * qt[rg * RPG + r]; }
++            redk[rg][c] = kpart;
++            redq[rg][c] = qpart;
++            __syncthreads();
++            pk[t] = redk[0][c] + redk[1][c] + redk[2][c] + redk[3][c];
++            pq[t] = redq[0][c] + redq[1][c] + redq[2][c] + redq[3][c];
++            __syncthreads();   // every thread has read both reductions before the next token overwrites them
++        }
++        // the per-column forward substitution (thread = column; A rows broadcast from LDS)
++        for (int t = 0; t < w; ++t) {
++            const float vj = h[2 * HK * S + head * S + (t0 + t) * C + col];
++            const float b = beta[(t0 + t) * HV + head], g = __expf(gate[(t0 + t) * HV + head]);
++            float acc = b * (vj - g * dec[t] * pk[t]);
++            for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WY + s2] * uj[s2];
++            uj[t] = acc;
++        }
++        if (g_wy_dbg && t0 == 0 && head == 0 && cb == 0 && rg == 0 && c == 0)
++            printf("DBG blk0: kt[0][0..2]=%.4f %.4f %.4f (col0) | pk[0]=%.4f vj=%.4f | s[col0 rows0..3]=%.4f %.4f %.4f %.4f\n",
++                   kt[0][0], kt[0][1], kt[0][2], pk[0], h[2 * HK * S + col], s[0], s[1], s[2], s[3]);
++        // outputs and the state update
++        for (int t = 0; t < w; ++t) {
++            const float* qt = h + (t0 + t) * C + qh * S;
++            float o = dec[t + 1] * pq[t];
++            for (int s2 = 0; s2 <= t; ++s2) {
++                float dq = 0.0f;
++#pragma unroll 4
++                for (int i = 0; i < S; ++i) dq += qt[i] * kt[s2][i];
++                float dec_ratio = 1.0f;
++                for (int j = s2 + 1; j <= t; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
++                o += dec_ratio * dq * uj[s2];
++            }
++            if (rg == 0) oc_out[(t0 + t) * HV * S + head * S + col] = o * rsqrtf((float) S);
++        }
++        for (int r = 0; r < RPG; ++r) {
++            const int i = rg * RPG + r;
++            float v = dec[w] * s[r];
++            for (int s2 = 0; s2 < w; ++s2) {
++                float dec_ratio = 1.0f;
++                for (int j = s2 + 1; j < w; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
++                v += dec_ratio * kt[s2][i] * uj[s2];
++            }
++            s[r] = v;
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
++}
++
++// ---------------------------------------------------------- host references (head 0, fp64)
++void serial64(const double* h, const double* gate, const double* beta, const double* st0, double* oc, double* stT,
++              int64_t T) {
++    std::vector<double> s(S * S);
++    for (int i = 0; i < S; ++i)
++        for (int j = 0; j < S; ++j) s[i * S + j] = st0[(size_t) i * HV * S + j];
++    for (int64_t t = 0; t < T; ++t) {
++        const double* kt = h + HK * S + t * C;
++        const double* qt = h + t * C;
++        const double* vt = h + 2 * HK * S + t * C;
++        const double g = std::exp(gate[t]), b = beta[t];
++        double delta[S];
++        for (int j = 0; j < S; ++j) {
++            double kv = 0;
++            for (int i = 0; i < S; ++i) kv += s[i * S + j] * kt[i];
++            delta[j] = (vt[j] - g * kv) * b;
++            if (std::getenv("WY_DBG") && t == 1 && j == 0)
++                std::printf("DBG serial64 t1 j0: v=%.10f g=%.10f kv=%.10f delta=%.10f | k1[0..2]=%.10f %.10f %.10f "
++                            "Saft0[0..2]=%.10f %.10f %.10f beta1=%.10f\n",
++                            vt[j], g, kv, delta[j], kt[0], kt[1], kt[2], s[0], s[1 * S], s[2 * S], beta[t]);
++        }
++        for (int i = 0; i < S; ++i)
++            for (int j = 0; j < S; ++j) s[i * S + j] = g * s[i * S + j] + kt[i] * delta[j];
++        for (int j = 0; j < S; ++j) {
++            double o = 0;
++            for (int i = 0; i < S; ++i) o += s[i * S + j] * qt[i];
++            oc[t * S + j] = o * (1.0 / std::sqrt((double) S));
++        }
++    }
++    for (int i = 0; i < S; ++i)
++        for (int j = 0; j < S; ++j) stT[(size_t) i * HV * S + j] = s[i * S + j];
++}
++
++// chunked WY (C=64) in double: per column the forward substitution rhs is beta*(v - g*dec[t]*p^K) minus the
++// A-row terms - exactly the device kernel's math at double precision.
++void wy64(const double* h, const double* gate, const double* beta, const double* st0, double* oc, double* stT,
++          int64_t T) {
++    std::vector<double> s(S * S);
++    for (int i = 0; i < S; ++i)
++        for (int j = 0; j < S; ++j) s[i * S + j] = st0[(size_t) i * HV * S + j];
++    std::vector<double> A(WY * WY), dec(WY + 1), pK(WY), pQ(WY), uj(WY);
++    for (int64_t t0 = 0; t0 < T; t0 += WY) {
++        const int w = (int) std::min<int64_t>(WY, T - t0);
++        dec[0] = 1.0;
++        for (int t = 0; t < w; ++t) dec[t + 1] = dec[t] * std::exp(gate[t0 + t]);
++        for (int t = 0; t < w; ++t) {
++            const double b = beta[t0 + t], g = std::exp(gate[t0 + t]);
++            const double* kt = h + HK * S + (t0 + t) * C;
++            for (int s2 = 0; s2 <= t; ++s2) {
++                if (s2 == t) { A[t * WY + s2] = 1.0; continue; }
++                const double* ks = h + HK * S + (t0 + s2) * C;
++                double dk = 0;
++                for (int i = 0; i < S; ++i) dk += kt[i] * ks[i];
++                A[t * WY + s2] = b * g * (dec[t] / dec[s2 + 1]) * dk;
++            }
++        }
++        for (int j = 0; j < S; ++j) {
++            for (int t = 0; t < w; ++t) {
++                const double* kt = h + HK * S + (t0 + t) * C;
++                const double* qt = h + (t0 + t) * C;
++                double pk = 0, pq = 0;
++                for (int i = 0; i < S; ++i) { pk += kt[i] * s[i * S + j]; pq += qt[i] * s[i * S + j]; }
++                pK[t] = pk; pQ[t] = pq;
++            }
++            for (int t = 0; t < w; ++t) {
++                double acc = beta[t0 + t] * (h[2 * HK * S + (t0 + t) * C + j] - std::exp(gate[t0 + t]) * dec[t] * pK[t]);
++                for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WY + s2] * uj[s2];
++                uj[t] = acc;
++                if (std::getenv("WY_DBG") && t0 == 0 && t == 1 && j == 0)
++                    std::printf("DBG wy64 t1 j0: v=%.10f g=%.10f dec[1]=%.10f pK[1]=%.10f A10=%.10f uj0=%.10f uj1=%.10f "
++                                "| k1[0..2]=%.10f %.10f %.10f S0[0..2]=%.10f %.10f %.10f beta1=%.10f\n",
++                                h[2 * HK * S + (t0 + t) * C + j], std::exp(gate[t0 + t]), dec[t], pK[t],
++                                A[t * WY + 0], uj[0], uj[t],
++                                h[HK * S + (t0 + t) * C], h[HK * S + (t0 + t) * C + 1], h[HK * S + (t0 + t) * C + 2],
++                                s[0 * S + j], s[1 * S + j], s[2 * S + j], beta[t0 + t]);
++            }
++            for (int t = 0; t < w; ++t) {
++                const double* qt = h + (t0 + t) * C;
++                double o = dec[t + 1] * pQ[t];
++                for (int s2 = 0; s2 <= t; ++s2) {
++                    double dq = 0;
++                    for (int i = 0; i < S; ++i) dq += qt[i] * h[HK * S + (t0 + s2) * C + i];
++                    o += (dec[t + 1] / dec[s2 + 1]) * dq * uj[s2];
++                }
++                oc[(t0 + t) * S + j] = o * (1.0 / std::sqrt((double) S));
++            }
++            for (int i = 0; i < S; ++i) {
++                double v = dec[w] * s[i * S + j];
++                for (int s2 = 0; s2 < w; ++s2) v += (dec[w] / dec[s2 + 1]) * h[HK * S + (t0 + s2) * C + i] * uj[s2];
++                s[i * S + j] = v;
++            }
++        }
++    }
++    for (int i = 0; i < S; ++i)
++        for (int j = 0; j < S; ++j) stT[(size_t) i * HV * S + j] = s[i * S + j];
++}
++
++// fp64 oracle over ALL heads, in the device's layout: oc[t*HV*S + head*S + j], state[(i*HV + head)*S + j].
++// The reference the device WY kernel is BOUND against (the serial-vs-WY host check above proves the chunk
++// algebra; this one quantifies the fp32 device's distance from exact).
++void oracle64(const double* h, const double* gate, const double* beta, const double* st0, double* oc, double* stT,
++              int64_t T) {
++    std::vector<double> s(S * S);
++    for (int head = 0; head < HV; ++head) {
++        const int qh = head % HK;
++        for (int i = 0; i < S; ++i)
++            for (int j = 0; j < S; ++j) s[i * S + j] = st0[((size_t) i * HV + head) * S + j];
++        for (int64_t t = 0; t < T; ++t) {
++            const double* kt = h + HK * S + t * C + qh * S;
++            const double* qt = h + t * C + qh * S;
++            const double* vt = h + 2 * HK * S + t * C + head * S;
++            const double g = std::exp(gate[t * HV + head]), b = beta[t * HV + head];
++            double delta[S];
++            for (int j = 0; j < S; ++j) {
++                double kv = 0;
++                for (int i = 0; i < S; ++i) kv += s[i * S + j] * kt[i];
++                delta[j] = (vt[j] - g * kv) * b;
++            }
++            for (int i = 0; i < S; ++i)
++                for (int j = 0; j < S; ++j) s[i * S + j] = g * s[i * S + j] + kt[i] * delta[j];
++            for (int j = 0; j < S; ++j) {
++                double o = 0;
++                for (int i = 0; i < S; ++i) o += s[i * S + j] * qt[i];
++                oc[((size_t) t * HV + head) * S + j] = o * (1.0 / std::sqrt((double) S));
++            }
++        }
++        for (int i = 0; i < S; ++i)
++            for (int j = 0; j < S; ++j) stT[((size_t) i * HV + head) * S + j] = s[i * S + j];
++    }
++}
++
++// ---------------------------------------------------------- fixtures
++int fixture(const char* name, int64_t T, int gates_mode, unsigned seed) {
++    std::mt19937 rng(seed);
++    std::normal_distribution<double> nd(0.0, 1.0);
++    std::uniform_real_distribution<double> ud(0.0, 1.0);
++    const size_t hz = (size_t) T * C;
++    std::vector<double> h(hz), gate((size_t) T * HV), beta((size_t) T * HV);
++    for (int64_t t = 0; t < T; ++t) {
++        double* q = h.data() + t * C;
++        double* k = h.data() + HK * S + t * C;
++        double* v = h.data() + 2 * HK * S + t * C;
++        for (int kh = 0; kh < HK; ++kh) {
++            for (int x = 0; x < S; ++x) { q[kh * S + x] = nd(rng); k[kh * S + x] = nd(rng); v[kh * S + x] = nd(rng); }
++            double nq = 0, nk = 0;
++            for (int x = 0; x < S; ++x) { nq += q[kh * S + x] * q[kh * S + x]; nk += k[kh * S + x] * k[kh * S + x]; }
++            nq = std::sqrt(nq); nk = std::sqrt(nk);
++            for (int x = 0; x < S; ++x) { q[kh * S + x] /= nq; k[kh * S + x] /= nk; }
++        }
++        for (int64_t t2 = 0; t2 < T; ++t2)   // heads 1..HV-1 share the token rows the host refs never read; keep clean
++            if (t2 != t) { }
++    }
++    for (int64_t t = 0; t < T; ++t)
++        for (int hd = 0; hd < HV; ++hd) {
++            gate[t * HV + hd] = gates_mode == 0 ? 0.3 * nd(rng) : gates_mode == 1 ? 0.0 : gates_mode == 2 ? -6.0 : 0.3 * nd(rng);
++            beta[t * HV + hd] = gates_mode == 3 ? 0.0 : ud(rng);
++        }
++    std::vector<double> st0((size_t) S * HV * S), oc64((size_t) T * S), ocwy((size_t) T * S), stT64((size_t) S * HV * S),
++        stTW((size_t) S * HV * S);
++    for (size_t i = 0; i < st0.size(); ++i) st0[i] = nd(rng) * 0.1;
++    serial64(h.data(), gate.data(), beta.data(), st0.data(), oc64.data(), stT64.data(), T);
++    wy64(h.data(), gate.data(), beta.data(), st0.data(), ocwy.data(), stTW.data(), T);
++    for (int64_t t = 0; t < T; ++t) {
++        double et = 0;
++        for (int j = 0; j < S; ++j) et = std::max(et, std::fabs(oc64[t * S + j] - ocwy[t * S + j]));
++        if (t < 8 || (et > 1e-8 && (t == 8 || t % 32 == 0)))
++            std::printf("    token %lld: max oc err %.3e\n", (long long) t, et);
++    }
++    double e_oc = 0, e_st = 0, s_oc = 0;
++    for (size_t i = 0; i < oc64.size(); ++i) {
++        e_oc = std::max(e_oc, std::fabs(oc64[i] - ocwy[i]));
++        s_oc = std::max(s_oc, std::fabs(oc64[i]));
++    }
++    for (size_t i = 0; i < (size_t) S * S; ++i) e_st = std::max(e_st, std::fabs(stT64[i] - stTW[i]));
++    const bool ok = e_oc < 1e-8 && e_st < 1e-8;
++    std::printf("%-28s T=%5d  max|serial64-wy64| oc %.3e state %.3e (scale %.2f) -> %s\n", name, (int) T, e_oc, e_st, s_oc,
++                ok ? "ALGEBRA OK" : "MISMATCH");
++    return ok ? 0 : 1;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
++    (void) bench;
++    int fails = 0;
++    if (!bench) {
++        const int64_t Ts[] = {1, 64, 4099};
++        const int gm[] = {0, 1, 2, 3};
++        int wfails = 0;
++        double worst = 0.0, worst_oracle = 0.0;
++        for (int64_t T : Ts)
++            for (int g : gm) {
++                if (T == 4099 && g != 0) continue;   // one long device cell: the fp64 oracle is slow
++                std::mt19937 rng((unsigned) (T * 100 + g + 7));
++                std::normal_distribution<double> nd(0.0, 1.0);
++                std::uniform_real_distribution<double> ud(0.0, 1.0);
++                const size_t hz = (size_t) T * C;
++                std::vector<float> h(hz), gate((size_t) T * HV), beta((size_t) T * HV);
++                for (int64_t t = 0; t < T; ++t) {
++                    for (int x = 0; x < C; ++x) h[t * C + x] = (float) nd(rng);
++                    for (int kh = 0; kh < HK; ++kh) {
++                        double nq = 0, nk = 0;
++                        for (int x = 0; x < S; ++x) { nq += (double) h[t * C + kh * S + x] * h[t * C + kh * S + x];
++                                                      nk += (double) h[t * C + HK * S + kh * S + x] * h[t * C + HK * S + kh * S + x]; }
++                        nq = std::sqrt(nq); nk = std::sqrt(nk);
++                        for (int x = 0; x < S; ++x) { h[t * C + kh * S + x] /= (float) nq; h[t * C + HK * S + kh * S + x] /= (float) nk; }
++                    }
++                    for (int hd = 0; hd < HV; ++hd) {
++                        gate[t * HV + hd] = g == 0 ? (float) (0.3 * nd(rng)) : g == 1 ? 0.0f : g == 2 ? -6.0f : (float) (0.3 * nd(rng));
++                        beta[t * HV + hd] = g == 3 ? 0.0f : (float) ud(rng);
++                    }
++                }
++                std::vector<float> st0((size_t) S * HV * S), stA((size_t) S * HV * S), stB((size_t) S * HV * S);
++                for (size_t i = 0; i < st0.size(); ++i) st0[i] = (float) (nd(rng) * 0.1);
++                const size_t oz = (size_t) T * HV * S;
++                std::vector<float> ocA(oz, 0.0f), ocB(oz, 0.0f);
++                float *dH, *dG, *dB, *dS0, *dSA, *dSB, *dOA, *dOB;
++                ck(cudaMalloc(&dH, hz * 4), "m1"); ck(cudaMalloc(&dG, gate.size() * 4), "m2");
++                ck(cudaMalloc(&dB, beta.size() * 4), "m3");
++                ck(cudaMalloc(&dS0, st0.size() * 4), "m4"); ck(cudaMalloc(&dSA, st0.size() * 4), "m5");
++                ck(cudaMalloc(&dSB, st0.size() * 4), "m6"); ck(cudaMalloc(&dOA, oz * 4), "m7");
++                ck(cudaMalloc(&dOB, oz * 4), "m8");
++                ck(cudaMemcpy(dH, h.data(), hz * 4, cudaMemcpyHostToDevice), "c1");
++                ck(cudaMemcpy(dG, gate.data(), gate.size() * 4, cudaMemcpyHostToDevice), "c2");
++                ck(cudaMemcpy(dB, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice), "c3");
++                ck(cudaMemcpy(dS0, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "c4");
++                ck(cudaMemcpy(dSA, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "c5");
++                ck(cudaMemcpy(dSB, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "c6");
++                const int dbg = std::getenv("WY_DBG") ? 1 : 0;
++                cudaMemcpyToSymbol(g_wy_dbg, &dbg, 4);
++                gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG)>>>(dSA, dH, dG, dB, dOA, T);
++                gdn_rec_wy_kernel<<<HV * NCB, dim3(CB, RG)>>>(dSB, dH, dG, dB, dOB, T);
++                ck(cudaDeviceSynchronize(), "run");
++                ck(cudaMemcpy(stA.data(), dSA, st0.size() * 4, cudaMemcpyDeviceToHost), "d1");
++                ck(cudaMemcpy(stB.data(), dSB, st0.size() * 4, cudaMemcpyDeviceToHost), "d2");
++                ck(cudaMemcpy(ocA.data(), dOA, oz * 4, cudaMemcpyDeviceToHost), "d3");
++                ck(cudaMemcpy(ocB.data(), dOB, oz * 4, cudaMemcpyDeviceToHost), "d4");
++                cudaFree(dH); cudaFree(dG); cudaFree(dB); cudaFree(dS0); cudaFree(dSA); cudaFree(dSB);
++                cudaFree(dOA); cudaFree(dOB);
++                double eoc = 0, est = 0, soc = 0, sost = 0;
++                for (size_t i = 0; i < oz; ++i) {
++                    const double d = (double) std::fabs(ocA[i] - ocB[i]);
++                    if (std::isnan(d) || d > eoc) eoc = d;   // std::max silently DROPS NaN - a NaN state
++                    soc = std::max(soc, (double) std::fabs(ocA[i]));   // diff read as err 0.0 for a full run
++                }
++                for (size_t i = 0; i < st0.size(); ++i) {
++                    const double d = (double) std::fabs(stA[i] - stB[i]);
++                    if (std::isnan(d) || d > est) est = d;
++                    sost = std::max(sost, (double) std::fabs(stA[i]));
++                }
++                // TEMP diagnostics: locate the first non-finite entry in each array (t, head, col)
++                for (int which = 0; which < 4; ++which) {
++                    const float* arr = which == 0 ? ocA.data() : which == 1 ? ocB.data() : which == 2 ? stA.data() : stB.data();
++                    const size_t n = which < 2 ? oz : st0.size();
++                    const char* nm = which == 0 ? "serial-oc" : which == 1 ? "wy-oc" : which == 2 ? "serial-st" : "wy-st";
++                    for (size_t i2 = 0; i2 < n; ++i2)
++                        if (!std::isfinite(arr[i2])) {
++                            if (which < 2) {
++                                const int64_t tt = i2 / (HV * S);
++                                const size_t rem = i2 % (HV * S);
++                                std::printf("NONFINITE %s [%zu]: t=%lld head=%zu col=%zu val=%g\n", nm, i2,
++                                            (long long) tt, rem / S, rem % S, arr[i2]);
++                            } else {
++                                const size_t row = i2 / ((size_t) HV * S), rem = i2 % ((size_t) HV * S);
++                                std::printf("NONFINITE %s [%zu]: row=%zu head=%zu col=%zu val=%g\n", nm, i2,
++                                            row, rem / S, rem % S, arr[i2]);
++                            }
++                            break;
++                        }
++                }
++                if (std::getenv("WY_DBG") && T == 1)
++                    for (int j = 0; j < 4; ++j) {
++                        double kv = 0;
++                        for (int i = 0; i < S; ++i) kv += (double) h[(size_t) HK * S + i] * st0[(size_t) i * HV * S + j];
++                        std::printf("DBG T1 g%d col%d: beta %.4f v %.4f kv %.4f k[0..2]=%.4f %.4f %.4f s0[0..3]=%.4f %.4f %.4f %.4f | serial oc %.4f wy oc %.4f | serial st %.4f wy st %.4f\n",
++                                    g, j, beta[j], h[(size_t) 2 * HK * S + j], kv,
++                                    (double) h[(size_t) HK * S + 0], (double) h[(size_t) HK * S + 1],
++                                    (double) h[(size_t) HK * S + 2],
++                                    st0[(size_t) 0 * HV * S + j], st0[(size_t) 1 * HV * S + j],
++                                    st0[(size_t) 2 * HV * S + j], st0[(size_t) 3 * HV * S + j],
++                                    ocA[(size_t) j], ocB[(size_t) j], stA[(size_t) j], stB[(size_t) j]);
++                    }
++                const double bound = 1e-3 * (1.0 + soc), bst = 1e-3 * (1.0 + sost);
++                const bool ok = eoc < bound && est < bst;   // scale-aware (the state grows without decay)
++                worst = std::max(worst, eoc);
++                if (!ok) {
++                    ++wfails;
++                    std::printf("  WY gpu T=%d g=%d: oc err %.3e (bound %.3e) state err %.3e FAIL\n", (int) T, g, eoc, bound, est);
++                }
++                // WY3: the device fp32 WY kernel against the fp64 oracle, inside the derived reassociation
++                // bound.  Per element the device sums <= ~2^10 fp32 terms (S + WY dots + the substitution
++                // chain) at u32 = 2^-24 each, compounded over ceil(T/WY) serial sub-chunks: the bound is
++                // (T/WY + 1) * 2^10 * 2^-24 * (1 + scale) = (T/WY + 1) * 2^-14 * (1 + scale), scale from the
++                // oracle itself.  No tolerance is involved: B is derived, and the negative control is the
++                // serial-vs-WY check above (a same-arithmetic pairing must stay ~1e-7 here).
++                {
++                    std::vector<double> h64(h.begin(), h.end()), g64(gate.begin(), gate.end()), b64(beta.begin(), beta.end()),
++                        s064(st0.begin(), st0.end()), ocO(oz), stO(st0.size());
++                    oracle64(h64.data(), g64.data(), b64.data(), s064.data(), ocO.data(), stO.data(), T);
++                    double eo_oc = 0, eo_st = 0, so_oc = 0, so_st = 0;
++                    for (size_t i = 0; i < oz; ++i) {
++                        const double d = std::fabs((double) ocB[i] - ocO[i]);
++                        if (std::isnan(d) || d > eo_oc) eo_oc = d;
++                        so_oc = std::max(so_oc, std::fabs(ocO[i]));
++                    }
++                    for (size_t i = 0; i < st0.size(); ++i) {
++                        const double d = std::fabs((double) stB[i] - stO[i]);
++                        if (std::isnan(d) || d > eo_st) eo_st = d;
++                        so_st = std::max(so_st, std::fabs(stO[i]));
++                    }
++                    const double chunks = (double) ((T + WY - 1) / WY);
++                    const double boc = chunks * (1.0 / 16384.0) * (1.0 + so_oc), bst = chunks * (1.0 / 16384.0) * (1.0 + so_st);
++                    const double util = std::max(eo_oc / boc, eo_st / bst);
++                    worst_oracle = std::max(worst_oracle, util);
++                    if (!(eo_oc < boc && eo_st < bst)) {
++                        ++wfails;
++                        std::printf("  WY oracle T=%d g=%d: oc %.3e (bound %.3e) state %.3e (bound %.3e) FAIL\n",
++                                    (int) T, g, eo_oc, boc, eo_st, bst);
++                    }
++                }
++            }
++        std::printf("device WY vs serial GPU: worst oc err %.3e -> %s\n", worst, wfails ? "FAIL" : "OK");
++        std::printf("device WY vs fp64 oracle: worst bound utilisation %.1f%% -> %s\n", worst_oracle * 100.0,
++                    wfails ? "FAIL" : "OK");
++        fails += wfails;
++    }
++    fails += fixture("T=2 trace", 2, 0, 11);
++    fails += fixture("plain", 200, 0, 1);
++    fails += fixture("T < WY sub-chunk", 37, 0, 2);
++    fails += fixture("T = WY exactly", 64, 0, 3);
++    fails += fixture("T = WY+1", 65, 0, 4);
++    fails += fixture("long", 4099, 0, 5);
++    fails += fixture("gates = 0 (no decay)", 300, 1, 6);
++    fails += fixture("gates = -6 (fast decay)", 300, 2, 7);
++    fails += fixture("beta = 0 (pure decay)", 300, 3, 8);
++    std::printf("%s (%d mismatches)\n", fails ? "BROKEN" : "all checks PASS", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/src/prefill/gdn_wy_wmma_check.cu b/src/prefill/gdn_wy_wmma_check.cu
+new file mode 100644
+index 0000000000..02f062176e
+--- /dev/null
++++ b/src/prefill/gdn_wy_wmma_check.cu
+@@ -0,0 +1,409 @@
++#include <cuda_runtime.h>
++#include <cuda_fp16.h>
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++#include <limits>
++
++// ============================================================================
++// A. Include chain for the shipped kernel (verbatim from task description)
++// ============================================================================
++
++// 1. Global scope: defines STRATA_GDN_WY_HAVE_ROCWMMA, includes <rocwmma/rocwmma.hpp>
++#include "gdn_rec_wy_wmma_rocwmma.hpp"
++
++namespace strata::prefill {
++namespace {
++
++// 2. Constants
++constexpr int S = 128, HK = 16, HV = 48, C = 10240;
++constexpr int RG = 4, RPG = S / RG;
++constexpr int CB = 32, NCB = S / CB;
++constexpr int WY = 64;
++
++// 3. INSIDE the anonymous namespace: gdn_rec_wy_wmma_kernel + gdn_wy_wmma_supported()
++#include "gdn_rec_wy_wmma.cuh"
++
++}  // anonymous namespace
++}  // namespace strata::prefill
++
++// ============================================================================
++// Harness Implementation
++// ============================================================================
++
++namespace {
++
++using namespace strata::prefill;
++
++// Helper for HIP error checking
++void ck(hipError_t e, const char* what) {
++    if (e != hipSuccess) {
++        std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
++        std::exit(2);
++    }
++}
++
++// NaN-aware max absolute difference
++double nan_max_abs_diff(double a, double b) {
++    double d = std::fabs(a - b);
++    if (std::isnan(d)) return std::numeric_limits<double>::infinity();
++    return d;
++}
++
++// NaN-aware max absolute value
++double nan_max_abs(double x) {
++    if (std::isnan(x)) return std::numeric_limits<double>::infinity();
++    return std::fabs(x);
++}
++
++// fp64 oracle over ALL heads, in the device's layout: oc[t*HV*S + head*S + j], state[(i*HV + head)*S + j].
++// The reference the device WY kernel is BOUND against.
++void oracle64(const double* h, const double* gate, const double* beta, const double* st0, double* oc, double* stT,
++              int64_t T) {
++    std::vector<double> s(S * S);
++    for (int head = 0; head < HV; ++head) {
++        const int qh = head % HK;
++        for (int i = 0; i < S; ++i)
++            for (int j = 0; j < S; ++j) s[i * S + j] = st0[((size_t) i * HV + head) * S + j];
++        for (int64_t t = 0; t < T; ++t) {
++            const double* kt = h + HK * S + t * C + qh * S;
++            const double* qt = h + t * C + qh * S;
++            const double* vt = h + 2 * HK * S + t * C + head * S;
++            const double g = std::exp(gate[t * HV + head]), b = beta[t * HV + head];
++            double delta[S];
++            for (int j = 0; j < S; ++j) {
++                double kv = 0;
++                for (int i = 0; i < S; ++i) kv += s[i * S + j] * kt[i];
++                delta[j] = (vt[j] - g * kv) * b;
++            }
++            for (int i = 0; i < S; ++i)
++                for (int j = 0; j < S; ++j) s[i * S + j] = g * s[i * S + j] + kt[i] * delta[j];
++            for (int j = 0; j < S; ++j) {
++                double o = 0;
++                for (int i = 0; i < S; ++i) o += s[i * S + j] * qt[i];
++                oc[((size_t) t * HV + head) * S + j] = o * (1.0 / std::sqrt((double) S));
++            }
++        }
++        for (int i = 0; i < S; ++i)
++            for (int j = 0; j < S; ++j) stT[((size_t) i * HV + head) * S + j] = s[i * S + j];
++    }
++}
++
++// Generate inputs matching the existing harness C style
++void generate_inputs(int64_t T, int gates_mode, unsigned seed,
++                     std::vector<float>& h_f, std::vector<float>& gate_f, std::vector<float>& beta_f,
++                     std::vector<double>& h_d, std::vector<double>& gate_d, std::vector<double>& beta_d,
++                     std::vector<double>& st0_d) {
++    std::mt19937 rng(seed);
++    std::normal_distribution<double> nd(0.0, 1.0);
++    std::uniform_real_distribution<double> ud(0.0, 1.0);
++
++    const size_t hz = (size_t) T * C;
++    h_d.resize(hz);
++    gate_d.resize((size_t) T * HV);
++    beta_d.resize((size_t) T * HV);
++    st0_d.resize((size_t) S * HV * S);
++
++    // Generate h (q, k, v)
++    for (int64_t t = 0; t < T; ++t) {
++        double* q = h_d.data() + t * C;
++        double* k = h_d.data() + HK * S + t * C;
++        double* v = h_d.data() + 2 * HK * S + t * C;
++        for (int kh = 0; kh < HK; ++kh) {
++            for (int x = 0; x < S; ++x) {
++                q[kh * S + x] = nd(rng);
++                k[kh * S + x] = nd(rng);
++                v[kh * S + x] = nd(rng);
++            }
++            double nq = 0, nk = 0;
++            for (int x = 0; x < S; ++x) {
++                nq += q[kh * S + x] * q[kh * S + x];
++                nk += k[kh * S + x] * k[kh * S + x];
++            }
++            nq = std::sqrt(nq);
++            nk = std::sqrt(nk);
++            for (int x = 0; x < S; ++x) {
++                q[kh * S + x] /= nq;
++                k[kh * S + x] /= nk;
++            }
++        }
++    }
++
++    // Generate gate and beta
++    for (int64_t t = 0; t < T; ++t) {
++        for (int hd = 0; hd < HV; ++hd) {
++            double g_val, b_val;
++            if (gates_mode == 0) { // normal
++                g_val = 0.3 * nd(rng);
++                b_val = ud(rng);
++            } else if (gates_mode == 1) { // none (zero gate)
++                g_val = 0.0;
++                b_val = ud(rng);
++            } else if (gates_mode == 2) { // fast decay
++                g_val = -6.0;
++                b_val = ud(rng);
++            } else if (gates_mode == 4) { // always-decay normal (gdn_rec_parity's distribution) - the long cell's mode: random-sign gates grow the state as exp(sum g) and leave the fp16 operand range
++                g_val = -0.02 - 0.8 * ud(rng) * ud(rng) * ud(rng);
++                b_val = ud(rng);
++            } else { // beta=0
++                g_val = 0.3 * nd(rng);
++                b_val = 0.0;
++            }
++            gate_d[t * HV + hd] = g_val;
++            beta_d[t * HV + hd] = b_val;
++        }
++    }
++
++    // Generate initial state
++    for (size_t i = 0; i < st0_d.size(); ++i) {
++        st0_d[i] = nd(rng) * 0.1;
++    }
++
++    // Convert to float for device and oracle (oracle reads float as double)
++    h_f.resize(hz);
++    gate_f.resize((size_t) T * HV);
++    beta_f.resize((size_t) T * HV);
++
++    for (size_t i = 0; i < hz; ++i) h_f[i] = (float) h_d[i];
++    for (size_t i = 0; i < hz; ++i) h_d[i] = (double) h_f[i];
++    for (size_t i = 0; i < (size_t) T * HV; ++i) {
++        gate_f[i] = (float) gate_d[i];
++        beta_f[i] = (float) beta_d[i];
++    }
++    
++    // Re-read gate/beta as double from float for oracle consistency
++    for (size_t i = 0; i < (size_t) T * HV; ++i) {
++        gate_d[i] = (double) gate_f[i];
++        beta_d[i] = (double) beta_f[i];
++    }
++}
++
++// Run one test cell
++// Returns: {worst_utilization, negative_control_ok}
++// worst_utilization is max(err/bound) over all elements.
++// negative_control_ok is true if the perturbed copy FAILED the bound (as expected).
++std::pair<double, bool> run_cell(int64_t T, int gates_mode, unsigned seed) {
++    std::vector<float> h_f, gate_f, beta_f;
++    std::vector<double> h_d, gate_d, beta_d, st0_d;
++    
++    generate_inputs(T, gates_mode, seed, h_f, gate_f, beta_f, h_d, gate_d, beta_d, st0_d);
++
++    // Allocate device memory
++    float *d_h, *d_gate, *d_beta, *d_state, *d_oc;
++    size_t h_size = (size_t) T * C * sizeof(float);
++    size_t gb_size = (size_t) T * HV * sizeof(float);
++    size_t st_size = (size_t) S * HV * S * sizeof(float);
++    size_t oc_size = (size_t) T * HV * S * sizeof(float);
++
++    ck(hipMalloc(&d_h, h_size), "malloc h");
++    ck(hipMalloc(&d_gate, gb_size), "malloc gate");
++    ck(hipMalloc(&d_beta, gb_size), "malloc beta");
++    ck(hipMalloc(&d_state, st_size), "malloc state");
++    ck(hipMalloc(&d_oc, oc_size), "malloc oc");
++
++    // Copy inputs to device
++    ck(hipMemcpy(d_h, h_f.data(), h_size, hipMemcpyHostToDevice), "memcpy h");
++    ck(hipMemcpy(d_gate, gate_f.data(), gb_size, hipMemcpyHostToDevice), "memcpy gate");
++    ck(hipMemcpy(d_beta, beta_f.data(), gb_size, hipMemcpyHostToDevice), "memcpy beta");
++    
++    // Copy initial state to device
++    std::vector<float> st0_f(st0_d.size());
++    for (size_t i = 0; i < st0_d.size(); ++i) st0_f[i] = (float) st0_d[i];
++    ck(hipMemcpy(d_state, st0_f.data(), st_size, hipMemcpyHostToDevice), "memcpy state");
++
++    // Launch kernel
++    // gdn_rec_wy_wmma_kernel<<<HV * NCB, dim3(CB, RG)>>>
++    gdn_rec_wy_wmma_kernel<<<HV * NCB, dim3(CB, RG)>>>(d_state, d_h, d_gate, d_beta, d_oc, T);
++    ck(hipGetLastError(), "kernel launch");
++    ck(hipDeviceSynchronize(), "kernel sync");
++
++    // Copy results back
++    std::vector<float> oc_dev(oc_size / sizeof(float));
++    std::vector<float> st_dev(st_size / sizeof(float));
++    ck(hipMemcpy(oc_dev.data(), d_oc, oc_size, hipMemcpyDeviceToHost), "memcpy oc back");
++    ck(hipMemcpy(st_dev.data(), d_state, st_size, hipMemcpyDeviceToHost), "memcpy state back");
++
++    // Run fp64 oracle
++    std::vector<double> oc_oracle(oc_size / sizeof(float));
++    std::vector<double> st_oracle(st_size / sizeof(float));
++    oracle64(h_d.data(), gate_d.data(), beta_d.data(), st0_d.data(), oc_oracle.data(), st_oracle.data(), T);
++
++    // Calculate Bound B
++    // B = chunks * (pow(2, -6) + pow(2, -14)) * (1.0 + scale)
++    // chunks = ceil((double)T / WY)
++    double chunks = std::ceil((double) T / WY);
++    double base_factor = std::pow(2.0, -6) + std::pow(2.0, -14);
++    
++    // Calculate scales
++    double scale_oc = 0.0;
++    for (double val : oc_oracle) {
++        scale_oc = std::max(scale_oc, nan_max_abs(val));
++    }
++    double scale_st = 0.0;
++    for (double val : st_oracle) {
++        scale_st = std::max(scale_st, nan_max_abs(val));
++    }
++
++    double bound_oc = chunks * base_factor * (1.0 + scale_oc);
++    double bound_st = chunks * base_factor * (1.0 + scale_st);
++
++    // Calculate worst utilization
++    double worst_util = 0.0;
++    
++    // Check oc
++    for (size_t i = 0; i < oc_oracle.size(); ++i) {
++        double err = nan_max_abs_diff((double) oc_dev[i], oc_oracle[i]);
++        double util = err / bound_oc;
++        if (std::isnan(util)) util = std::numeric_limits<double>::infinity();
++        worst_util = std::max(worst_util, util);
++    }
++    
++    // Check state
++    for (size_t i = 0; i < st_oracle.size(); ++i) {
++        double err = nan_max_abs_diff((double) st_dev[i], st_oracle[i]);
++        double util = err / bound_st;
++        if (std::isnan(util)) util = std::numeric_limits<double>::infinity();
++        worst_util = std::max(worst_util, util);
++    }
++
++    // Negative Control
++    // Copy device oc_out and state, add exactly 2.5*B to every element
++    // Require the checker to FLAG the copy (max err > B)
++    
++    std::vector<float> oc_perturbed = oc_dev;
++    std::vector<float> st_perturbed = st_dev;
++    
++    for (size_t i = 0; i < oc_perturbed.size(); ++i) {
++        oc_perturbed[i] += (float) (2.5 * bound_oc);
++    }
++    for (size_t i = 0; i < st_perturbed.size(); ++i) {
++        st_perturbed[i] += (float) (2.5 * bound_st);
++    }
++    
++    double neg_control_max_util = 0.0;
++    for (size_t i = 0; i < oc_oracle.size(); ++i) {
++        double err = nan_max_abs_diff((double) oc_perturbed[i], oc_oracle[i]);
++        double util = err / bound_oc;
++        if (std::isnan(util)) util = std::numeric_limits<double>::infinity();
++        neg_control_max_util = std::max(neg_control_max_util, util);
++    }
++    for (size_t i = 0; i < st_oracle.size(); ++i) {
++        double err = nan_max_abs_diff((double) st_perturbed[i], st_oracle[i]);
++        double util = err / bound_st;
++        if (std::isnan(util)) util = std::numeric_limits<double>::infinity();
++        neg_control_max_util = std::max(neg_control_max_util, util);
++    }
++    
++    // Negative control is OK if it trips the bound (util > 1.0)
++    bool neg_control_ok = (neg_control_max_util > 1.0);
++
++    // Cleanup
++    hipFree(d_h);
++    hipFree(d_gate);
++    hipFree(d_beta);
++    hipFree(d_state);
++    hipFree(d_oc);
++
++    return {worst_util, neg_control_ok};
++}
++
++} // namespace
++
++int main(int argc, char** argv) {
++    (void) argc;
++    (void) argv;
++
++
++    // --bench: kernel-level timing of the wmma arm (compare with gdn_wy_check --bench's
++    // cols/pipe/wy-fp32 numbers at the same T). Always-decay inputs: outside the fp16 domain
++    // (random-sign growth) the arithmetic would run on infs and the timing would lie.
++    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
++        for (int64_t T : {8192, 32768}) {
++            std::vector<float> h_f, gate_f, beta_f;
++            std::vector<double> h_d, gate_d, beta_d, st0_d;
++            generate_inputs(T, 4, 77, h_f, gate_f, beta_f, h_d, gate_d, beta_d, st0_d);
++            float *d_h, *d_gate, *d_beta, *d_state, *d_oc;
++            ck(hipMalloc(&d_h, h_f.size() * 4), "bm h");
++            ck(hipMalloc(&d_gate, gate_f.size() * 4), "bm g");
++            ck(hipMalloc(&d_beta, beta_f.size() * 4), "bm b");
++            ck(hipMalloc(&d_state, st0_d.size() * 4), "bm s");
++            ck(hipMalloc(&d_oc, (size_t) T * HV * S * 4), "bm o");
++            ck(hipMemcpy(d_h, h_f.data(), h_f.size() * 4, hipMemcpyHostToDevice), "bm mh");
++            ck(hipMemcpy(d_gate, gate_f.data(), gate_f.size() * 4, hipMemcpyHostToDevice), "bm mg");
++            ck(hipMemcpy(d_beta, beta_f.data(), beta_f.size() * 4, hipMemcpyHostToDevice), "bm mb");
++            ck(hipMemset(d_state, 0, st0_d.size() * 4), "bm ms0");
++            hipEvent_t e0, e1;
++            ck(hipEventCreate(&e0), "bm ev"); ck(hipEventCreate(&e1), "bm ev");
++            const int warm = 3, reps = T <= 8192 ? 10 : 5;
++            for (int i = 0; i < warm; ++i)
++                gdn_rec_wy_wmma_kernel<<<HV * NCB, dim3(CB, RG)>>>(d_state, d_h, d_gate, d_beta, d_oc, T);
++            ck(hipDeviceSynchronize(), "bm warm");
++            float best = 1e30f;
++            for (int i = 0; i < reps; ++i) {
++                ck(hipEventRecord(e0), "bm r");
++                gdn_rec_wy_wmma_kernel<<<HV * NCB, dim3(CB, RG)>>>(d_state, d_h, d_gate, d_beta, d_oc, T);
++                ck(hipEventRecord(e1), "bm r");
++                ck(hipEventSynchronize(e1), "bm r");
++                float ms = 0;
++                ck(hipEventElapsedTime(&ms, e0, e1), "bm r");
++                best = best < ms ? best : ms;
++            }
++            std::printf("gdn wy wmma bench T=%lld: %.1f ms (best of %d)\n", (long long) T, best, reps);
++            ck(hipEventDestroy(e0), "bm ev"); ck(hipEventDestroy(e1), "bm ev");
++            hipFree(d_h); hipFree(d_gate); hipFree(d_beta); hipFree(d_state); hipFree(d_oc);
++        }
++        return 0;
++    }
++
++    if (!gdn_wy_wmma_supported()) {
++        std::printf("gdn_wy_wmma_check: SKIP (rocwmma unavailable or not gfx1100)\n");
++        return 0;
++    }
++
++    int fails = 0;
++    double global_worst_util = 0.0;
++    bool global_neg_control_ok = true;
++
++    // Device cells: T in {1, 37, 64, 65, 200, 4099} x decay modes {none, normal, fast}
++    // minus the (4099, none) cell
++    const int64_t Ts[] = {1, 37, 64, 65, 200, 4099};
++    // Modes: 0=normal, 1=none, 2=fast
++    const int modes[] = {0, 1, 2};
++    const char* mode_names[] = {"normal", "none", "fast"};
++
++    for (int64_t T : Ts) {
++        for (int m : modes) {
++            // one long device cell: the fp64 oracle is slow. Mode 4 (always-decay) keeps the
++            // state inside the fp16 operand range over 4099 tokens - random-sign gates do not
++            // (exp(sum g) overflows), which is a domain fact of the wmma arm, not a tolerance.
++            if (T == 4099 && m != 4) continue;
++
++            unsigned seed = (unsigned) (T * 100 + m + 7);
++            auto [util, neg_ok] = run_cell(T, m, seed);
++
++            if (util > 1.0) {
++                std::printf("FAIL: T=%lld mode=%s err/bound=%.4f\n", (long long) T, mode_names[m], util);
++                fails++;
++            }
++            
++            if (!neg_ok) {
++                std::printf("NEGATIVE-CONTROL BROKEN: T=%lld mode=%s\n", (long long) T, mode_names[m]);
++                fails++;
++                global_neg_control_ok = false;
++            }
++
++            global_worst_util = std::max(global_worst_util, util);
++        }
++    }
++
++    std::printf("gdn_wy_wmma_check: worst bound utilisation %.1f%% -> %s (negative control: %s)\n",
++                global_worst_util * 100.0,
++                fails == 0 ? "PASS" : "FAIL",
++                global_neg_control_ok ? "ok" : "BROKEN");
++
++    return fails;
++}
+diff --git a/src/prefill/kernels.cu b/src/prefill/kernels.cu
+index 3f14fb16d1..925dba56e1 100644
+--- a/src/prefill/kernels.cu
++++ b/src/prefill/kernels.cu
+@@ -15,6 +15,10 @@
+ #include <cstdlib>
+ #include <cstring>
+ 
++// the rocWMMA include for the GDN WY WMMA arm - at GLOBAL scope (its std:: names must not
++// resolve against the anonymous namespace below); see gdn_rec_wy_wmma_rocwmma.hpp
++#include "gdn_rec_wy_wmma_rocwmma.hpp"
++
+ namespace strata::prefill {
+ namespace {
+ 
+@@ -1119,6 +1123,118 @@ __global__ void __launch_bounds__(S) gdn_out_norm_loop_kernel(const float* __res
+     }
+ }
+ #endif   // __HIPCC__
++constexpr int WY = 64;   // the WY sub-chunk length (gdn_rec_wy_kernel)
++// The chunk-parallel (WY-form) recurrence: tokens in 64-token sub-chunks; per sub-chunk one CxC unit-lower-
++// triangular solve (the only serial part, C steps instead of C fully-serial token steps) and GEMV-shaped
++// folds.  Opt-in STRATA_GDN_WY: EXACT MODULO SUMMATION ORDER ONLY (same fp32 dtype, no tolerance - the
++// reassociation bound and the fp64-oracle check live in src/prefill/gdn_wy_check.cu; design and
++// measured verdicts in the PR description).  Writes the same pre-norm oc as the cols kernels; gdn_out_norm follows
++// unchanged.  A[t][s] = beta_t g_t (dec[t]/dec[s+1]) (k_t . k_s) with dec[t] = prod of gates before t;
++// rhs_t = beta_t (v_t - g_t dec[t] (k_t . S_in)); o_t = dec[t+1](q_t . S_in) + sum (dec[t+1]/dec[s+1])(q_t.k_s)u_s;
++// S_out = dec[w] S_in + sum (dec[w]/dec[s+1]) k_s u_s.  The two strided loops MUST stride the flat thread id
++// (rg*CB + c): under dim3(CB, RG) threadIdx.x alone covers a quarter of the range and leaves the rest of
++// kt/A uninitialized (the run-varying-NaN class gdn_wy_check's redk-vs-redq probe caught).
++__global__ void __launch_bounds__(CB * RG) gdn_rec_wy_kernel(float* __restrict__ state, const float* __restrict__ h,
++                                                             const float* __restrict__ gate,
++                                                             const float* __restrict__ beta,
++                                                             float* __restrict__ oc_out, int64_t T) {
++    __shared__ float kt[WY][S];
++    __shared__ float A[WY * WY];
++    __shared__ float dec[WY + 1];
++    __shared__ float redk[RG][CB], redq[RG][CB];
++    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
++    const int c = threadIdx.x, rg = threadIdx.y, col = cb * CB + c, tid = rg * CB + c;
++    const int qh = head % HK;
++    float s[RPG];
++    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
++    const size_t rs = (size_t) HV * S;
++#pragma unroll
++    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
++
++    for (int64_t t0 = 0; t0 < T; t0 += WY) {
++        const int w = (int) min((int64_t) WY, T - t0);
++        if (threadIdx.x == 0) {
++            dec[0] = 1.0f;
++            for (int t = 0; t < w; ++t) dec[t + 1] = dec[t] * __expf(gate[(t0 + t) * HV + head]);
++        }
++        for (int t = 0; t < w; ++t) {
++            const float* src = h + HK * S + qh * S + (t0 + t) * C;
++            for (int i = tid; i < S; i += CB * RG) kt[t][i] = src[i];
++        }
++        __syncthreads();
++        for (int p = tid; p < WY * WY; p += CB * RG) {
++            const int t = p / WY, s2 = p % WY;
++            if (t >= w) continue;
++            if (s2 > t) { A[p] = 0.0f; continue; }
++            if (s2 == t) { A[p] = 1.0f; continue; }
++            const float b = beta[(t0 + t) * HV + head], g = __expf(gate[(t0 + t) * HV + head]);
++            float dk = 0.0f;
++#pragma unroll 4
++            for (int i = 0; i < S; ++i) dk += kt[t][i] * kt[s2][i];
++            // the decay factor as a product, not g * dec[t]/dec[s+1]: under fast decay the cumulative
++            // products underflow fp32 to 0 and the ratio becomes 0/0 = NaN (the serial path just multiplies
++            // and lands at 0).  g * (dec[t]/dec[s+1]) = prod of gates s+1..t exactly - the standalone g is
++            // consumed by the product.  Same real value, covered by the reassociation bound.
++            float dec_ratio = 1.0f;
++            for (int j = s2 + 1; j <= t; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
++            A[p] = b * dec_ratio * dk;
++        }
++        __syncthreads();
++        float uj[WY], pk[WY], pq[WY];
++        for (int t = 0; t < w; ++t) {
++            const float* qt = h + (t0 + t) * C + qh * S;
++            float kpart = 0.0f, qpart = 0.0f;
++#pragma unroll
++            for (int r = 0; r < RPG; ++r) { kpart += s[r] * kt[t][rg * RPG + r]; qpart += s[r] * qt[rg * RPG + r]; }
++            redk[rg][c] = kpart;
++            redq[rg][c] = qpart;
++            __syncthreads();
++            pk[t] = redk[0][c] + redk[1][c] + redk[2][c] + redk[3][c];
++            pq[t] = redq[0][c] + redq[1][c] + redq[2][c] + redq[3][c];
++            __syncthreads();   // every thread has read both reductions before the next token overwrites them
++        }
++        for (int t = 0; t < w; ++t) {
++            const float vj = h[2 * HK * S + head * S + (t0 + t) * C + col];
++            const float b = beta[(t0 + t) * HV + head], g = __expf(gate[(t0 + t) * HV + head]);
++            float acc = b * (vj - g * dec[t] * pk[t]);
++            for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WY + s2] * uj[s2];
++            uj[t] = acc;
++        }
++        for (int t = 0; t < w; ++t) {
++            const float* qt = h + (t0 + t) * C + qh * S;
++            float o = dec[t + 1] * pq[t];
++            for (int s2 = 0; s2 <= t; ++s2) {
++                float dq = 0.0f;
++#pragma unroll 4
++                for (int i = 0; i < S; ++i) dq += qt[i] * kt[s2][i];
++                float dec_ratio = 1.0f;
++                for (int j = s2 + 1; j <= t; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
++                o += dec_ratio * dq * uj[s2];
++            }
++            if (rg == 0) oc_out[(t0 + t) * HV * S + head * S + col] = o * rsqrtf((float) S);
++        }
++        for (int r = 0; r < RPG; ++r) {
++            const int i = rg * RPG + r;
++            float v = dec[w] * s[r];
++            for (int s2 = 0; s2 < w; ++s2) {
++                float dec_ratio = 1.0f;
++                for (int j = s2 + 1; j < w; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
++                v += dec_ratio * kt[s2][i] * uj[s2];
++            }
++            s[r] = v;
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
++}
++// The tensor-core folds variant of the WY kernel (rocWMMA 16x16x16 fp16xfp16->f32, wave32),
++// included INSIDE the anonymous namespace so it sees S/HK/HV/C/CB/RG/RPG/NCB/WY above; the
++// the pre-derived fp16-class error bound and the parity gates predate this file (PR description) QA note: the codegen draft's `sh` alias
++// was block-scoped; hoisted to kernel scope at the LDS declarations during review.
++#include "gdn_rec_wy_wmma.cuh"
++// the output norm over a head's 128 columns, into the FP16 copy the out projection reads (the FP32 output before the
++// norm stays in its scratch buffer)
+ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
+                                                          float eps, float* __restrict__ y, uint16_t* __restrict__ y16,
+                                                          int64_t ld16) {
+@@ -1625,12 +1741,24 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
+         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T, ld16);
+     } else {
+         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
++        static const bool wy = [] { const char* v = std::getenv("STRATA_GDN_WY"); return v != nullptr && v[0] != '\0' && v[0] != '0'; }();
+ #if !defined(__HIPCC__)
+-        if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
++        if (pipe && !wy && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
+             gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+         else
+ #endif
+-        if (pipe)   // the software-pipelined loads (same bits)
++        if (wy) {   // the chunk-parallel WY recurrence (opt-in; wmma folds per the revised checkpoint, fma fallback)
++            if (gdn_wy_wmma_supported()) {
++                static const bool said_wmma = [] { std::fprintf(stderr, "gdn wy arm = wmma (gfx1100, opt-in)\n"); return true; }();
++                (void) said_wmma;
++                gdn_rec_wy_wmma_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
++            } else {
++                static const bool said_fma = [] { std::fprintf(stderr, "gdn wy arm = fma (opt-in, wmma unavailable)\n"); return true; }();
++                (void) said_fma;
++                gdn_rec_wy_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
++            }
++        }
++        else if (pipe)   // the software-pipelined loads (same bits)
+             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+         else
+             gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);

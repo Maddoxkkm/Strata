@@ -1,0 +1,3722 @@
+diff --git a/.gitignore b/.gitignore
+index acca09f3fe..55f93a4b73 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -35,11 +35,13 @@ td.log
+ /run-*.bat
+ /run-*.sh
+ /strata-*.json
++/strata-*.json.bak
+ /strata-*.log
+ /build-strata.bat
+ /build-strata-cuda12.bat
+ /build-cuda12/
+ /.strata-mcp/
++/.strata-launcher/
+ 
+ # image encoder (setup.py --vision): build output and the generated build script
+ build-vision*/
+diff --git a/AGENTS.md b/AGENTS.md
+index 3bcf107ae7..78e3e9a61e 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -10,14 +10,20 @@ one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
+ Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,
+ start and verify the server, and connect the user's apps. Never expose the server beyond `127.0.0.1` without
+ `--api-key`. As an alternative to shell commands, Strata's MCP server ([docs/MCP_SERVER.md](docs/MCP_SERVER.md))
+-offers the same steps as tools.
++offers the same steps as tools, and the launcher ([docs/LAUNCHER.md](docs/LAUNCHER.md), `LAUNCHER.bat` /
++`./launcher.sh`) offers them as a window the user can click through: models installed and available, presets, the
++calibration.
+ 
+ ## Working on the code
+ 
+ - How the engine works, every measured number, the API and all settings: [docs/DETAILS.md](docs/DETAILS.md) and
+   the [paper](docs/paper/Strata-Paper.pdf).
+ - AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
++- `launcher/` is a front-end, not a second engine: it asks `tools/strata_mcp.py` (the controller the MCP server
++  uses) what is installed and what fits, and runs setup and `serve/server.py` the way the start scripts do. A new
++  setting belongs in setup.py first; the launcher only shows it.
+ - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
+-  `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
++  `tools/test_setup_amd.py`, `tools/test_setup_choices.py`). The launcher's: `python -m unittest
++  launcher.test_presets launcher.test_api`.
+ - Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a
+   measurement.
+diff --git a/LAUNCHER.bat b/LAUNCHER.bat
+new file mode 100644
+index 0000000000..08a3d9f1ff
+--- /dev/null
++++ b/LAUNCHER.bat
+@@ -0,0 +1,33 @@
++@echo off
++rem Strata's launcher: one window to pick which model to run and with which settings - the sizes setup offers and
++rem what they need, the models this PC already has, presets you can save and change, setup's calibration, and the
++rem speed of each model (published, measured here, and live while it runs).
++rem It changes nothing by itself: a download runs setup exactly as SETUP.bat does, and a start runs the same
++rem serve\server.py as run-<model>.bat. Closing this window leaves a started model running.
++setlocal
++title Strata launcher
++cd /d "%~dp0"
++if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe" & goto run
++
++call :findpy
++if defined PY goto run
++echo.
++echo  The launcher needs Python 3.10 or newer (64-bit).
++echo  Run START-HERE.bat once - it installs Python and the model - then LAUNCHER.bat.
++pause
++exit /b 1
++
++:run
++"%PY%" -m launcher %*
++if errorlevel 1 pause
++exit /b
++
++:findpy
++rem the py launcher first, then python on PATH (not the Microsoft Store stub), then the usual per-user folders
++set "PY="
++py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) and sys.maxsize > 2**32 else 1)" >nul 2>nul
++if not errorlevel 1 set "PY=py -3" & goto :eof
++python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) and sys.maxsize > 2**32 else 1)" >nul 2>nul
++if not errorlevel 1 set "PY=python" & goto :eof
++for %%V in (313 312 311 310) do if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" set "PY="%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"" & goto :eof
++goto :eof
+diff --git a/README.de.md b/README.de.md
+index fbc44a6069..74f7f39a14 100644
+--- a/README.de.md
++++ b/README.de.md
+@@ -140,7 +140,9 @@ stark komprimiert. Kleinere Größen sind schneller. Größere sind etwas klüge
+   ein. Es steht nicht im Menü des Installers.
+ 
+ Größen, Downloads und was wohin passt: [docs/MODELS.md](docs/MODELS.md). Um später ein weiteres Modell
+-hinzuzufügen, starte `SETUP.bat` (Linux: `./setup.sh --setup`).
++hinzuzufügen, starte `SETUP.bat` (Linux: `./setup.sh --setup`). Um eine Größe auszuwählen und Einstellungen in
++einem Fenster als wiederverwendbare Presets zu halten statt Flags zu tippen: `LAUNCHER.bat`
++(Linux: `./launcher.sh`, [der Launcher](docs/LAUNCHER.md)).
+ 
+ ## So benutzt du es
+ 
+diff --git a/README.es.md b/README.es.md
+index e8fa744df9..801b226444 100644
+--- a/README.es.md
++++ b/README.es.md
+@@ -137,7 +137,8 @@ tamaños pequeños son más rápidos. Los grandes son algo más inteligentes.
+   el menú del instalador.
+ 
+ Tamaños, descargas y qué cabe dónde: [docs/MODELS.md](docs/MODELS.md). Para añadir otro modelo más adelante, ejecuta
+-`SETUP.bat` (Linux: `./setup.sh --setup`).
++`SETUP.bat` (Linux: `./setup.sh --setup`). Para elegir un tamaño y guardar ajustes reutilizables en una ventana en
++lugar de escribir opciones: `LAUNCHER.bat` (Linux: `./launcher.sh`, [el lanzador](docs/LAUNCHER.md)).
+ 
+ ## Cómo usarlo
+ 
+diff --git a/README.fr.md b/README.fr.md
+index b6cccce9b6..2f6467342f 100644
+--- a/README.fr.md
++++ b/README.fr.md
+@@ -137,7 +137,9 @@ compressées. Les petites tailles sont plus rapides. Les grandes sont un peu plu
+   Il n'est pas dans le menu de l'installateur.
+ 
+ Tailles, téléchargements et ce qui tient où : [docs/MODELS.md](docs/MODELS.md). Pour ajouter un autre modèle plus
+-tard, lancez `SETUP.bat` (Linux : `./setup.sh --setup`).
++tard, lancez `SETUP.bat` (Linux : `./setup.sh --setup`). Pour choisir une taille et garder des réglages
++réutilisables dans une fenêtre au lieu de taper des options : `LAUNCHER.bat` (Linux : `./launcher.sh`,
++[le lanceur](docs/LAUNCHER.md)).
+ 
+ ## Utilisation
+ 
+diff --git a/README.ja.md b/README.ja.md
+index b910c38486..901bdb3541 100644
+--- a/README.ja.md
++++ b/README.ja.md
+@@ -134,7 +134,8 @@ Strata のインストール、起動、停止もできます。
+   インストーラーのメニューにはありません。
+ 
+ サイズ、ダウンロード、どれがどこに収まるかについて：[docs/MODELS.md](docs/MODELS.md)。あとで別のモデルを追加するには
+-`SETUP.bat`（Linux：`./setup.sh --setup`）を実行します。
++`SETUP.bat`（Linux：`./setup.sh --setup`）を実行します。サイズを選んで、フラグを打つ代わりにウィンドウで
++設定を保存して使い回すには：`LAUNCHER.bat`（Linux：`./launcher.sh`、[ランチャー](docs/LAUNCHER.md)）。
+ 
+ ## 使い方
+ 
+diff --git a/README.md b/README.md
+index a8184b66e3..d1000727f0 100644
+--- a/README.md
++++ b/README.md
+@@ -135,7 +135,8 @@ sizes are faster. Larger sizes are a bit smarter.
+   not in the installer's menu.
+ 
+ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
+-`SETUP.bat` (Linux: `./setup.sh --setup`).
++`SETUP.bat` (Linux: `./setup.sh --setup`). To pick a size and keep settings you can reuse in a window instead of
++typing flags: `LAUNCHER.bat` (Linux: `./launcher.sh`, [the launcher](docs/LAUNCHER.md)).
+ 
+ ## Using it
+ 
+diff --git a/README.pt-BR.md b/README.pt-BR.md
+index aa0b0ee6cc..8d4e94f718 100644
+--- a/README.pt-BR.md
++++ b/README.pt-BR.md
+@@ -137,7 +137,8 @@ Os tamanhos menores são mais rápidos. Os maiores são um pouco mais inteligent
+   não está no menu do instalador.
+ 
+ Tamanhos, downloads e o que cabe onde: [docs/MODELS.md](docs/MODELS.md). Para adicionar outro modelo depois, rode
+-`SETUP.bat` (Linux: `./setup.sh --setup`).
++`SETUP.bat` (Linux: `./setup.sh --setup`). Para escolher um tamanho e guardar configurações reutilizáveis numa
++janela em vez de digitar opções: `LAUNCHER.bat` (Linux: `./launcher.sh`, [o lançador](docs/LAUNCHER.md)).
+ 
+ ## Como usar
+ 
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index a54a2188f6..3a5b7c97df 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -127,7 +127,8 @@ NVIDIA 和 AMD 的步骤完全一样。安装程序会识别你的显卡，并
+ - **[OrcaRouter 的 Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)：** 需要手动设置，不在安装程序的菜单里。
+ 
+ 规格、下载以及各配置能装下什么：[docs/MODELS.md](docs/MODELS.md)。以后想再添加模型，运行
+-`SETUP.bat`（Linux：`./setup.sh --setup`）。
++`SETUP.bat`（Linux：`./setup.sh --setup`）。想在窗口里挑选规格、把设置存成可复用的预设而不用记命令行参数：
++`LAUNCHER.bat`（Linux：`./launcher.sh`，[启动器](docs/LAUNCHER.md)）。
+ 
+ ## 使用方法
+ 
+diff --git a/docs/AI_SETUP.md b/docs/AI_SETUP.md
+index 3eb9dfcf15..b3fba980a6 100644
+--- a/docs/AI_SETUP.md
++++ b/docs/AI_SETUP.md
+@@ -109,6 +109,9 @@ The flags (all of them: `START-HERE.bat --help`):
+ block your shell. Start it separately in step 6.
+ 
+ Notes:
++- **The user wants to choose themselves:** `LAUNCHER.bat` (Linux: `./launcher.sh`) is the window for that - the
++  models installed and available, presets and the calibration. It runs the same setup and the
++  same server; see [the launcher](LAUNCHER.md).
+ - **Linux:** setup uses `sudo apt` (or dnf/pacman) to install Python with venv if it is missing, and on AMD may need
+   `build-essential` and `git`. You cannot type the user's password: if a `sudo` step is needed, ask the user to run it
+   (e.g. `sudo apt install python3-venv build-essential git`) and then rerun setup.
+diff --git a/docs/INSTALL.md b/docs/INSTALL.md
+index 05b1035d29..3f2909f1f2 100644
+--- a/docs/INSTALL.md
++++ b/docs/INSTALL.md
+@@ -43,8 +43,9 @@ where it left off) and **starts the model**. Your browser opens the Strata app a
+ 
+ **Next time**, just double-click `START-HERE.bat` again: it starts right away (30-90 s to load the model), nothing is
+ downloaded twice. Close its window to stop the model. `SETUP.bat` (the same as `START-HERE.bat --setup`) installs
+-another model or changes the settings. Starting Strata from Task Scheduler at logon needs two task settings, or the
+-start is 24x slower: [Running it at startup](DETAILS.md#running-it-at-startup-task-scheduler).
++another model or changes the settings; `LAUNCHER.bat` opens a window where you pick the model and its settings and
++keep them as presets ([the launcher](LAUNCHER.md)). Starting Strata from Task Scheduler at logon needs two task
++settings, or the start is 24x slower: [Running it at startup](DETAILS.md#running-it-at-startup-task-scheduler).
+ 
+ ## Linux
+ 
+@@ -54,7 +55,8 @@ start is 24x slower: [Running it at startup](DETAILS.md#running-it-at-startup-ta
+ 
+ The same questions, the same automatic install (it uses `sudo apt` for Python and, only if it has to compile, for
+ the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./setup.sh` (or `./run-<model>.sh`)
+-start the model directly; `./setup.sh --setup` installs another model or changes the settings. Other distributions,
++start the model directly; `./setup.sh --setup` installs another model or changes the settings. `./launcher.sh` opens
++the same choices in a window ([the launcher](LAUNCHER.md)). Other distributions,
+ WSL and compiling: [details](DETAILS.md#linux).
+ 
+ ## AMD cards
+@@ -216,6 +218,7 @@ keep it. NVIDIA cards for now. [What it measures](DETAILS.md#double-click-start-
+ ```
+ START-HERE.bat --setup                          install another model, or change context / images
+ SETUP.bat                                       the same (double-click it)
++LAUNCHER.bat   /   ./launcher.sh                a window to pick a model, a preset, and start it (docs/LAUNCHER.md)
+ START-HERE.bat --model IQ2_XS --context 32768 --vision yes --yes     no questions
+ START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
+ START-HERE.bat --data-dir E:\Strata-data         keep the model files somewhere else
+diff --git a/docs/LAUNCHER.md b/docs/LAUNCHER.md
+new file mode 100644
+index 0000000000..ca17b4fc53
+--- /dev/null
++++ b/docs/LAUNCHER.md
+@@ -0,0 +1,151 @@
++# Strata's launcher: pick a model and its settings in one window
++
++`LAUNCHER.bat` (Windows) / `./launcher.sh` (Linux) opens a page on your own PC where you choose **which model to
++run and with which settings**: the sizes setup offers and what each needs, the models this PC already has, presets
++you save and reuse, and setup's calibration. It is a front-end, not a second engine: a download runs setup exactly as
++`SETUP.bat` does, and a start runs the same `serve/server.py` as `run-<model>.bat`.
++
++The launcher is for the case `START-HERE.bat` is not meant for - "run the Coder today with 32K and leave 2 GB of
++VRAM free for the game" - without remembering flags. If you only ever run one model, you never need it.
++
++<p align="center"><img src="media/launcher.png" width="900" alt="The launcher page: the models on this PC and the saved presets on the left, the preset's own fields in the middle, and what the selected model runs with on the right"></p>
++
++- **On this page:** [Opening it](#opening-it) · [What is on the page](#what-is-on-the-page) ·
++  [Presets](#presets) · [Downloading a model](#downloading-a-model) · [Measuring this PC](#measuring-this-pc) ·
++  [Where things are stored](#where-things-are-stored) · [What it does not do](#what-it-does-not-do)
++
++## Opening it
++
++```
++LAUNCHER.bat                    Windows
++./launcher.sh                   Linux
++python -m launcher              from the Strata folder, with any Python 3.10+ you like
++python -m launcher --port 8091 --no-browser
++```
++
++It opens `http://127.0.0.1:8090/` in your browser (the next free port if that one is taken) and listens on this PC
++only - the same rule the model server follows: nothing leaves the PC unless you set up a network address with an API
++key. It uses only Python's standard library, so it starts before setup has made a `.venv`; when a `.venv` exists it
++uses that, which is what the calibration needs. Closing the launcher's window leaves a model it started running -
++stop a model on the page or close its own window.
++
++## What is on the page
++
++| | |
++| --- | --- |
++| **Top bar** | what runs now (model, port, idle or answering), a link to the chat page, Stop, and this PC: GPU, RAM, engine version. While a download or a measurement runs, its step and percentage are here. |
++| **On this PC** | the models installed in this folder: their context, KV precision, images, port, when they were last used, and whether their files are all there. Clicking one shows its settings. The line under it says which Strata folder the page is reading - with two installs on the PC, that is the one you are changing. |
++| **Presets** | your presets, each with a ✕ to remove it; "as it is set up here", one per model installed in this folder, read from its own `strata-<model>.json`; and the ones derived from this PC (setup's own recommendation, the fastest size, the biggest that fits, the Coder). |
++| **The middle column** | the selected preset: its name, note and every setting, with the setup.py flag each one writes under it. Buttons: save, duplicate, delete, what installing it would do, apply these settings, download, start, measure this PC. |
++| **Right column** | what the model needs (download, RAM, experts), its config and start script, what setup's calibration recorded for it, and - while a model runs - the base URLs for pointing your apps at it. |
++| **Logs** (full width, under the three columns) | Download, Measuring, Server, Engine: the last 120 lines of that file, re-read every 3 seconds, so a running server writes itself onto the page while you watch. The pane stays at the end unless you scroll up to read something, the tab whose file is being written now is marked, and the line under the pane names the file and how many lines are shown. |
++
++Nothing changes on this PC until you press a button that says so.
++
++## Presets
++
++A **preset** is one model plus its settings, with a name: the family and size, the context, the KV precision,
++images, the low-RAM mode, the VRAM left free, the KV streaming, which GPU or GPUs, the port, the address and key,
++whether the experimental speed projection is on, and whether to measure this PC first. Every field is a `setup.py`
++flag - the page prints the flag under each field, and the plan shows the whole command - so a preset never hides a
++setting that setup does not have. A field left empty is **not** passed: setup's own default for this PC decides,
++which is what makes a preset portable to another machine. The form stops at what a person actually changes: the
++context scaling and the draft token subset are not offered, because setup picks them for the context it is given.
++
++The **context** field offers setup's own lengths (8K, 32K, 64K, 128K, 256K, 384K, 512K) plus **192K**, the one
++between 128K and 256K, and an **own value** box for any token count from 1,024 to 1,048,576. setup takes any
++`--context` - its list is only what its questions offer - so a length of your own is passed straight through and the
++plan marks it as such. 192K is 196,608 tokens, still under the model's trained 262,144 positions, so no rope scaling
++comes into it; past that setup adds yarn by itself, and the page marks those lengths as scaled.
++
++Presets are plain JSON in `.strata-launcher/presets.json`: copy that file to another PC and the presets are there.
++Selecting an installed model makes a preset out of its own `strata-<model>.json`, so "save what I have now" and
++"change one thing and install it again" are the same path - and every installed model is listed under "as it is set
++up here" with exactly what its config says it runs with, so the setup you already made is visible without clicking
++around. None of these are stored: the installed ones are re-read from the configs and the ones derived from this PC
++are recalculated from setup's tables, so a repository that adds a model adds it to the list. A folder with no
++installed model shows no "as it is set up here" group - that is how you notice you started the launcher from a
++different Strata copy.
++
++A preset you made carries a **✕** in the list: one click removes it, after asking, and the model it downloaded stays
++on the PC. The derived ones have no ✕ and their Delete button is greyed out: nothing is stored to remove, they are
++recalculated from this PC and from the model's config.
++
++Two presets can name the same model with different settings (a 32K one for work, a 128K one for long documents);
++installing the second reuses the model files already downloaded and only re-applies the settings.
++
++## Downloading a model
++
++"Download" first shows the plan, and only runs setup once you agree to it: the size of the download (58-111 GB
++depending on the size), the disk space needed and free, whether the RAM is enough, and how long it takes (20-90
++minutes, mostly the download). Setup runs non-interactively in the background, exactly as the MCP server runs it, and
++the page follows its steps and percentages. Stop it whenever you like: starting it again continues the download where
++it stopped. When it finishes, setup has written `strata-<model>.json` and `run-<model>.bat` as usual, and the model
++appears under "On this PC".
++
++Installing a model that is already here **rewrites that model's config**: anything the preset does not carry is
++chosen again by setup, so a preset made from an older config can quietly lower the context or drop KV streaming. The
++plan says so before anything runs, one line per difference against the config that model runs with now - on a 16 GB
++card, a 128K preset over a 256K model reads `Context: 262,144 becomes 131,072`. A preset that matches the installed
++model lists nothing, and **matching is judged by what setup decides, not by the words**: `auto` is not a setting, it
++is setup's RAM rule for this PC, so a preset saying `auto` - or saying what that rule decides (`off` for a size whose
++experts fit the RAM, `on` for one that streams its cache) - is the model as it runs and lists nothing.  The two
++settings setup decides by itself are compared as the engine runs them: KV streaming by its `--kv-resident`, the
++low-RAM mode by its `--resident-experts`/`--mmap-experts`, each side with its own context and KV precision, with
++setup's own rules (`kv_streaming_wanted`, `low_ram_wanted`).  What is listed is what really changes -
++`KV streaming: on becomes off`, `Low-RAM mode: setup's own choice becomes on` - and a preset that changes nothing
++never re-runs setup.  For a model that is already here the button in
++the plan is **"Apply these settings"**, not "Download": setup re-checks the files and rewrites the config, it fetches
++nothing again - a few seconds to a minute on this PC.
++
++## Starting a model
++
++"Start" runs the same command `run-<model>.bat` runs (`serve/server.py --engine strata --config strata-<model>.json
++--port <port>`), in the background, and the page follows the server log while the model comes into memory - 1-3
++minutes, and the PC is slow meanwhile. It also opens the model's chat page in a new browser tab: that tab says the
++model is loading and becomes the chat page as soon as the server answers, which is what the start script does with
++`--open`. If the browser blocks the new tab, the page says the model is ready and the top bar has an "Open the chat
++page" button; if the start stops before the model is up, the tab it opened is closed. "Measure this PC first" opens
++the same page when the measurement is done and the model starts. One model runs at a time: the top bar says which one
++and on what port, and the model card shows the OpenAI and Anthropic base URLs for pointing your apps at it.
++
++**A preset is applied when you start the model.** A model runs what its own `strata-<model>.json` says, so when the
++preset differs from that config, Start runs setup first (`--yes --no-start`): the config is rewritten with the
++preset's settings and the files already there are only checked again - a few seconds to a minute on this PC, nothing
++fetched. The differences are listed above the buttons while they exist
++(`Speed projection: the model runs with on, this preset says off`), and the start says what it did:
++`applied the preset to iq3_s first (Speed projection off); Strata is running …`. "Apply these settings" does the same
++without starting the model. A preset that already matches the config starts straight away, with no setup run, and a
++server that is already running keeps the settings it started with until you stop it and start it again.
++
++## Measuring this PC
++
++"Measure this PC" is setup's `--calibrate`: it starts the model a few times with different settings (the share of
++missing experts copied over PCIe, how sure the draft layer must be to guess further, how many CPU threads compute
++experts), keeps a setting only when it beats the default by more than 3%, and writes the winners into that model's
++config. It takes 5-10 minutes and keeps the PC busy, so the launcher asks first, refuses while a model is running
++(the measurement needs the VRAM and RAM to itself), shows the measurement's own log, and can stop it. The result is
++remembered per PC and model in setup's own settings file, so an update keeps it. NVIDIA cards for now, as before.
++
++A preset says what to do about it: **ask** (the default) offers the measurement the first time you start that model
++on this PC and starts it when the measurement is done, **always** runs it by itself after a download, **never**
++leaves the shipped settings alone. You can also press "Measure this PC" at any time.
++
++## Where things are stored
++
++| | |
++| --- | --- |
++| `.strata-launcher/presets.json` | your presets |
++| `.strata-launcher/calibrate.log`, `calibrate-result.json` | the last measurement's output and result |
++| `.strata-mcp/` | unchanged: the install job, its log, and the model server the launcher starts |
++| `strata-<model>.json`, `run-<model>.bat` | unchanged: setup writes these, the launcher only reads them |
++
++## What it does not do
++
++It adds no settings of its own: anything the page offers is a `setup.py` flag, and `setup.py --help` stays the
++reference. It does not use the model server's own settings page, and it does not change a running model - a setting
++is applied by running setup again, which is what "Update / re-apply" does. It does not listen outside this PC, and it
++does not download anything without showing the plan first.
++
++**Tests.** `python -m unittest launcher.test_presets launcher.test_api` checks the preset rules and the flags they
++produce, and the launcher's own answers with a fixed description of a PC. They download nothing and use no GPU.
+diff --git a/docs/MCP_SERVER.md b/docs/MCP_SERVER.md
+index 4fc053697f..052cf7fc81 100644
+--- a/docs/MCP_SERVER.md
++++ b/docs/MCP_SERVER.md
+@@ -17,7 +17,8 @@ scripts do. It is one Python file that uses only the standard library, so it wor
+ 
+ It is not the same thing as [Tools from MCP servers](DETAILS.md#tools-from-mcp-servers). That feature
+ (`serve/mcp.py`) lets the *Strata model* call tools from your MCP servers in its chat page. This page is the other
+-direction: *your assistant* manages Strata.
++direction: *your assistant* manages Strata. For a person rather than an assistant, `LAUNCHER.bat`
++(Linux: `./launcher.sh`) puts the same steps in a window: [the launcher](LAUNCHER.md).
+ 
+ ## Add it
+ 
+diff --git a/docs/MODELS.md b/docs/MODELS.md
+index 921b55db24..7b7255527a 100644
+--- a/docs/MODELS.md
++++ b/docs/MODELS.md
+@@ -155,4 +155,6 @@ explicit packing conversion and is not an installer menu option.
+ You can add another model any time with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux
+ `./setup.sh --setup`). Files another model shares are not downloaded again (the Coder uses the original's shard 2 and
+ vision encoder). With more than one model installed, `START-HERE.bat` asks which one to start; `run-<model>.bat`
+-(Linux: `run-<model>.sh`) starts one directly.
++(Linux: `run-<model>.sh`) starts one directly. `LAUNCHER.bat` (Linux: `./launcher.sh`) shows the same choices in a
++window - the sizes and what they need on this PC, the models installed here, and settings you can save as a preset
++and reuse: [the launcher](LAUNCHER.md).
+diff --git a/docs/media/launcher.png b/docs/media/launcher.png
+new file mode 100644
+index 0000000000..10e0e47bb2
+Binary files /dev/null and b/docs/media/launcher.png differ
+diff --git a/launcher.sh b/launcher.sh
+new file mode 100755
+index 0000000000..c51c8c41de
+--- /dev/null
++++ b/launcher.sh
+@@ -0,0 +1,20 @@
++#!/bin/sh
++# Strata's launcher: one page to pick which model to run and with which settings - the sizes setup offers and what
++# they need, the models this PC already has, presets you can save and change, setup's calibration, and the speed of
++# each model (published, measured here, and live while it runs).
++# It changes nothing by itself: a download runs setup exactly as ./setup.sh --setup does, and a start runs the same
++# serve/server.py as run-<model>.sh. Closing this terminal leaves a started model running.
++cd "$(dirname "$0")" || exit 1
++if [ -x .venv/bin/python ]; then
++  exec .venv/bin/python -m launcher "$@"
++fi
++for c in python3 python; do
++  if command -v $c >/dev/null 2>&1 && $c -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
++    echo "Strata's own Python environment (.venv) is missing: run ./setup.sh once to install or repair it."
++    echo "Starting the launcher with $c instead - a download still uses setup's own environment."
++    exec $c -m launcher "$@"
++  fi
++done
++echo "The launcher needs Python 3.10 or newer. Run ./setup.sh once - it installs Python and the model - then"
++echo "./launcher.sh."
++exit 1
+diff --git a/launcher/__init__.py b/launcher/__init__.py
+new file mode 100644
+index 0000000000..6b195c8603
+--- /dev/null
++++ b/launcher/__init__.py
+@@ -0,0 +1,7 @@
++"""Strata's launcher: pick a model, pick a preset, start it.
++
++    LAUNCHER.bat (Windows)   /   ./launcher.sh (Linux)   /   python -m launcher
++
++A model selector with the settings in it: the sizes setup offers and what they need, the models this PC already has,
++presets you can save and change, and setup's calibration.  See docs/LAUNCHER.md.
++"""
+diff --git a/launcher/__main__.py b/launcher/__main__.py
+new file mode 100644
+index 0000000000..36fb9f71b1
+--- /dev/null
++++ b/launcher/__main__.py
+@@ -0,0 +1,9 @@
++"""python -m launcher - start the launcher page."""
++from __future__ import annotations
++
++import sys
++
++from .app import main
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/launcher/api.py b/launcher/api.py
+new file mode 100644
+index 0000000000..4e19f3a259
+--- /dev/null
++++ b/launcher/api.py
+@@ -0,0 +1,481 @@
++"""launcher/api.py - what the launcher page asks Strata to do.
++
++Every answer comes from the controller the MCP server uses (`tools/strata_mcp.py`): the model tables and their fit
++checks, the install job, the start/stop of a model, the logs, the connection settings.  What is new here is only what
++a page needs and an assistant does not: presets, and the calibration as a job that can be watched and stopped.
++
++Nothing in this file prints or parses a console.  The errors are the controller's own (`ToolError`) or a
++`PresetError`, and the HTTP layer turns them into a message the page shows.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++from . import calibrate as C
++from . import presets as P
++from .controller import strata
++from .jobs import Job
++
++STATE_DIR = ".strata-launcher"
++INSTALLED_PREFIX = "builtin-installed-"      # a built-in preset that mirrors an installed model's own config
++
++
++class Launcher:
++    """One Strata folder, its presets, and the operations the page can ask for."""
++
++    def __init__(self, root=None, state_dir=None):
++        self.root = Path(root).resolve() if root else Path(__file__).resolve().parents[1]
++        self.m, self.s = strata(self.root)
++        self.t = self.m.Tools(self.s)
++        # tests point this at a temporary folder, so a test never writes next to a real install
++        self.state_dir = Path(state_dir) if state_dir else self.root / STATE_DIR
++        self.presets = P.Store(self.state_dir / "presets.json")
++        self.calibrate_job = Job(self.state_dir, "calibrate")
++
++    # ---- the tables
++    def catalog(self) -> dict:
++        models, families, contexts, source = self.s.tables()
++        hw = self.s.hardware()
++        return {"models": models, "families": families, "contexts": list(contexts), "source": source,
++                # the sizes per family, asked of the same controller the page's model table uses: a size that names
++                # no families in setup's table belongs to the fine-tunes too, and this is where that answer lives
++                "family_sizes": {f: self.s.sizes_of(models, f) for f in families},
++                "ram_gb": hw.get("ram_gb"), "gpus": [{k: g.get(k) for k in ("index", "name", "vram_gb", "usable")}
++                                                     for g in hw.get("gpus", [])]}
++
++    def schema(self) -> dict:
++        """The form the page builds: every field, its choices in plain words, and the setup.py flag it writes."""
++        fields = []
++        for f in P.FIELDS:
++            d = {k: v for k, v in f.items() if k != "choices"}
++            if "choices" in f:
++                d["choices"] = [{"value": k, "label": v} for k, v in f["choices"].items()]
++            fields.append(d)
++        return {"fields": fields, "trained_context": P.TRAINED_CONTEXT}
++
++    def ui_catalog(self) -> dict:
++        """The model list as the page wants it: the families with their sizes, and one entry per size with what it
++        needs and whether it fits this PC - setup's own table (`Strata.model_table`), reshaped for a table view."""
++        cat = self.catalog()
++        sizes, families = {}, []
++        for row in self.s.model_table(self.s.hardware()):
++            fam = cat["families"][row["family"]]
++            families.append({"id": row["family"], "title": row["title"], "about": row.get("about"),
++                             "by": fam.get("by"), "tag": fam.get("tag", ""),
++                             "images": row.get("images", True), "experimental": row.get("experimental", False),
++                             "sizes": [s["model"] for s in row["sizes"]]})
++            for s in row["sizes"]:
++                sizes[s["model"]] = s
++        return {"families": families, "sizeInfo": sizes, "contexts": P.offered_contexts(cat),
++                "setup_contexts": cat["contexts"],
++                "recommendation": self.recommendation(), "ram_gb": cat["ram_gb"], "gpus": cat["gpus"]}
++
++    def recommendation(self) -> dict:
++        return self.s.recommend(self.s.hardware())
++
++    # ---- the page's first paint
++    def state(self, hardware: bool = False) -> dict:
++        out = self.t.strata_status(hardware=hardware)
++        out["presets"] = self.presets.load()
++        out["builtin"] = self.builtin_presets()
++        out["calibrate"] = self.calibrate_job.status(lines=12)
++        out["strata_folder"] = str(self.root)      # which Strata folder this page is reading
++        return out
++
++    # ---- the presets that are not stored
++    def installed_presets(self) -> list:
++        """One entry per model installed in this folder, exactly as its own strata-<model>.json has it: the page
++        shows the setup this PC actually has, not only what setup would recommend for it."""
++        cat = self.catalog()
++        out = []
++        for cfg in self.s.configs():
++            model_id = cfg.stem[len("strata-"):]
++            try:
++                p = self._from_config(model_id)
++            except Exception:                        # noqa: BLE001 - a half-written config is not the page's problem
++                continue
++            if not p.get("context"):
++                rec = self.recommendation()
++                p["context"] = rec.get("context") or cat["contexts"][0]
++            fam = cat["families"].get(p["family"], {})
++            p["id"] = INSTALLED_PREFIX + model_id
++            p["builtin"] = True
++            p["name"] = f"{fam.get('title', p['family'])} {p['model']} as it is set up here"
++            p["note"] = f"what {cfg.name} says this model runs with"
++            out.append(p)
++        return out
++
++    def builtin_presets(self) -> list:
++        return P.builtin(self.catalog(), self.recommendation()) + self.installed_presets()
++
++    # ---- presets
++    def preset(self, pid: str) -> dict:
++        """A stored preset, or one of the built-in ones (which are derived, never stored)."""
++        pid = str(pid or "")
++        if pid.startswith("builtin-"):
++            found = next((b for b in self.builtin_presets() if b["id"] == pid), None)
++            if found is None:
++                raise self.m.ToolError(f"{pid} is not one of the built-in presets on this PC")
++            return found
++        p = self.presets.get(pid)
++        if p is None:
++            raise self.m.ToolError(f"no preset {pid!r}: the page lists the ones this folder has")
++        return p
++
++    def new_preset(self, seed: dict | None = None) -> dict:
++        """An empty preset for the form, pre-filled with setup's own answers for this PC. Not validated and not
++        stored: the page validates it when it is saved."""
++        cat = self.catalog()
++        return dict(P.blank(cat, self.recommendation()), **(seed or {}))
++
++    def save_preset(self, raw: dict) -> dict:
++        """Check a preset and store it. A built-in one is not stored: editing it makes a new id."""
++        cat = self.catalog()
++        p = P.clean(raw, cat, keep_id=raw.get("id"))
++        if p["id"].startswith("builtin-"):
++            p["id"] = P.slug(p["name"])
++        return self.presets.put(p)
++
++    def delete_preset(self, pid: str) -> dict:
++        if str(pid).startswith("builtin-"):
++            raise self.m.ToolError("a built-in preset follows this PC's hardware; duplicate it to change it")
++        if not self.presets.delete(str(pid)):
++            raise self.m.ToolError(f"no preset {pid!r}")
++        return {"summary": f"the preset {pid} was removed"}
++
++    def _from_config(self, model_id: str, name: str = "") -> dict:
++        """A preset describing an installed model, as its own strata-<model>.json says it is set up."""
++        cfg_path = self.s.find_config(model_id)
++        cfg = self.s.read_config(cfg_path)
++        return P.from_config(self.s.describe_config(cfg_path), cfg, self.catalog(), name or None)
++
++    def preset_from_model(self, model_id: str, name: str = "") -> dict:
++        """The same, checked: what the page edits and saves, so it can be changed and installed again."""
++        return P.clean(self._from_config(model_id, name), self.catalog())
++
++    def plan(self, pid: str) -> dict:
++        """What installing this preset would do - the same plan the MCP tool returns before it downloads 60-110 GB."""
++        p, cat = self.preset(pid), self.catalog()
++        plan, args = self._plan_args(p)
++        plan["preset"] = p
++        plan["preset_id"] = p["id"]
++        plan["setup_args"] = args
++        plan["setup_command"] = ("START-HERE.bat " if self.m.WIN else "./setup.sh ") + " ".join(args)
++        plan["model_id"] = P.model_id(p, cat)
++        plan["calibrate"] = p.get("calibrate") or "ask"
++        # setup's plan has no yes/no of its own: the page wants one. Only a full disk stops it; a RAM that is too
++        # small is said in the plan, and setup can still do it with --low-ram.
++        bad_ram = plan.get("ram") not in (None, "fits")
++        plan["ok"] = not plan["disk_short"] and not bad_ram
++        plan["why"] = plan["disk_short"] or (plan["ram"] if bad_ram else "")
++        plan["changes"] = self._changes(plan["model_id"], p)
++        # a length setup's own menu does not list: setup takes any --context, but its menu stops at these lengths,
++        # and past the trained 262,144 it adds rope scaling
++        plan["own_context"] = int(p["context"]) not in cat["contexts"]
++        return plan
++
++    # what an install would change on a model that is already installed here; name/note/calibrate are the launcher's
++    # own, backend/api_key/port/host are not read back from a config in a way that can be compared, so they are left
++    # out - an empty field in a preset means "setup decides", which for those is what happens anyway
++    COMPARED = ("context", "kv", "vision", "kv_streaming", "low_ram",
++                "resident_budget_gib", "vram_reserve_mib", "speed_projection", "gpu", "gpus",
++                "layer_split")
++
++    def preset_diff(self, raw: dict) -> dict:
++        """What this preset differs from on the config of the model it names, and whether that model is installed
++        here.  Starting a model runs its own strata-<model>.json, not the preset, so the page needs this to say so
++        before Start: a preset with the speed projection off does not turn off a model whose config has it on."""
++        cat = self.catalog()
++        model_id = P.model_id(raw, cat)
++        installed = any(c.stem == "strata-" + model_id for c in self.s.configs())
++        return {"model_id": model_id, "installed": installed,
++                "changes": self._changes(model_id, raw) if installed else []}
++
++    # what setup does when a config carries nothing for a field: a preset that says the same thing is not a change
++    DEFAULTS = {"vision": "no", "speed_projection": "off", "kv_streaming": "auto", "low_ram": "auto"}
++    # The two settings setup decides by itself.  "auto" is not a setting: it is setup's RAM rule applied to this PC,
++    # so a preset that says "auto" - and a config whose flags are that decision - is the model as it runs, and so is
++    # a preset that spells the decision out ("off" on a PC that does not need the low-RAM mode).  Comparing the
++    # words made every Start re-run setup to change nothing; the rules are setup's own (kv_streaming_wanted,
++    # low_ram_wanted), not a second copy of them here.
++    RULED = ("kv_streaming", "low_ram")
++
++    def _decides(self, key: str, model: str, ctx, kv, ram) -> str:
++        """What setup's rule makes of "auto" for one size on this PC: "on" or "off" ("" when it cannot tell)."""
++        S = self.s.setup_module()
++        if S is None or not model:
++            return ""
++        try:
++            if key == "kv_streaming":
++                return "on" if S.kv_streaming_wanted(model, int(ctx), kv, ram) else "off"
++            return "on" if S.low_ram_wanted(model, ram, "auto") else "off"
++        except (KeyError, TypeError, ValueError):        # a size this table does not know: nothing to resolve into
++            return ""
++
++    def _changes(self, model_id: str, chosen: dict) -> list:
++        """What installing this preset would change on a model that is already installed here.  An install rewrites
++        that model's strata-<model>.json, so a preset that carries a smaller context quietly replaces the one the
++        model runs with now; the page is shown the difference before setup runs."""
++        path = next((c for c in self.s.configs() if c.stem == "strata-" + model_id), None)
++        if path is None:
++            return []
++        try:
++            cfg = self.s.read_config(path)
++            current = P.from_config(self.s.describe_config(path), cfg, self.catalog())
++        except Exception:                        # noqa: BLE001 - a half-written config is not the page's problem
++            return []
++        args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
++        if "--kv-resident" in args:
++            current["kv_streaming"] = "on"       # setup writes --kv-resident when it streams the KV cache
++        labels = {f["key"]: f["label"] for f in P.FIELDS}
++        ram = (self.s.hardware() or {}).get("ram_gb") or 0
++        model = str(chosen.get("model") or "")
++        # each side is read with its own context and KV precision: the config's flags are what setup decided for the
++        # context it installed, the preset's for the context it asks for
++        sides = {"config": (current.get("context") or 0, current.get("kv") or "int8"),
++                 "preset": (chosen.get("context") or 0, chosen.get("kv") or "int8")}
++
++        def text(v):
++            return "" if v in ("", None) else str(v)
++
++        def said(key, v, side):
++            # "no images", "projection off", "auto": what a preset spells out and what a config leaves out are the
++            # same setting, and listing them as a difference would make every start re-run setup
++            t = text(v)
++            if key == "low_ram" and t in ("resident", "mmap"):
++                return "on"                       # the low-RAM mode's two variants are one setting here
++            if t in ("", self.DEFAULTS.get(key, "\x00")):
++                return self._decides(key, model, sides[side][0], sides[side][1], ram) if key in self.RULED else ""
++            return t
++
++        out = []
++        for key in self.COMPARED:
++            now, want = text(current.get(key)), text(chosen.get(key))
++            if said(key, now, "config") == said(key, want, "preset"):     # the rules folded in, per side
++                continue
++            out.append({"key": key, "label": labels[key], "config": now or "setup's own choice",
++                        "preset": want or "setup's own choice"})
++        return out
++
++    def _plan_args(self, p: dict):
++        """setup's plan, with the preset's own flags merged in (the preset wins where both name a flag)."""
++        def opt(key):
++            v = p.get(key)
++            return None if v in ("", None) else v
++        plan, args = self.t.install_plan(
++            family=p["family"], model=p["model"], context=int(p["context"]), vision=opt("vision"), kv=opt("kv"),
++            gpu=opt("gpu"), gpus=opt("gpus"), backend=("auto" if p.get("backend") in ("", "auto") else p["backend"]),
++            low_ram=opt("low_ram"), port=opt("port"), data_dir=None)
++        return plan, P.merge_args(args, P.setup_args(p))
++
++    def install(self, pid: str) -> dict:
++        """Start the install: setup.py, non-interactive, in the background, resumable.  The plan is shown first -
++        the page asks before it downloads 60-110 GB."""
++        p = self.preset(pid)
++        plan, args = self._plan_args(p)
++        self._refuse_if_running()
++        if plan["disk_short"]:
++            raise self.m.ToolError(plan["disk_short"])
++        out = self.t.launch_install(plan, args)
++        self._mark_install(p, (self.s.state("install") or {}).get("job"))
++        return {"plan": plan, "install": self.s.install_job() or out}
++
++    APPLY_WAIT = 900          # setup re-applying an installed model: seconds here, more if it repairs a file
++
++    def apply_preset(self, p: dict) -> dict:
++        """Make a preset the model's own settings: setup itself, non-interactive, with --no-start.  For a model that
++        is already installed this only re-checks the files and rewrites strata-<model>.json - a few seconds to a
++        minute on this PC, nothing fetched again - which is why Start can wait for it and go straight on."""
++        self._refuse_if_running()
++        plan, args = self._plan_args(p)
++        if plan["disk_short"]:
++            raise self.m.ToolError(plan["disk_short"])
++        self.t.launch_install(plan, args)
++        job_id = (self.s.state("install") or {}).get("job")
++        # a re-apply does not start a measurement by itself: "measure this PC: always" means after a download
++        self._mark_install(dict(p, calibrate="never"), job_id)
++        end = time.time() + self.APPLY_WAIT
++        job = {}
++        while True:
++            job = self.s.install_job() or {}
++            if not job.get("running"):
++                break
++            if time.time() > end:
++                raise self.m.ToolError(f"setup is still running after {self.APPLY_WAIT // 60} minutes: the page "
++                                       "shows its log, and you can stop it there")
++            time.sleep(1.0)
++        if job.get("result") != "installed":
++            raise self.m.ToolError("setup stopped while applying the preset (" + str(job.get("result") or
++                                       "no exit code recorded") + "): its log is on the page under Download")
++        return {"plan": plan, "install": job}
++
++    def apply_by_id(self, pid: str) -> dict:
++        """The page's "Update / re-apply": make a preset the model's settings without starting it and without
++        downloading anything, since the model is already here."""
++        p, cat = self.preset(pid), self.catalog()
++        model_id = P.model_id(p, cat)
++        if model_id not in [c.stem[len("strata-"):] for c in self.s.configs()]:
++            raise self.m.ToolError(f"{P.summary(p, cat)} is not installed here: download it first "
++                                   "(the page shows the plan and the size)")
++        changes = self._changes(model_id, p)
++        if not changes:
++            return {"install": None, "applied": [], "summary": f"{model_id} already runs with these settings"}
++        out = self.apply_preset(p)
++        return {"install": out["install"], "applied": changes,
++                "summary": f"applied to {model_id}: " + ", ".join(f"{c['label']} {c['preset']}" for c in changes)}
++
++    def _refuse_if_running(self) -> None:
++        tracked = self.s.tracked_server()
++        if tracked and not tracked.get("ended"):
++            raise self.m.ToolError("Strata is running (started by the launcher): stop it first - setup may update "
++                                   "the engine files it uses")
++
++    def install_status(self) -> dict:
++        job = self.s.install_job()
++        if job and not job["running"] and job.get("exit_code") == 0:
++            self._maybe_calibrate(job)
++        return {"install": job}
++
++    def install_cancel(self) -> dict:
++        return self.t.strata_install(cancel=True)
++
++    def _mark_install(self, p: dict, job_id) -> None:
++        """Remember which preset an install came from, so a preset that says "measure this PC" can run its
++        calibration when the install finishes."""
++        self.state_dir.mkdir(parents=True, exist_ok=True)
++        (self.state_dir / "last-install.json").write_text(
++            json.dumps({"job": job_id, "preset": p.get("id"), "calibrate": p.get("calibrate"),
++                        "model": P.model_id(p, self.catalog())}, indent=1), encoding="utf-8")
++
++    def _maybe_calibrate(self, job: dict) -> None:
++        try:
++            mark = json.loads((self.state_dir / "last-install.json").read_text(encoding="utf-8"))
++        except (OSError, ValueError):
++            return
++        if not mark or mark.get("job") != job.get("job") or mark.get("calibrate") != "always":
++            return
++        mark["calibrate"] = "done"
++        (self.state_dir / "last-install.json").write_text(json.dumps(mark, indent=1), encoding="utf-8")
++        if self.calibrate_job.running():
++            return
++        try:
++            self.calibrate(mark["model"])
++        except Exception:                               # noqa: BLE001 - a finished install is not undone by this
++            pass
++
++    # ---- running it
++    def start(self, pid: str, wait_seconds: int = 10, apply_first: bool = True) -> dict:
++        """Start a model.  A model runs what its own strata-<model>.json says, so when the preset differs from that
++        config, applying it is part of starting: setup re-writes the config first (nothing is downloaded again for a
++        model that is already here) and the model then starts with the preset's settings."""
++        p, cat = self.preset(pid), self.catalog()
++        model_id = P.model_id(p, cat)
++        if model_id not in [c.stem[len("strata-"):] for c in self.s.configs()]:
++            raise self.m.ToolError(f"{P.summary(p, cat)} is not installed here: download it first "
++                                   "(the page shows the plan and the size)")
++        changes = self._changes(model_id, p)
++        applied = None
++        if apply_first and changes:
++            self.apply_preset(p)
++            applied = changes
++        out = self.t.strata_start(model=model_id, port=None, gpu=None, wait_seconds=wait_seconds)
++        if applied:
++            out["applied"] = applied
++            what = ", ".join(f"{c['label']} {c['preset']}" for c in applied)
++            out["summary"] = f"applied the preset to {model_id} first ({what}); " + out["summary"]
++        return out
++
++    def stop(self, force: bool = False) -> dict:
++        return self.t.strata_stop(force=force)
++
++    def logs(self, source: str = "", model: str = "", lines: int = 80) -> dict:
++        return self.t.strata_logs(source=source or None, model=model or None, lines=int(lines))
++
++    def connect(self) -> dict:
++        return self.t.strata_connect_info()
++
++    # ---- measuring this PC
++    def calibrate(self, model_id: str, then_start: bool = False) -> dict:
++        """setup's --calibrate for one installed model, as a job: it starts its own engine, so nothing else may run.
++        `then_start` is the page's answer to a preset's "ask": measure first, then start the model."""
++        running = [x for x in (self.t.strata_status(hardware=False).get("running") or [])]
++        if running:
++            raise self.m.ToolError(f"Strata is running on port {running[0]['port']}: stop it first - the "
++                                   "measurement starts its own engine and needs the VRAM and RAM to itself")
++        if self.calibrate_job.running():
++            raise self.m.ToolError("a measurement is already running (its progress is on the page)")
++        cfg = self.s.find_config(model_id)
++        py = self.s.run_python()
++        if not Path(py).exists():
++            raise self.m.ToolError("Strata's Python environment (.venv) is missing: run the install again")
++        result = self.state_dir / "calibrate-result.json"
++        out = self.calibrate_job.start([py, "-m", "launcher.calibrate", str(cfg), str(result)], cwd=self.root,
++                                       label=f"measuring this PC for {cfg.name}", result=result)
++        # only once the job really runs: a measurement that never started must not leave a "then start" behind
++        self._save_hook({"model": model_id, "start": bool(then_start)} if then_start else None)
++        return out
++
++    def _hook(self) -> dict:
++        try:
++            raw = json.loads((self.state_dir / "calibrate-hook.json").read_text(encoding="utf-8"))
++            return raw if isinstance(raw, dict) else {}
++        except (OSError, ValueError):
++            return {}
++
++    def _save_hook(self, d: dict | None) -> None:
++        self.state_dir.mkdir(parents=True, exist_ok=True)
++        f = self.state_dir / "calibrate-hook.json"
++        if d is None:
++            try:
++                f.unlink()
++            except OSError:
++                pass
++        else:
++            f.write_text(json.dumps(d, indent=1), encoding="utf-8")
++
++    def calibrate_status(self) -> dict:
++        """The measurement's progress; a measurement the page asked for before a start ends with that start."""
++        status = self.calibrate_job.status()
++        hook = self._hook()
++        if hook.get("start") and not status.get("running") and hook.get("model"):
++            self._save_hook(None)
++            try:
++                if not (self.t.strata_status(hardware=False).get("running") or []):
++                    status["then_start"] = self.t.strata_start(model=hook["model"], wait_seconds=5)
++            except Exception as e:                      # noqa: BLE001 - said on the page, not swallowed
++                status["then_start"] = {"summary": f"it did not start afterwards: {e}"}
++        return {"calibrate": status}
++
++    def calibrate_cancel(self) -> dict:
++        return {"calibrate": self.calibrate_job.cancel()}
++
++    # ---- what the model itself is on this PC
++    def model_card(self, p: dict, model_id: str | None = None) -> dict:
++        """The model behind this preset on this PC: its own config when it is installed (which is what starting it
++        runs), the files it misses, what setup's calibration recorded for it, and which model the server serves now.
++        No speed numbers: a model runs what its own config says, and the engine's own page shows how fast."""
++        cat = self.catalog()
++        model_id = model_id or P.model_id(p, cat)
++        name = P.model_name(p, cat)
++        configs = {c.stem[len("strata-"):]: c for c in self.s.configs()}
++        installed = self.s.describe_config(configs[model_id]) if model_id in configs else None
++        card = {"model": model_id, "model_name": name, "preset_id": p.get("id"),
++                "settings": P.summary(p, cat), "installed": bool(installed),
++                "calibrations": [c for c in C.calibrations(self.s.settings_path())
++                                 if c.get("model_name") == name][:5]}
++        if installed:
++            card["model_settings"] = installed
++        running = self.t.strata_status(hardware=False).get("running") or []
++        if running:
++            card["live"] = {"running": True, "model": running[0].get("model"), "port": running[0].get("port")}
++        return card
++
++    def model_for_preset(self, pid: str) -> dict:
++        """The same for a preset, or for an installed model named directly (the page can select either)."""
++        try:
++            p = self.preset(pid)
++        except self.m.ToolError:
++            p = self._from_config(pid)          # not a preset id: an installed model's
++        return self.model_card(p)
+diff --git a/launcher/app.py b/launcher/app.py
+new file mode 100644
+index 0000000000..f10571e94d
+--- /dev/null
++++ b/launcher/app.py
+@@ -0,0 +1,248 @@
++"""launcher/app.py - the small local server that serves the launcher page and its API.
++
++    python -m launcher                     # http://127.0.0.1:8090/ in your browser
++    python -m launcher --port 8091 --no-browser
++
++It is stdlib-only, like the MCP server it shares its controller with, so it runs before setup has made a .venv and
++after: the page is the front-end, `launcher/api.py` is the logic, and setup.py / serve/server.py stay the ones that
++actually install and run a model.  It listens on 127.0.0.1 only - the same rule the model server follows: nothing of
++this PC leaves it unless you set up a network address with an API key.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++import traceback
++import urllib.parse
++import webbrowser
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++from .api import Launcher
++
++ROOT = Path(__file__).resolve().parents[1]
++WEB = Path(__file__).resolve().parent / "web"
++SHARED = ROOT / "serve" / "web"          # the chat page's design tokens and its font (SIL OFL)
++DEFAULT_PORT = 8090
++TYPES = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml",
++         ".html": "text/html; charset=utf-8", ".woff2": "font/woff2", ".png": "image/png", ".ico": "image/x-icon"}
++
++
++def static(folder: Path, name: str) -> tuple[bytes, str] | None:
++    """A file from a folder, never above it (no ../ in a URL)."""
++    if "/" in name or "\\" in name or "\x00" in name:
++        return None
++    f = folder / name
++    ext = f.suffix.lower()
++    if ext not in TYPES or not f.is_file():
++        return None
++    try:
++        return f.read_bytes(), TYPES[ext]
++    except OSError:
++        return None
++
++
++class ClientGone(Exception):
++    """The browser went away while the launcher was answering - the page reloads every 3 seconds and a reload or a
++    closed tab cuts the connection.  Normal here: no 500, no stack on the console."""
++
++
++class Handler(BaseHTTPRequestHandler):
++    server_version = "StrataLauncher"
++    api: Launcher = None                      # set on the class before the server starts
++
++    # ---- plumbing
++    def log_message(self, fmt, *args):        # the console stays readable: only the API's problems are worth a line
++        if self.path.startswith("/api/") and args and str(args[1] if len(args) > 1 else "")[:1] == "5":
++            sys.stderr.write(f"launcher: {self.path} {fmt % args}\n")
++
++    def _send(self, code: int, body: bytes, ctype: str, cache: str = "no-cache") -> None:
++        try:
++            self.send_response(code)
++            self.send_header("Content-Type", ctype)
++            self.send_header("Content-Length", str(len(body)))
++            self.send_header("Cache-Control", cache)
++            self.send_header("X-Content-Type-Options", "nosniff")
++            self.end_headers()
++            if self.command != "HEAD":
++                self.wfile.write(body)
++        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError) as e:
++            raise ClientGone(str(e)) from None
++
++    def _json(self, code: int, obj) -> None:
++        self._send(code, json.dumps(obj, default=str).encode("utf-8"), "application/json; charset=utf-8")
++
++    def _body(self) -> dict:
++        try:
++            n = int(self.headers.get("Content-Length") or 0)
++        except ValueError:
++            n = 0
++        if not n:
++            return {}
++        try:
++            raw = json.loads(self.rfile.read(n).decode("utf-8"))
++        except (ValueError, UnicodeDecodeError):
++            raise ValueError("the request body is not JSON")
++        return raw if isinstance(raw, dict) else {}
++
++    # ---- routing
++    def do_GET(self):
++        self._route(body=None)
++
++    def do_HEAD(self):
++        self._route(body=None)
++
++    def do_POST(self):
++        try:
++            self._route(body=self._body())
++        except ClientGone:
++            return
++        except ValueError as e:
++            self._json(400, {"error": {"message": str(e)}})
++
++    def _route(self, body):
++        url = urllib.parse.urlsplit(self.path)
++        path = url.path.rstrip("/") or "/"
++        q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
++        try:
++            if path == "/":
++                page = static(WEB, "index.html")
++                if not page:
++                    return self._send(404, b"launcher/web/index.html is missing", "text/plain; charset=utf-8")
++                return self._send(200, *page)
++            if path.startswith("/web/"):
++                found = static(WEB, path[len("/web/"):])
++            elif path.startswith("/ui/"):
++                found = static(SHARED, path[len("/ui/"):])
++            elif path.startswith("/fonts/"):
++                # the same font the chat page uses (Outfit, SIL Open Font License 1.1)
++                found = static(SHARED / "fonts", path[len("/fonts/"):])
++            else:
++                return self._api(path.lstrip("/"), q, body)
++            if not found:
++                return self._json(404, {"error": {"message": f"no {path}"}})
++            data, ctype = found
++            return self._send(200, data, ctype, "no-cache" if ctype.endswith("utf-8") else "max-age=86400")
++        except ClientGone:
++            return                                            # nothing to answer, nothing to print
++        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
++            return                                            # the same, from a read or a probe instead of a write
++        except Exception as e:                                    # noqa: BLE001 - a page must never hang on a stack
++            tool_error = getattr(getattr(self.api, "m", None), "ToolError", ())
++            if tool_error and isinstance(e, tool_error):
++                return self._json(400, {"error": {"message": str(e)}})
++            if isinstance(e, ValueError):
++                return self._json(400, {"error": {"message": str(e)}})
++            traceback.print_exc()
++            return self._json(500, {"error": {"message": f"the launcher hit a problem: {e}"}})
++
++    def _api(self, path: str, q: dict, body) -> None:
++        a = self.api
++        if path == "api/state":
++            return self._json(200, a.state(hardware=q.get("hardware") == "1"))
++        if path == "api/schema":
++            return self._json(200, a.schema())
++        if path == "api/models":
++            return self._json(200, a.ui_catalog())
++        if path == "api/plan":
++            return self._json(200, a.plan(q.get("id") or ""))
++        if path == "api/model":
++            return self._json(200, a.model_for_preset(q.get("id") or ""))
++        if path == "api/jobs":
++            return self._json(200, dict(a.install_status(), **a.calibrate_status()))
++        if path == "api/logs":
++            return self._json(200, a.logs(q.get("source", ""), q.get("model", ""), int(q.get("lines", 80))))
++        if path == "api/connect":
++            return self._json(200, a.connect())
++        if path == "api/preset/new":
++            return self._json(200, {"preset": a.new_preset()})
++        if path == "api/preset/save":
++            return self._json(200, {"preset": a.save_preset(body)})
++        if path == "api/preset/delete":
++            return self._json(200, a.delete_preset(body.get("id", "")))
++        if path == "api/preset/from-model":
++            return self._json(200, {"preset": a.preset_from_model(body.get("model", ""), body.get("name", ""))})
++        if path == "api/preset/diff":
++            return self._json(200, a.preset_diff(body))
++        if path == "api/install":
++            return self._json(200, a.install(body.get("id") or ""))
++        if path == "api/apply":
++            return self._json(200, a.apply_by_id(body.get("id") or ""))
++        if path == "api/install/cancel":
++            return self._json(200, a.install_cancel())
++        if path == "api/start":
++            return self._json(200, a.start(body.get("id") or "", int(body.get("wait_seconds", 10)),
++                                          bool(body.get("apply", True))))
++        if path == "api/stop":
++            return self._json(200, a.stop(bool(body.get("force"))))
++        if path == "api/calibrate":
++            return self._json(200, a.calibrate(body.get("model") or "", bool(body.get("then_start"))))
++        if path == "api/calibrate/cancel":
++            return self._json(200, a.calibrate_cancel())
++        return self._json(404, {"error": {"message": f"no /{path}"}})
++
++
++class Server(ThreadingHTTPServer):
++    """A launcher per port.  With the default SO_REUSEADDR, Windows lets a second launcher bind a port that is
++    already listening and the first one keeps answering - so `--port` would silently do nothing."""
++    allow_reuse_address = False
++
++    def handle_error(self, request, client_address):
++        """socketserver prints a stack for every thread that dies.  A browser cutting the connection halfway
++        through an answer is ordinary for a page that polls, so those stay off the console."""
++        exc = sys.exc_info()[1]
++        if isinstance(exc, (ClientGone, ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
++            return
++        super().handle_error(request, client_address)
++
++
++def serve(root=None, port: int = DEFAULT_PORT, open_browser: bool = True, quiet: bool = False) -> int:
++    api = Launcher(root)
++    if not (api.root / "setup.py").is_file() or not (api.root / "serve" / "server.py").is_file():
++        print(f"{api.root} is not a Strata folder (no setup.py / serve/server.py)")
++        return 2
++    Handler.api = api
++    httpd, chosen = None, None
++    for p in range(port, port + 20):
++        try:
++            httpd = Server(("127.0.0.1", p), Handler)
++            chosen = p
++            break
++        except OSError:
++            continue
++    if httpd is None:
++        print(f"no free port from {port} to {port + 19}: close something and try again")
++        return 2
++    url = f"http://127.0.0.1:{chosen}/"
++    if not quiet:
++        print(f"Strata launcher: {url} (this PC only; close this window or press Ctrl+C to stop it)", flush=True)
++        print(f"  Strata folder: {api.root}", flush=True)
++    if open_browser:
++        try:
++            webbrowser.open(url)
++        except Exception:                                           # noqa: BLE001 - no browser: the URL is printed
++            pass
++    try:
++        httpd.serve_forever()
++    except KeyboardInterrupt:
++        if not quiet:
++            print("\nlauncher stopped (a model it started keeps running: stop it on the page or close its window)")
++    finally:
++        httpd.server_close()
++    return 0
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description="Strata's launcher: pick a model, a preset, and start it.",
++                                formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--root", help="the Strata folder (default: the one this file is in)")
++    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"the page's port (default {DEFAULT_PORT})")
++    ap.add_argument("--no-browser", action="store_true", help="do not open the browser")
++    ap.add_argument("--quiet", action="store_true", help="print nothing")
++    a = ap.parse_args(argv)
++    return serve(a.root, a.port, not a.no_browser, a.quiet)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/launcher/calibrate.py b/launcher/calibrate.py
+new file mode 100644
+index 0000000000..ae154790a9
+--- /dev/null
++++ b/launcher/calibrate.py
+@@ -0,0 +1,96 @@
++"""launcher/calibrate.py - setup's --calibrate for one model, as a job the launcher can watch.
++
++    python -m launcher.calibrate <strata-<model>.json> [result.json]
++
++It runs setup.py's own `calibrate_config()`, so the measurement is exactly the one `START-HERE.bat --calibrate`
++does: measure this PC's decode speed with a few engine settings (the PCIe share, the draft depth, the CPU threads),
++write the winners into the model's config, and remember them per PC and model in setup's settings file.  Nothing is
++reimplemented here - only the way it is started, so the launcher can show its progress and stop it.
++
++The last line written to the result file (by default `.strata-launcher/calibrate-result.json`) is what the
++launcher's Measuring panel shows afterwards.
++"""
++from __future__ import annotations
++
++import json
++import re
++import sys
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++RESULT = ROOT / ".strata-launcher" / "calibrate-result.json"
++
++# setup keys its calibration by the PC and the model: "GPU|VRAM|CPU|RAM|model|context|images"
++CAL_KEY = re.compile(r"^(?P<gpu>[^|]*)\|(?P<vram>[^|]*)\|(?P<cpu>[^|]*)\|(?P<ram>[^|]*)\|"
++                     r"(?P<model>[^|]*)\|(?P<context>[^|]*)\|(?P<images>[^|]*)$")
++
++
++def calibrations(settings_path: Path) -> list[dict]:
++    """What setup's --calibrate recorded on this PC (its settings file keeps the decode speed it measured, keyed by
++    the PC and the model).  Read-only: the launcher shows them, it never writes that file."""
++    try:
++        raw = json.loads(Path(settings_path).read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return []
++    raw = raw.get("calibration") if isinstance(raw, dict) else None
++    out = []
++    if not isinstance(raw, dict):
++        return out
++    for key, v in raw.items():
++        if not isinstance(v, dict):
++            continue
++        m = CAL_KEY.match(key)
++        g = m.groupdict() if m else {}
++        out.append({"model_name": g.get("model") or None, "context": g.get("context") or None,
++                    "gpu": g.get("gpu") or None, "decode_tok_s": v.get("tok_s"), "date": v.get("date"),
++                    "settings": v.get("settings") or {}, "key": key})
++    return sorted(out, key=lambda r: str(r.get("date") or ""), reverse=True)
++
++
++def write_result(d: dict) -> None:
++    RESULT.parent.mkdir(parents=True, exist_ok=True)
++    tmp = RESULT.with_name(RESULT.name + ".tmp")
++    tmp.write_text(json.dumps(dict(d, at=time.strftime("%Y-%m-%d %H:%M")), indent=1), encoding="utf-8")
++    import os
++    os.replace(tmp, RESULT)
++
++
++def main(argv=None) -> int:
++    global RESULT
++    argv = sys.argv[1:] if argv is None else argv
++    if not 1 <= len(argv) <= 2:
++        print("usage: python -m launcher.calibrate <strata-<model>.json> [result.json]")
++        return 2
++    if len(argv) == 2:                       # the launcher names the file its job reads back
++        RESULT = Path(argv[1]).expanduser()
++    cfg_path = Path(argv[0]).expanduser()
++    if not cfg_path.is_file():
++        print(f"{cfg_path} is not a model config")
++        return 2
++    from .controller import strata                      # the same loader the launcher's API uses
++    _m, s = strata(ROOT)
++    S = s.setup_module()
++    if S is None:
++        print("setup.py could not be read: run START-HERE.bat --calibrate (Linux: ./setup.sh --calibrate) instead")
++        write_result({"ok": False, "summary": "setup.py could not be read"})
++        return 2
++    if not hasattr(S, "calibrate_config"):
++        print("this Strata's setup.py has no calibration (it needs engine 0.1.13 or newer setup)")
++        write_result({"ok": False, "summary": "this setup has no calibration"})
++        return 2
++    print(f"measuring this PC for {cfg_path.name} - about 5-10 minutes, the PC is busy meanwhile", flush=True)
++    try:
++        ok = bool(S.calibrate_config(cfg_path))
++    except Exception as e:                              # noqa: BLE001 - a failed measurement keeps the defaults
++        print(f"the tuning did not finish ({e}): the default settings stay", flush=True)
++        write_result({"ok": False, "summary": f"the tuning did not finish ({e})", "config": cfg_path.name})
++        return 1
++    write_result({"ok": ok, "config": cfg_path.name,
++                  "summary": ("this PC is tuned: the settings are in " + cfg_path.name) if ok
++                             else "the tuning failed: the default settings stay"})
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/launcher/controller.py b/launcher/controller.py
+new file mode 100644
+index 0000000000..c60bef3d80
+--- /dev/null
++++ b/launcher/controller.py
+@@ -0,0 +1,32 @@
++"""launcher/controller.py - the launcher's connection to Strata itself.
++
++The launcher does not re-implement "what is installed", "start this model", "what does this PC have": those answers
++already exist in `tools/strata_mcp.py`, the stdlib-only controller the MCP server uses so an AI assistant can install,
++start, check and stop Strata.  A second front-end should ask the same questions, so this file only imports that
++controller and hands it out.  The web page is the only new front-end; the model tables, the fit checks, the install
++job and the start/stop logic stay where they are.
++"""
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++_mcp = None
++
++
++def strata_module():
++    """tools/strata_mcp.py as a module (it is a script with a main() guard, and stdlib-only)."""
++    global _mcp
++    if _mcp is None:
++        if str(ROOT / "tools") not in sys.path:
++            sys.path.insert(0, str(ROOT / "tools"))
++        import strata_mcp                                  # noqa: WPS433 - the shared controller
++        _mcp = strata_mcp
++    return _mcp
++
++
++def strata(root=None):
++    """(the controller module, a Strata folder bound to `root`)."""
++    m = strata_module()
++    return m, m.Strata(Path(root).resolve() if root else ROOT)
+diff --git a/launcher/jobs.py b/launcher/jobs.py
+new file mode 100644
+index 0000000000..cb78bcb6ee
+--- /dev/null
++++ b/launcher/jobs.py
+@@ -0,0 +1,99 @@
++"""launcher/jobs.py - a long job the launcher starts, shows progress for, and can stop.
++
++setup's install already has this shape (tools/strata_mcp.py runs it detached, keeps its log and reads the progress
++back out of setup's own output).  The calibration needs the same thing - 5-10 minutes of measuring, a log to watch,
++a Cancel button - so it uses this small runner, which follows the same rules: the job is a separate process, its
++output goes to a log file, its state is a JSON file, and it keeps running if the launcher window is closed.
++
++One job per name at a time; the state file names the process, so a launcher started again finds the job that is
++still running.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++from pathlib import Path
++
++from .controller import strata_module
++
++
++class Job:
++    """One named job: start it, read its status, cancel it."""
++
++    def __init__(self, state_dir: Path, name: str):
++        self.dir = Path(state_dir)
++        self.name = name
++        self.m = strata_module()
++
++    @property
++    def state_path(self) -> Path:
++        return self.dir / f"{self.name}-job.json"
++
++    @property
++    def log_path(self) -> Path:
++        return self.dir / f"{self.name}.log"
++
++    def state(self) -> dict:
++        try:
++            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
++            return raw if isinstance(raw, dict) else {}
++        except (OSError, ValueError):
++            return {}
++
++    def _save(self, d: dict | None) -> None:
++        self.dir.mkdir(parents=True, exist_ok=True)
++        if d is None:
++            try:
++                self.state_path.unlink()
++            except OSError:
++                pass
++            return
++        tmp = self.state_path.with_name(self.state_path.name + ".tmp")
++        tmp.write_text(json.dumps(d, indent=1), encoding="utf-8")
++        os.replace(tmp, self.state_path)
++
++    def running(self) -> bool:
++        s = self.state()
++        return bool(s) and self.m.proc_alive(s.get("pid"), s.get("ident"))
++
++    def start(self, cmd: list, cwd: Path, label: str, result: Path | None = None,
++              env: dict | None = None) -> dict:
++        """Run `cmd` detached; `result` is the file the job writes its own summary to when it ends."""
++        if self.running():
++            raise RuntimeError(f"{label} is already running (started {self.state().get('started')})")
++        self.dir.mkdir(parents=True, exist_ok=True)      # the first job in a fresh folder writes its log here
++        with open(self.log_path, "ab") as f:      # the child writes its own output here: bytes, not str
++            f.write(f"\n===== launcher: {label} at {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n".encode("utf-8"))
++        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", **(env or {}))
++        p = self.m.spawn_detached([str(x) for x in cmd], cwd, self.log_path, env)
++        time.sleep(0.2)
++        self._save({"pid": p.pid, "ident": self.m.proc_identity(p.pid), "label": label, "log": str(self.log_path),
++                    "result": str(result) if result else None,
++                    "started": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": [str(x) for x in cmd]})
++        return self.status()
++
++    def cancel(self) -> dict:
++        s = self.state()
++        if not s or not self.m.proc_alive(s.get("pid"), s.get("ident")):
++            self._save(None)
++            return {"summary": f"the {self.name} job is not running"}
++        self.m.proc_kill_tree(s["pid"], s.get("ident"))
++        self.m.wait_gone(s["pid"], s.get("ident"), 15)
++        self._save(None)
++        return {"summary": f"the {self.name} job was stopped"}
++
++    def status(self, lines: int = 40) -> dict:
++        s = self.state()
++        if not s:
++            return {"running": False}
++        alive = self.m.proc_alive(s.get("pid"), s.get("ident"))
++        result = {}
++        try:                                          # the job writes its own result when it ends
++            result = json.loads(Path(s.get("result", "")).read_text(encoding="utf-8")) if s.get("result") else {}
++        except (OSError, ValueError):
++            result = {}
++        tail = self.m.read_tail(Path(s.get("log", "")), lines)
++        return {"running": alive, "label": s.get("label"), "started": s.get("started"), "log": s.get("log"),
++                "lines": tail[-25:], "result": result,
++                "result_note": (result.get("summary") or "ended without a result") if not alive else "running"}
+diff --git a/launcher/presets.py b/launcher/presets.py
+new file mode 100644
+index 0000000000..a81da529c7
+--- /dev/null
++++ b/launcher/presets.py
+@@ -0,0 +1,464 @@
++"""A Strata preset: one model, one set of setup choices, a name.
++
++A preset is what the launcher shows instead of a wall of command-line flags: it names a model (family + size), the
++context, the KV precision, images, and the rest of the choices `setup.py` takes, and it can be saved, edited,
++duplicated and started again later.  It is not a new kind of configuration: applying a preset runs setup's own
++install path with these choices, and starting one starts the model's own `strata-<model>.json` the way
++`run-<model>.bat` does.  Nothing here invents a setting - every field maps to a `setup.py` flag, and the flags are
++the ones `setup.py` documents (its `--help` stays the reference).
++
++Presets live in `.strata-launcher/presets.json` next to the MCP server's own state: plain JSON, so a preset can be
++copied to another PC or reviewed in a text editor.  The built-in ones are not stored: they are derived from setup's
++tables and its recommendation for this PC, so they follow the repository when its model list changes.
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import time
++
++# The choices setup.py takes, with the words the launcher shows for them.  The values are setup's; only the labels
++# are ours.  A field the user leaves at its default is not passed at all, so setup's own default (which may depend
++# on the PC) decides.
++KV = {"int8": "8-bit (the default: precise, and what setup picks)",
++      "q4_0": "4-bit (half the memory, about 4% faster at 128K, less precise on long documents)",
++      "k8v4": "hybrid K8/V4 (23% less than 8-bit; it streams its KV cache too since 0.1.40)"}
++VISION = {"no": "text only", "gpu": "images - the encoder on the GPU", "cpu": "images - the encoder on the CPU"}
++LOW_RAM = {"auto": "auto (setup's rule: only when the RAM needs it)", "on": "on", "off": "off",
++           "resident": "resident (keep a fixed budget of experts in RAM)",
++           "mmap": "mmap (read the experts through the OS file cache)"}
++KV_STREAMING = {"auto": "auto (from a 64K context, when the RAM has room)", "on": "on", "off": "off"}
++# setup's --backend takes cuda, hip or sycl; it has no "auto" value, so "leave it to setup" is the empty field and
++# no flag is written - which is also what makes the preset portable to a PC with another card.
++BACKEND = {"": "auto (setup picks: NVIDIA, or AMD when the PC has no NVIDIA it can use)",
++           "cuda": "NVIDIA (cuda)", "hip": "AMD (hip) - RX 7900 / 7800 / 7700 XT, RX 9060 XT / 9070",
++           "sycl": "Intel Arc (sycl) - EXPERIMENTAL, Linux, built from source"}
++CALIBRATE = {"ask": "ask before the first start of a new model", "always": "always measure this PC first",
++             "never": "never (keep the shipped defaults)"}
++
++# The context lengths the page offers: setup's own menu plus the size between its 128K and 256K.  setup takes any
++# --context integer (its CONTEXTS list is only what its questions offer interactively), and 196,608 = 192K is still
++# under the model's trained 262,144 positions, so no rope scaling comes into it.  A value of your own is taken
++# between these bounds; below or above them setup's engine has no use for it.
++EXTRA_CONTEXTS = [196608]
++CTX_MIN, CTX_MAX = 1024, 1048576
++
++
++def offered_contexts(catalog: dict) -> list:
++    """The context lengths the page offers, in order."""
++    return sorted(set(catalog["contexts"]) | set(EXTRA_CONTEXTS))
++ESP = {"off": "off (the default)", "on": "on - EXPERIMENTAL: the speed-projection vector in data/"}
++
++NAME_MAX = 60
++ID_MAX = 60
++TRAINED_CONTEXT = 262144          # setup.py's own trained length; the page marks a longer context as scaled
++GPUS_PATTERN = re.compile(r"^(all|\d{1,2}(,\d{1,2}){1,7})$")
++ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,59}$")
++
++# A size that names no families in setup's table belongs to the original model *and* to its fine-tunes: that is
++# setup.py's own default (its `MODELS[m].get("families", ("qwen", "swift"))`, and tools/strata_mcp.py's sizes_of).
++# Swift 1.5's IQ2_XS and IQ3_XXS are stored that way, so a launcher reading the same table with ("qwen",) alone
++# offers a size on the page and then refuses to save it ("Swift 1.5 has no IQ3_XXS chosen; its sizes:").
++DEFAULT_FAMILIES = ("qwen", "swift")
++
++
++def sizes_of(catalog: dict, family: str) -> list:
++    """The sizes a family publishes: the controller's answer when the catalog carries it (the launcher's catalog
++    does, from tools/strata_mcp.py), setup's tables read the same way otherwise.  One rule, so the list the page
++    shows and the list a save is checked against cannot drift apart."""
++    listed = (catalog.get("family_sizes") or {}).get(family)
++    if listed is not None:
++        return list(listed)
++    return [m for m in catalog["models"] if family in catalog["models"][m].get("families", DEFAULT_FAMILIES)]
++
++# The fields, in the order the launcher shows them.  `flag` is the setup.py flag it writes; a field without one is
++# launcher-side only (calibrate is a choice about the first start, not a setup flag).  `default` "" / None means
++# "do not pass it": setup's own default, which often depends on the PC, decides.
++FIELDS = [
++    {"key": "family", "label": "Model", "type": "family", "required": True,
++     "help": "which release of the model"},
++    {"key": "model", "label": "Size", "type": "size", "required": True,
++     "help": "the quantization: smaller is faster, bigger is better"},
++    {"key": "context", "label": "Context", "type": "context", "required": True, "flag": "--context",
++     "help": "how much of the conversation it keeps; longer needs more VRAM and RAM"},
++    {"key": "kv", "label": "KV cache", "type": "select", "choices": KV, "flag": "--kv",
++     "help": "how the context's attention values are stored (above an 8K context)"},
++    {"key": "vision", "label": "Images", "type": "select", "choices": VISION, "flag": "--vision",
++     "default": "no"},
++    {"key": "kv_streaming", "label": "KV streaming", "type": "select", "choices": KV_STREAMING,
++     "flag": "--kv-streaming", "help": "from 64K: keep the KV cache in RAM so more experts fit on the GPU"},
++    {"key": "low_ram", "label": "Low-RAM mode", "type": "select", "choices": LOW_RAM, "flag": "--low-ram",
++     "help": "when the RAM is short, the GPU holds part of the experts (slower)"},
++    {"key": "resident_budget_gib", "label": "Experts kept in RAM (GiB)", "type": "number",
++     "flag": "--resident-budget-gib", "help": "Unsloth's 4-bit file only: the rest is read from the SSD"},
++    {"key": "vram_reserve_mib", "label": "VRAM left free (MiB)", "type": "number", "flag": "--vram-reserve-mib",
++     "help": "for other programs; the engine's own default is 700"},
++    {"key": "speed_projection", "label": "Speed projection", "type": "select", "choices": ESP,
++     "flag": "--experimental-speed-projection", "help": "EXPERIMENTAL, off by default"},
++    {"key": "gpu", "label": "GPU", "type": "number", "flag": "--gpu",
++     "help": "one card, numbered as nvidia-smi numbers them; blank: the one with the most VRAM"},
++    {"key": "gpus", "label": "GPUs (layer split)", "type": "text", "flag": "--gpus",
++     "help": "several cards sharing one model: \"0,1\" or \"all\" (experimental)"},
++    {"key": "layer_split", "label": "Layer split", "type": "text", "flag": "--layer-split",
++     "help": "with several cards: where each later card's layers start (\"18\", \"16,32\")"},
++    {"key": "backend", "label": "Backend", "type": "select", "choices": BACKEND, "flag": "--backend"},
++    {"key": "port", "label": "Port", "type": "number", "flag": "--port", "default": 8080,
++     "help": "the address is always 127.0.0.1 unless you set up a network address with a key"},
++    {"key": "host", "label": "Listen address", "type": "text", "flag": "--host",
++     "help": "0.0.0.0 also answers other devices - only with an API key"},
++    {"key": "api_key", "label": "API key", "type": "text", "flag": "--api-key", "secret": True,
++     "help": "required by clients when the address is not this PC only"},
++    {"key": "calibrate", "label": "Measure this PC", "type": "select", "choices": CALIBRATE, "default": "ask",
++     "help": "setup's --calibrate: 5-10 minutes on the PCIe share, the draft depth and the CPU threads"},
++]
++
++
++class PresetError(ValueError):
++    """A preset that setup.py would refuse, or that names nothing the launcher can install."""
++
++
++def slug(text: str) -> str:
++    """A stable id from a name: lowercase, one dash between words.  Two names that slug the same get a number."""
++    s = re.sub(r"[^a-z0-9]+", "-", str(text or "").strip().lower()).strip("-")
++    return (s or "preset")[:ID_MAX]
++
++
++def defaults() -> dict:
++    return {f["key"]: f.get("default", "") for f in FIELDS}
++
++
++def blank(catalog: dict, recommendation: dict | None = None) -> dict:
++    """A new preset, pre-filled the way setup pre-fills its own questions: the size and context it recommends for
++    this PC, images off, everything else left to setup."""
++    p = defaults()
++    p["name"] = ""
++    p["note"] = ""
++    rec = recommendation or {}
++    p["family"] = rec.get("family") or ""
++    p["model"] = rec.get("model") or ""
++    p["context"] = rec.get("context") or 32768
++    if rec.get("backend") in BACKEND:
++        p["backend"] = rec["backend"]
++    return p
++
++
++def builtin(catalog: dict, recommendation: dict | None) -> list[dict]:
++    """The presets the launcher offers before anyone makes one: setup's recommendation for this PC, and the fastest
++    and the best-fitting size of the original model.  Built from setup's own tables, so a repository that adds a
++    model adds it here too; a size that does not fit this PC is left out."""
++    models, families = catalog["models"], catalog["families"]
++    contexts = catalog["contexts"]
++    rec = recommendation or {}
++    ram = catalog.get("ram_gb") or 0
++
++    def fits(m):
++        return ram >= models[m]["ram_gb"] - 4
++
++    def pick(family, want):
++        sizes = sizes_of(catalog, family)
++        for m in want:
++            if m in sizes and (ram == 0 or fits(m)):
++                return family, m
++        return None, None
++
++    wanted = []
++    if rec.get("model") and rec.get("model") in models and rec.get("family") in families:
++        wanted.append(("Recommended for this PC", rec["family"], rec["model"], rec["context"],
++                       rec.get("why", ""), "setup's own pick for this PC"))
++    for title, family, sizes, note in (
++            ("Fastest answers", "qwen", ["Q2_0", "IQ2_XS"], "the shortest answers, the least quality"),
++            ("Best quality that fits", "qwen", ["IQ3_S", "IQ3_XXS", "IQ2_XS"],
++             "the biggest size this PC has room for"),
++            ("Coding", "coder", ["IQ1_M"], "the Coder: half the experts, ~32 GB of RAM, made for code")):
++        family, model = pick(family, sizes)
++        if model:
++            wanted.append((title, family, model, None, note, ""))
++    out = []
++    for title, family, model, context, why, note in wanted:
++        # the context a built-in preset starts from is the one setup would pick for this card; a longer one is the
++        # user's choice, made in the form
++        ctx = context or rec.get("context") or next((c for c in contexts if c == 32768), contexts[0])
++        p = dict(defaults(), name=title, note=(why + (" - " + note if note else ""))[:200],
++                 family=family, model=model, context=ctx, vision="no", id=f"builtin-{slug(title)}", builtin=True)
++        if rec.get("backend") in BACKEND:
++            p["backend"] = rec["backend"]
++        out.append(p)
++    return out
++
++
++def _as_number(value):
++    if value in ("", None):
++        return None
++    try:
++        n = float(value)
++    except (TypeError, ValueError):
++        raise PresetError(f"{value!r} is not a number")
++    return int(n) if n.is_integer() else n
++
++
++def clean(raw: dict, catalog: dict, keep_id: str | None = None) -> dict:
++    """`raw` as a stored preset: unknown keys dropped, numbers checked, and every choice checked against setup's
++    tables.  Raises PresetError with the whole list of problems, so the form can show them at once."""
++    bad = []
++    p = defaults()
++    name = str(raw.get("name") or "").strip()
++    if not name:
++        bad.append("a preset needs a name")
++    if len(name) > NAME_MAX:
++        bad.append(f"the name is longer than {NAME_MAX} characters")
++    p["name"] = name
++    p["note"] = str(raw.get("note") or "").strip()[:500]
++    p["id"] = str(raw.get("id") or keep_id or "") or None
++    if p["id"] and not ID_PATTERN.match(p["id"]):
++        bad.append(f"the preset id {p['id']!r} may use lowercase letters, digits, '-' and '_'")
++
++    models, families = catalog["models"], catalog["families"]
++    family, model, context = str(raw.get("family") or ""), str(raw.get("model") or ""), raw.get("context")
++    if family not in families:
++        bad.append(f"{family or 'nothing'} is not a model family setup offers"
++                   + (f" (it offers {', '.join(families)})" if families else ""))
++        p["family"], p["model"] = family, model
++    else:
++        p["family"] = family
++        sizes = sizes_of(catalog, family)
++        if model not in sizes:
++            bad.append(f"{families[family]['title']} has no {model or 'size'} chosen; its sizes: {', '.join(sizes)}")
++            p["model"] = model
++        else:
++            p["model"] = model
++            if models[model].get("families") and family not in models[model]["families"]:
++                bad.append(f"{model} is not published for {families[family]['title']}")
++    try:
++        context = int(context)
++    except (TypeError, ValueError):
++        bad.append("the context must be a whole number of tokens: "
++                   f"{', '.join(str(c) for c in offered_contexts(catalog))}, or a value of your own")
++        context = None
++    if context is not None and not CTX_MIN <= context <= CTX_MAX:
++        bad.append(f"a {context:,} token context is outside what Strata takes ({CTX_MIN:,} to {CTX_MAX:,}); "
++                   "setup's --context is a token count")
++        context = None
++    p["context"] = context or ""
++
++    for f in FIELDS:
++        k = f["key"]
++        if k in ("family", "model", "context"):
++            continue
++        value = raw.get(k, p.get(k))
++        if f["type"] == "number":
++            try:
++                value = _as_number(value)
++            except PresetError as e:
++                bad.append(f"{f['label']}: {e}")
++                value = None
++            if isinstance(value, int) and k in ("port", "vram_reserve_mib", "gpu", "resident_budget_gib"):
++                if k == "port" and not 1024 <= value <= 65535:
++                    bad.append("the port must be between 1024 and 65535")
++                if k in ("vram_reserve_mib", "resident_budget_gib", "gpu") and value < 0:
++                    bad.append(f"{f['label']} must be 0 or more")
++            p[k] = value if value not in (None,) else ""
++        elif f["type"] == "select":
++            value = "" if value is None else str(value)
++            if k == "backend" and value == "auto":
++                value = ""      # a preset saved when the page still called this "auto": it meant "leave it to setup"
++            if value and value not in f["choices"]:
++                bad.append(f"{f['label']}: {value!r} is not one of {', '.join(x for x in f['choices'] if x)}")
++            p[k] = value
++        else:
++            p[k] = str(value or "").strip()
++
++    # choices that only make sense together - the same rules setup.py applies to its flags
++    if p["gpus"] and not GPUS_PATTERN.match(p["gpus"]):
++        bad.append(f"the GPU list {p['gpus']!r} looks like \"0,1\" or \"all\"")
++    if p["gpus"] and p["gpu"] not in ("", None):
++        bad.append("choose one GPU or a list of them, not both")
++    if p["vision"] in ("yes", "gpu", "cpu") and families.get(family, {}).get("vision") is False:
++        bad.append(f"images are not available with {families[family]['title']} yet")
++    if p["vision"] in ("yes", "gpu", "cpu") and p["backend"] == "hip":
++        bad.append("the AMD backend has no image encoder yet: turn images off")
++    if p["resident_budget_gib"] not in ("", None) and not models.get(model, {}).get("budget"):
++        bad.append(f"{model or 'this size'} keeps all of its experts in RAM: the RAM budget is only for "
++                   "Unsloth's UD-Q4_K_XL")
++    if p["host"] and p["host"] not in ("127.0.0.1", "localhost") and not p["api_key"]:
++        bad.append("an address other than 127.0.0.1 needs an API key")
++    if p["calibrate"] not in CALIBRATE:
++        p["calibrate"] = "ask"
++    if bad:
++        raise PresetError("\n".join(bad))
++    p["id"] = p["id"] or slug(p["name"])
++    p["updated"] = time.strftime("%Y-%m-%d %H:%M")
++    return p
++
++
++def from_config(desc: dict, cfg: dict, catalog: dict, name: str | None = None) -> dict:
++    """A preset that describes an installed model, so it can be re-created on another PC or changed and installed
++    again.  Reads what the model's own strata-<model>.json says (setup's choices_from_config already did that
++    reading; here it is only mapped onto fields)."""
++    p = defaults()
++    tag = str(desc.get("model") or "")
++    family = next((f for f, d in catalog["families"].items() if d.get("tag") and tag.startswith(d["tag"])), "qwen")
++    size = tag[len(catalog["families"][family]["tag"]):] if family != "qwen" else tag
++    p["name"] = name or f"{tag.upper()} (from the installed model)"
++    p["note"] = "made from " + str(desc.get("config") or "an installed model")
++    p["family"], p["model"] = family, (size or tag).upper()
++    p["context"] = desc.get("context") or ""
++    p["kv"] = desc.get("kv") or ""
++    p["vision"] = "" if desc.get("images") in (None, "off") else desc["images"]
++    p["port"] = desc.get("port") or ""
++    p["host"] = desc.get("host") or ""
++    p["api_key"] = ""
++    args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
++
++    def val(flag):
++        return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
++
++    for flag, key, cast in (("--vram-reserve-mib", "vram_reserve_mib", int), ("--kv-streaming", "kv_streaming", str),
++                            ("--low-ram", "low_ram", str)):
++        v = val(flag)
++        if v is not None:
++            try:
++                p[key] = cast(v)
++            except (TypeError, ValueError):
++                p[key] = v
++    if val("--resident-experts") is not None or val("--mmap-experts") is not None:
++        p["low_ram"] = "resident" if val("--resident-experts") is not None else "mmap"
++    if val("--control-vector-scaled"):
++        p["speed_projection"] = "on"
++    if isinstance(desc.get("gpu"), list) and len(desc["gpu"]) > 1:
++        p["gpus"] = ",".join(str(g) for g in desc["gpu"])
++        if desc.get("layer_split"):
++            p["layer_split"] = ",".join(str(x) for x in desc["layer_split"])
++    elif isinstance(desc.get("gpu"), int):
++        p["gpu"] = desc["gpu"]
++    p["calibrate"] = "ask"
++    p["id"] = slug(p["name"])
++    return p
++
++
++def setup_args(p: dict) -> list[str]:
++    """The preset as setup.py's flags.  A field left empty is not passed, so setup's own default - which depends on
++    the PC - decides; that is what makes a preset portable."""
++    args = ["--yes", "--no-start", "--family", str(p["family"]), "--model", str(p["model"]),
++            "--context", str(p["context"])]
++    for f in FIELDS:
++        flag, key = f.get("flag"), f["key"]
++        if not flag or key in ("family", "model", "context"):
++            continue
++        value = p.get(key)
++        if value in ("", None):
++            continue
++        if key == "vision" and value == "yes":
++            value = "gpu"
++        args += [flag, str(value)]
++    return args
++
++
++def merge_args(base: list[str], extra: list[str]) -> list[str]:
++    """`base` with `extra`'s flags applied: a flag that appears in both is set to the extra value, so the preset
++    wins over what another builder picked.  Only single-value flags appear in either list."""
++    out, i = [], 0
++    taken = {}
++    while i < len(extra):
++        if str(extra[i]).startswith("--") and i + 1 < len(extra) and not str(extra[i + 1]).startswith("--"):
++            taken[extra[i]] = extra[i + 1]
++            i += 2
++        else:
++            i += 1
++    drop = {f for f, v in taken.items() if v is None}
++    i = 0
++    while i < len(base):
++        flag = base[i]
++        if str(flag).startswith("--") and i + 1 < len(base) and not str(base[i + 1]).startswith("--"):
++            if flag in drop:
++                i += 2
++                continue
++            out += [flag, taken.get(flag, base[i + 1])]
++            taken.pop(flag, None)
++            i += 2
++            continue
++        out.append(flag)
++        i += 1
++    for flag, value in taken.items():
++        out += [flag, str(value)]
++    return out
++
++
++def summary(p: dict, catalog: dict | None = None) -> str:
++    """One line: what this preset is, in the words the model page uses."""
++    fam = ((catalog or {}).get("families", {}).get(p.get("family") or "", {}) or {}).get("title") or p.get("family")
++    bits = [f"{fam} {p.get('model')}", f"{(p.get('context') or 0) // 1024}K"]
++    if p.get("kv"):
++        bits.append(f"kv {p['kv']}")
++    if p.get("vision") in ("yes", "gpu", "cpu"):
++        bits.append("images")
++    if p.get("gpus"):
++        bits.append(f"GPUs {p['gpus']}")
++    if p.get("low_ram") not in ("", "auto"):
++        bits.append(f"low-RAM {p['low_ram']}")
++    if p.get("vram_reserve_mib") not in ("", None):
++        bits.append(f"{p['vram_reserve_mib']} MiB free")
++    if p.get("speed_projection") == "on":
++        bits.append("speed projection")
++    return " · ".join(str(x) for x in bits)
++
++
++def model_id(p: dict, catalog: dict) -> str:
++    """The id of the model this preset installs - the tag of its strata-<model>.json and of run-<model>.bat."""
++    tag = catalog["families"].get(p["family"], {}).get("tag", "")
++    return f"{tag}{p['model']}".lower()
++
++
++def model_name(p: dict, catalog: dict) -> str:
++    """The name the model answers to in the API and in its own config (setup writes "<family name>-<size>"): what a
++    running server reports as its model, and what a calibration record is keyed by."""
++    fam = catalog["families"].get(p["family"], {})
++    return f"{fam.get('name', p['family'])}-{str(p['model']).lower()}"
++
++
++class Store:
++    """`.strata-launcher/presets.json`: the user's presets. Written whole or not at all, like setup's configs
++    (#459), so a launcher closed half-way never leaves an empty file behind."""
++
++    def __init__(self, path):
++        self.path = path
++
++    def load(self) -> list[dict]:
++        try:
++            raw = json.loads(self.path.read_text(encoding="utf-8"))
++        except (OSError, ValueError):
++            return []
++        items = raw.get("presets") if isinstance(raw, dict) else raw
++        return [p for p in (items or []) if isinstance(p, dict) and p.get("name")]
++
++    def save(self, presets: list[dict]) -> None:
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        tmp = self.path.with_name(self.path.name + ".tmp")
++        tmp.write_text(json.dumps({"presets": presets}, indent=1), encoding="utf-8")
++        os.replace(tmp, self.path)
++
++    def put(self, preset: dict) -> dict:
++        """Add or replace by id; a new name that collides with another preset's id gets a numbered id, so two
++        presets never overwrite each other."""
++        items = self.load()
++        by_id = {p.get("id"): p for p in items}
++        pid = preset["id"]
++        if pid in by_id and by_id[pid].get("name") != preset["name"]:
++            n = 2
++            while f"{pid}-{n}" in by_id:
++                n += 1
++            preset = dict(preset, id=f"{pid}-{n}")
++        by_id[preset["id"]] = preset
++        self.save(list(by_id.values()))
++        return preset
++
++    def delete(self, pid: str) -> bool:
++        items = self.load()
++        keep = [p for p in items if p.get("id") != pid]
++        if len(keep) == len(items):
++            return False
++        self.save(keep)
++        return True
++
++    def get(self, pid: str) -> dict | None:
++        return next((p for p in self.load() if p.get("id") == pid), None)
+diff --git a/launcher/test_api.py b/launcher/test_api.py
+new file mode 100644
+index 0000000000..761b1fa40e
+--- /dev/null
++++ b/launcher/test_api.py
+@@ -0,0 +1,489 @@
++"""launcher/test_api.py - what the launcher answers, with no GPU, no download and no model loaded.
++
++    python -m unittest launcher.test_api -v
++
++The Strata folder is the real one (its setup.py supplies the model tables), but everything that could touch this PC
++is pinned or faked: the hardware check returns a fixed description of a PC, no process is tracked, nothing answers on
++any port, and the launcher's own state (presets, jobs) lives in a temporary folder.  What is checked is the
++launcher's part: that a preset is stored and comes back, that a plan carries the preset's flags and only once each,
++that starting or measuring something that is not there says so plainly, and that the model card says what the model
++here really runs with.
++"""
++from __future__ import annotations
++
++import json
++import sys
++import tempfile
++import threading
++import unittest
++import urllib.error
++import urllib.request
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++from launcher.api import Launcher  # noqa: E402
++from launcher import app as launcher_app  # noqa: E402
++from launcher.jobs import Job  # noqa: E402
++
++HW = {"os": "Windows Test", "ram_gb": 64.0, "cpu": {"name": "a Ryzen", "cores": 8, "avx2": True, "avx512": True},
++      "gpus": [{"index": 0, "name": "Test GPU", "vendor": "nvidia", "vram_gb": 12.0, "arch": 120,
++                "usable": True, "problem": None}], "disk_free_gb": 900.0}
++PRESET = {"name": "IQ3_S 128K", "family": "qwen", "model": "IQ3_S", "context": 131072, "vision": "no",
++          "kv": "int8", "vram_reserve_mib": 1500, "speed_projection": "on", "calibrate": "never"}
++
++
++class Base(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.TemporaryDirectory()
++        self.a = Launcher(ROOT, state_dir=Path(self.dir.name) / "state")
++        import time
++        self.a.s._hw_cache = (time.time(), dict(HW))            # the hardware check: a fixed PC
++        self.a.s.probe = lambda port, deep=True: None           # nothing answers on any port
++        self.a.s.configs = lambda: []                           # nothing is installed in this folder
++        self.a.s.state = lambda name: {}                        # no install or server was started by this controller
++        self.a.s.save_state = lambda name, d: None
++
++    def tearDown(self):
++        self.a.calibrate_job._save(None)
++        self.dir.cleanup()
++
++
++class Presets(Base):
++    def test_a_preset_is_stored_and_comes_back(self):
++        saved = self.a.save_preset(PRESET)
++        again = Launcher(ROOT, state_dir=self.a.state_dir)      # a new process reads the same file
++        self.assertEqual([p["id"] for p in again.presets.load()], [saved["id"]])
++        self.assertEqual(again.preset(saved["id"])["vram_reserve_mib"], 1500)
++
++    def test_a_preset_the_model_page_would_refuse_is_refused_with_the_reason(self):
++        with self.assertRaises(ValueError) as e:
++            self.a.save_preset(dict(PRESET, family="coder", model="IQ3_S"))
++        self.assertIn("has no IQ3_S", str(e.exception))
++
++    def test_a_fine_tune_size_saves_though_setup_lists_it_without_families(self):
++        # Swift 1.5's IQ2_XS and IQ3_XXS carry no "families" key in setup's table: the page lists them under Swift,
++        # so saving one of them has to be accepted by the same rule, not refused with an empty list of sizes
++        fam = next(f for f in self.a.ui_catalog()["families"] if f["id"] == "swift")
++        self.assertIn("IQ3_XXS", fam["sizes"])
++        self.assertIn("IQ3_XXS", self.a.catalog()["family_sizes"]["swift"])
++        saved = self.a.save_preset(dict(PRESET, name="Swift 3-bit", family="swift", model="IQ3_XXS"))
++        self.assertEqual((saved["family"], saved["model"]), ("swift", "IQ3_XXS"))
++        self.assertEqual(self.a.preset(saved["id"])["model"], "IQ3_XXS")
++        args = self.a.plan(saved["id"])["setup_args"]
++        self.assertEqual(args[args.index("--family") + 1], "swift")
++        self.assertEqual(args[args.index("--model") + 1], "IQ3_XXS")
++
++    def test_the_page_gets_the_form_and_the_tables_from_the_same_source(self):
++        schema = self.a.schema()
++        keys = [f["key"] for f in schema["fields"]]
++        self.assertIn("context", keys)
++        self.assertIn("calibrate", keys)
++        cat = self.a.ui_catalog()
++        self.assertEqual([f["id"] for f in cat["families"]], ["qwen", "swift", "coder", "unsloth"])
++        self.assertTrue(cat["sizeInfo"]["IQ3_S"]["download_gb"] > 0)
++        self.assertEqual(cat["sizeInfo"]["IQ3_S"]["on_this_pc"], "fits")
++
++    def test_the_built_in_presets_are_not_stored(self):
++        state = self.a.state()
++        self.assertEqual(state["presets"], [])
++        self.assertTrue(state["builtin"])
++        self.assertTrue(all(p["id"].startswith("builtin-") for p in state["builtin"]))
++        self.assertTrue(any(p["name"] == "Recommended for this PC" for p in state["builtin"]))
++        self.assertEqual(self.a.presets.load(), [])
++
++    def test_a_preset_can_be_made_from_an_installed_model(self):
++        cfg = {"exe": "x", "args": ["--max-context", "131072", "--kv", "int8", "--pack", "p"],
++               "model_name": "qwen3.8-flash-next-iq3_s", "port": 8080}
++        with tempfile.TemporaryDirectory() as root:
++            (Path(root) / "strata-iq3_s.json").write_text(json.dumps(cfg), encoding="utf-8")
++            b = Launcher(ROOT, state_dir=Path(self.dir.name) / "state2")
++            import time
++            b.s._hw_cache = (time.time(), dict(HW))
++            b.s.root = Path(root)                              # the configs and the data folder: another install
++            p = b.preset_from_model("iq3_s")
++            self.assertEqual((p["family"], p["model"], p["context"]), ("qwen", "IQ3_S", 131072))
++            self.assertEqual(p["kv"], "int8")
++
++    def test_the_setup_this_folder_has_is_a_preset_of_its_own(self):
++        # the page must show what the installed model actually runs with, not only what setup would recommend
++        cfg = {"exe": "x", "args": ["--max-context", "262144", "--kv", "int8", "--pack", "p"],
++               "model_name": "qwen3.8-flash-next-iq3_s", "port": 8080}
++        with tempfile.TemporaryDirectory() as root:
++            (Path(root) / "strata-iq3_s.json").write_text(json.dumps(cfg), encoding="utf-8")
++            b = Launcher(ROOT, state_dir=Path(self.dir.name) / "state3")
++            import time
++            b.s._hw_cache = (time.time(), dict(HW))
++            b.s.root = Path(root)
++            listed = [p for p in b.state()["builtin"] if p["id"] == "builtin-installed-iq3_s"]
++            self.assertEqual(len(listed), 1, "the installed model is not in the list")
++            self.assertEqual(listed[0]["context"], 262144)
++            self.assertIn("262144", b.plan("builtin-installed-iq3_s")["setup_command"])
++            self.assertEqual(b.preset("builtin-installed-iq3_s")["context"], 262144)
++            self.assertEqual(b.presets.load(), [])            # still nothing stored
++
++
++class Plans(Base):
++    def test_the_plan_is_what_setup_would_be_told(self):
++        p = self.a.save_preset(PRESET)
++        plan = self.a.plan(p["id"])
++        self.assertEqual(plan["model_id"], "iq3_s")
++        self.assertEqual(plan["setup_args"].count("--experimental-speed-projection"), 1)
++        self.assertEqual(plan["setup_args"][plan["setup_args"].index("--experimental-speed-projection") + 1], "on")
++        self.assertEqual(plan["setup_args"][plan["setup_args"].index("--vram-reserve-mib") + 1], "1500")
++        self.assertEqual(plan["setup_args"].count("--context"), 1)
++        self.assertTrue(plan["setup_command"].startswith("START-HERE.bat") or
++                        plan["setup_command"].startswith("./setup.sh"))
++        self.assertTrue(plan["disk_needed_gb"] > 0)
++        self.assertTrue(plan["ok"], plan["why"])                # the fake PC has 64 GB, enough for this size
++
++    def test_a_plan_says_what_stops_it(self):
++        # a disk too small for the download: the plan says so, and the download button is not offered. The data
++        # folder is pointed at an empty temp folder so this does not depend on what this PC already has.
++        self.a.s.data_dir = lambda: Path(self.dir.name) / "no-models-here"
++        self.a.s.disk_free = lambda path: 10.0
++        p = self.a.save_preset(PRESET)
++        plan = self.a.plan(p["id"])
++        self.assertFalse(plan["ok"])
++        self.assertIn("not enough free disk space", plan["why"])
++        with self.assertRaises(Exception) as e:
++            self.a.install(p["id"])
++        self.assertIn("not enough free disk space", str(e.exception))
++
++    def test_a_preset_that_does_not_fit_says_so_before_downloading(self):
++        p = self.a.save_preset(dict(PRESET, name="IQ3_S on 32 GB", model="IQ3_S"))
++        import time
++        self.a.s._hw_cache = (time.time(), dict(HW, ram_gb=32.0))
++        plan = self.a.plan(p["id"])
++        self.assertIn("needs ~62 GB", plan["ram"])
++
++    def test_a_plan_says_what_it_would_change_on_a_model_that_is_already_installed(self):
++        # an install rewrites the model's own strata-<model>.json: a preset with a smaller context must not be
++        # allowed to lower a 256K setup quietly
++        cfg = {"exe": "x", "args": ["--max-context", "262144", "--kv", "int8", "--kv-resident", "32768",
++                                    "--pcie-frac", "0.29", "--pack", "p"],
++               "model_name": "qwen3.8-flash-next-iq3_s", "port": 8080}
++        with tempfile.TemporaryDirectory() as root:
++            (Path(root) / "strata-iq3_s.json").write_text(json.dumps(cfg), encoding="utf-8")
++            b = Launcher(ROOT, state_dir=Path(self.dir.name) / "state4")
++            import time
++            b.s._hw_cache = (time.time(), dict(HW))
++            b.s.root = Path(root)
++            p = b.save_preset(PRESET)                                  # same size, 128K context
++            changes = b.plan(p["id"])["changes"]
++            ctx = [c for c in changes if c["key"] == "context"]
++            self.assertEqual([(c["config"], c["preset"]) for c in ctx], [("262144", "131072")], changes)
++            self.assertTrue(any(c["key"] == "kv_streaming" for c in changes), changes)
++            same = b.save_preset(dict(PRESET, name="as installed", context=262144, kv_streaming="on",
++                                      vram_reserve_mib="", speed_projection=""))
++            self.assertEqual(b.plan(same["id"])["changes"], [], "a preset that matches changes nothing")
++
++    def test_the_page_sees_that_start_runs_the_config_and_not_the_preset(self):
++        cfg = {"exe": "x", "args": ["--max-context", "262144", "--kv", "int8", "--control-vector-scaled", "v.gguf:1.0",
++                                    "--pack", "p"],
++               "model_name": "qwen3.8-flash-next-iq3_s", "port": 8080}
++        with tempfile.TemporaryDirectory() as root:
++            (Path(root) / "strata-iq3_s.json").write_text(json.dumps(cfg), encoding="utf-8")
++            b = Launcher(ROOT, state_dir=Path(self.dir.name) / "state5")
++            import time
++            b.s._hw_cache = (time.time(), dict(HW))
++            b.s.root = Path(root)
++            off = b.preset_diff(dict(PRESET, context=262144, speed_projection="off"))
++            self.assertEqual(off["model_id"], "iq3_s")
++            self.assertTrue(off["installed"])
++            esp = [c for c in off["changes"] if c["key"] == "speed_projection"]
++            self.assertEqual([(c["config"], c["preset"]) for c in esp], [("on", "off")], off["changes"])
++            other = b.preset_diff({"family": "qwen", "model": "Q2_0"})       # a size nothing is installed for
++            self.assertFalse(other["installed"])
++            self.assertEqual(other["changes"], [])
++
++    def test_the_diff_resolves_auto_with_setup_s_own_rules(self):
++        # "auto" is not a setting: it is setup's RAM rule for this PC.  A preset that says what the rule decides is
++        # the model as it runs (no warning, and Start does not run setup); one that says something else is a real
++        # difference and says what it changes.  The rules are setup's, so the two cannot drift.
++        cfg = {"exe": "x", "args": ["--max-context", "196608", "--kv", "int8", "--kv-resident", "32768",
++                                    "--pack", "p"], "model_name": "swift-1.5-iq3_xxs", "port": 8080, "gpu": 0}
++        with tempfile.TemporaryDirectory() as root:
++            (Path(root) / "strata-swift-iq3_xxs.json").write_text(json.dumps(cfg), encoding="utf-8")
++            b = Launcher(ROOT, state_dir=Path(self.dir.name) / "state7")
++            import time
++            b.s._hw_cache = (time.time(), dict(HW))
++            b.s.root = Path(root)
++            b.s._setup, b.s._setup_tried = self.a.s.setup_module(), True      # the rules are setup.py's
++            base = dict(PRESET, name="Swift 1.5 IQ3_XXS", family="swift", model="IQ3_XXS", context=196608, gpu=0,
++                        vram_reserve_mib="", speed_projection="")
++
++            def keys(over):
++                return sorted(c["key"] for c in b.preset_diff(dict(base, **over))["changes"])
++
++            # 64 GB of RAM: at 192K IQ3_XXS streams its KV (60 + 2.7 + 1) and does not need the low-RAM mode
++            self.assertEqual(keys({"kv_streaming": "auto", "low_ram": "off"}), [],
++                             "spelling out what setup decides here is the model as it runs")
++            self.assertEqual(keys({"kv_streaming": "on", "low_ram": "auto"}), [])
++            self.assertEqual(keys({"kv_streaming": "off"}), ["kv_streaming"], "the model streams: off is a change")
++            self.assertEqual(keys({"low_ram": "on"}), ["low_ram"], "auto here is off: on is a change")
++            self.assertEqual(keys({"context": 65536}), ["context"], "64K streams too: only the length differs")
++            self.assertEqual(keys({"context": 32768}), ["context", "kv_streaming"], "32K is not streamed")
++
++    def test_a_k8v4_preset_is_read_with_setup_s_rule_like_every_other_kv(self):
++        # 0.1.40 lets k8v4 stream its KV (#711), so the launcher keeps no k8v4 case of its own: on a PC with room,
++        # a config carrying --kv-resident and a preset saying "auto" are the same setting.  This is the guard
++        # against re-introducing the old "k8v4 never streams" special case, which is now a lie about setup.
++        cfg = {"exe": "x", "args": ["--max-context", "196608", "--kv", "k8v4", "--kv-resident", "32768",
++                                    "--pack", "p"], "model_name": "swift-1.5-iq3_xxs", "port": 8080, "gpu": 0}
++        with tempfile.TemporaryDirectory() as root:
++            (Path(root) / "strata-swift-iq3_xxs.json").write_text(json.dumps(cfg), encoding="utf-8")
++            b = Launcher(ROOT, state_dir=Path(self.dir.name) / "state-k8v4")
++            import time
++            b.s._hw_cache = (time.time(), dict(HW, ram_gb=128.0))
++            b.s.root = Path(root)
++            b.s._setup, b.s._setup_tried = self.a.s.setup_module(), True
++            base = dict(PRESET, name="Swift 1.5 IQ3_XXS k8v4", family="swift", model="IQ3_XXS", context=196608,
++                        kv="k8v4", gpu=0, vram_reserve_mib="", speed_projection="")
++            import setup as S
++            self.assertTrue(S.kv_streaming_wanted("IQ3_XXS", 196608, "k8v4", 128.0),
++                            "0.1.40: k8v4 streams on a PC with room for its 2.1 GB cache at 192K")
++
++            def keys(over):
++                return sorted(c["key"] for c in b.preset_diff(dict(base, **over))["changes"])
++
++            self.assertEqual(keys({"kv_streaming": "auto"}), [], "auto is what setup writes here: no change")
++            self.assertEqual(keys({"kv_streaming": "on"}), [])
++            self.assertEqual(keys({"kv_streaming": "off"}), ["kv_streaming"], "off is a real ask")
++
++    def test_a_preset_with_no_disk_room_is_refused_before_it_starts(self):
++        p = self.a.save_preset(dict(PRESET, name="no room"))
++        empty = Path(self.dir.name) / "empty-data"
++        empty.mkdir()
++        self.a.s.data_dir = lambda: empty                       # none of it is downloaded yet
++        self.a.s.disk_free = staticmethod(lambda path: 10.0)    # and the drive has 10 GB
++        with self.assertRaises(Exception) as e:
++            self.a.install(p["id"])
++        self.assertIn("not enough free disk space", str(e.exception))
++
++    def test_the_page_offers_the_extra_length_and_a_value_of_your_own(self):
++        cats = self.a.ui_catalog()["contexts"]
++        self.assertIn(196608, cats)                       # 192K, between setup's 128K and 256K
++        self.assertIn(131072, cats)
++        self.assertEqual(cats, sorted(cats))
++        p = self.a.save_preset(dict(PRESET, name="IQ3_S 192K", context=196608))
++        plan = self.a.plan(p["id"])
++        self.assertTrue(plan["own_context"], "192K is not in setup's own menu, the plan says so")
++        self.assertEqual(plan["setup_args"][plan["setup_args"].index("--context") + 1], "196608")
++        listed = self.a.save_preset(dict(PRESET, name="IQ3_S 128K", context=131072))
++        self.assertFalse(self.a.plan(listed["id"])["own_context"])
++
++    def test_starting_a_model_applies_a_preset_that_differs_from_its_config(self):
++        # a model runs what its own strata-<model>.json says, so applying the preset is part of starting it
++        cfg = {"exe": "x", "args": ["--max-context", "262144", "--kv", "int8", "--pack", "p"],
++               "model_name": "qwen3.8-flash-next-iq3_s", "port": 8080}
++        with tempfile.TemporaryDirectory() as root:
++            (Path(root) / "strata-iq3_s.json").write_text(json.dumps(cfg), encoding="utf-8")
++            b = Launcher(ROOT, state_dir=Path(self.dir.name) / "state6")
++            import time
++            b.s._hw_cache = (time.time(), dict(HW))
++            b.s.root = Path(root)
++            applied, started = [], []
++            b.apply_preset = lambda p: applied.append(p["id"]) or {"install": {"result": "installed"}}
++            b.t.strata_start = lambda **kw: started.append(kw) or {"summary": "Strata is running", "server": {}}
++            p = b.save_preset(PRESET)                                  # 128K over a 262K config
++            out = b.start(p["id"])
++            self.assertEqual(applied, [p["id"]], "the preset was not applied before the start")
++            self.assertIn("applied the preset to iq3_s first", out["summary"])
++            self.assertIn("Context 131072", out["summary"])
++            self.assertEqual(len(started), 1)
++            same = b.save_preset(dict(PRESET, name="as installed", context=262144, vram_reserve_mib="",
++                                      speed_projection=""))
++            out2 = b.start(same["id"])
++            self.assertEqual(applied, [p["id"]], "a preset that matches must not run setup again")
++            self.assertNotIn("applied", out2)
++            b.start(p["id"], apply_first=False)                        # a plain start stays possible
++            self.assertEqual(applied, [p["id"]])
++            spelled = b.save_preset(dict(PRESET, name="spelled defaults", context=262144, vram_reserve_mib="",
++                                         speed_projection="off", kv_streaming="auto", low_ram="auto"))
++            self.assertEqual(b.plan(spelled["id"])["changes"], [],
++                             "saying what setup would do anyway is not a difference")
++            b.start(spelled["id"])
++            self.assertEqual(len(applied), 1, "a preset that only spells out defaults must not run setup")
++            quiet = b.apply_by_id(same["id"])
++            self.assertEqual(quiet["applied"], [])
++            self.assertIn("already runs with these settings", quiet["summary"])
++            r = b.apply_by_id(p["id"])
++            self.assertEqual([c["key"] for c in r["applied"]], ["context", "vram_reserve_mib", "speed_projection"],
++                             r["applied"])
++            self.assertIn("applied to iq3_s", r["summary"])
++
++
++class Running(Base):
++    def test_starting_a_model_that_is_not_installed_says_so(self):
++        p = self.a.save_preset(PRESET)
++        with self.assertRaises(Exception) as e:
++            self.a.start(p["id"])
++        self.assertIn("is not installed here", str(e.exception))
++
++    def test_measuring_refuses_while_a_model_runs(self):
++        self.a.s.probe = lambda port, deep=True: {"port": port, "model": "m", "loaded": True}
++        with self.assertRaises(Exception) as e:
++            self.a.calibrate("anything")
++        self.assertIn("stop it first", str(e.exception))
++
++    def test_a_measurement_asked_for_before_a_start_ends_with_that_start(self):
++        # the page's answer to a preset's "ask": measure, then start. Only the wiring is tested here: no
++        # measurement is run.
++        self.a._save_hook({"model": "iq3_s", "start": True})
++        self.a.calibrate_job.status = lambda *a, **kw: {"running": False, "result": {"ok": True}}
++        started = []
++        self.a.t.strata_start = lambda **kw: started.append(kw) or {"summary": "running"}
++        out = self.a.calibrate_status()["calibrate"]
++        self.assertEqual(started, [{"model": "iq3_s", "wait_seconds": 5}])
++        self.assertEqual(out["then_start"]["summary"], "running")
++        self.assertEqual(self.a._hook(), {})                 # asked once, not again on the next poll
++        self.a.calibrate_status()["calibrate"]
++        self.assertEqual(len(started), 1)
++
++
++class Jobs(Base):
++    def test_a_job_writes_its_header_and_keeps_its_output(self):
++        # a real detached process (a print, no model): the log header, the child's own lines, and the end state
++        import time
++        job = Job(self.a.state_dir, "measure")
++        try:
++            job.start([sys.executable, "-c", "print('measured 41.2 tokens/s')"], ROOT, "a short measurement")
++            self.assertIn("launcher: a short measurement at", job.log_path.read_text(encoding="utf-8"))
++            for _ in range(80):
++                if not job.running():
++                    break
++                time.sleep(0.25)
++            self.assertFalse(job.running())
++            self.assertIn("measured 41.2 tokens/s", "\n".join(job.status(lines=20)["lines"]))
++        finally:
++            job._save(None)
++
++    def test_the_measurement_child_refuses_a_config_that_is_not_there(self):
++        import contextlib
++        import io
++        from launcher import calibrate as cal
++        out = Path(self.dir.name) / "res.json"
++        with contextlib.redirect_stdout(io.StringIO()) as said:
++            code = cal.main(["no-such-config.json", str(out)])
++        self.assertEqual(code, 2)
++        self.assertIn("is not a model config", said.getvalue())
++        self.assertFalse(out.exists())
++
++    def test_the_measurement_job_is_told_where_to_write_its_result(self):
++        # the child and the job must name the same file, or the card shows nothing when it ends
++        captured = []
++        self.a.s.find_config = lambda mid: Path("strata-iq3_s.json")
++        self.a.s.run_python = lambda: sys.executable
++        self.a.calibrate_job.start = lambda cmd, cwd, label, **kw: captured.append((cmd, kw.get("result")))
++        self.a.calibrate("iq3_s")
++        cmd, result = captured[0]
++        self.assertEqual(cmd[:4], [sys.executable, "-m", "launcher.calibrate", "strata-iq3_s.json"])
++        self.assertEqual(str(result), cmd[4])
++        self.assertEqual(Path(cmd[4]).parent, self.a.state_dir)
++
++    def test_a_measurement_that_never_started_does_not_start_the_model_afterwards(self):
++        self.a.s.find_config = lambda mid: Path("strata-iq3_s.json")
++        self.a.s.run_python = lambda: sys.executable
++        self.a.calibrate_job.start = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("the job could not start"))
++        started = []
++        self.a.t.strata_start = lambda **kw: started.append(kw)
++        with self.assertRaises(RuntimeError):
++            self.a.calibrate("iq3_s", then_start=True)
++        self.assertEqual(self.a._hook(), {})                 # nothing was asked, so nothing starts later
++        self.a.calibrate_status()
++        self.assertEqual(started, [])
++
++
++class ModelCard(Base):
++    """What the page shows next to the preset: the model behind it on this PC, not a speed number."""
++
++    def test_the_model_card_names_the_model_and_says_whether_it_is_installed(self):
++        p = self.a.save_preset(PRESET)
++        card = self.a.model_for_preset(p["id"])
++        self.assertEqual(card["model"], "iq3_s")
++        self.assertEqual(card["model_name"], "qwen3.8-flash-next-iq3_s")
++        self.assertFalse(card["installed"])
++
++    def test_the_model_card_says_which_model_the_server_is_serving(self):
++        # the Start button and the "another model is running" warning follow this, so it has to be the running one
++        p = self.a.save_preset(PRESET)
++        self.a.s.probe = lambda port, deep=True: {"port": 8080, "model": "qwen3.8-flash-next-iq3_s", "loaded": True}
++        card = self.a.model_for_preset(p["id"])
++        self.assertEqual(card["live"]["model"], "qwen3.8-flash-next-iq3_s")
++        self.assertEqual(card["live"]["port"], 8080)
++
++
++class Page(unittest.TestCase):
++    """The routes: the page, its files, and an answer that is an error but still JSON."""
++
++    def setUp(self):
++        self.dir = tempfile.TemporaryDirectory()
++        root = Path(self.dir.name) / "Strata"
++        (root / "serve").mkdir(parents=True)
++        (root / "serve" / "server.py").write_text("# a stand-in install\n", encoding="utf-8")
++        (root / "setup.py").write_text("# a stand-in setup\n", encoding="utf-8")
++        launcher_app.Handler.api = Launcher(root, state_dir=root / ".strata-launcher")
++        self.httpd = launcher_app.Server(("127.0.0.1", 0), launcher_app.Handler)   # the class the launcher really uses
++        self.port = self.httpd.server_address[1]
++        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
++        self.thread.start()
++
++    def tearDown(self):
++        self.httpd.shutdown()
++        self.httpd.server_close()
++        self.dir.cleanup()
++
++    def get(self, path):
++        """A request's status, type and body - an error status is an answer too."""
++        try:
++            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=10) as r:
++                return r.status, r.headers.get("Content-Type"), r.read()
++        except urllib.error.HTTPError as e:
++            return e.code, e.headers.get("Content-Type"), e.read()
++
++    def test_the_page_and_its_files_are_served(self):
++        status, ctype, body = self.get("/")
++        self.assertEqual(status, 200)
++        self.assertIn("text/html", ctype)
++        self.assertIn(b"Strata Launcher", body)
++        for path, kind in (("/web/launcher.css", "text/css"), ("/web/launcher.js", "text/javascript"),
++                           ("/ui/tokens.css", "text/css")):
++            status, ctype, _ = self.get(path)
++            self.assertEqual(status, 200, path)
++            self.assertIn(kind, ctype)
++
++    def test_a_path_cannot_escape_its_folder(self):
++        self.assertEqual(self.get("/web/../setup.py")[0], 404)
++        self.assertEqual(self.get("/api/nothing")[0], 404)
++
++    def test_a_browser_that_vanishes_mid_answer_leaves_no_stack_on_the_console(self):
++        # the page asks for the state every 3 seconds; a reload or a closed tab cuts an answer in half, and that is
++        # not a launcher problem: no 500, no traceback on the console
++        import contextlib
++        import http.client
++        import io
++
++        def gone(hardware=False):
++            raise ConnectionAbortedError("the browser went away")
++
++        launcher_app.Handler.api.state = gone
++        err = io.StringIO()
++        with contextlib.redirect_stderr(err):
++            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
++            c.request("GET", "/api/state")
++            try:
++                c.getresponse()
++            except (http.client.BadStatusLine, http.client.RemoteDisconnected, ConnectionError, OSError):
++                pass
++            c.close()
++        self.assertNotIn("Traceback", err.getvalue(), err.getvalue())
++
++    def test_an_error_is_a_message_the_page_can_show(self):
++        status, _, body = self.get("/api/plan?id=not-a-preset")
++        self.assertEqual(status, 400)
++        self.assertIn("no preset", json.loads(body)["error"]["message"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/launcher/test_presets.py b/launcher/test_presets.py
+new file mode 100644
+index 0000000000..b312da1a01
+--- /dev/null
++++ b/launcher/test_presets.py
+@@ -0,0 +1,266 @@
++"""launcher/test_presets.py - what a preset is and what it turns into, without a GPU or a download.
++
++    python -m unittest launcher.test_presets -v
++
++A preset is only useful if it says exactly what setup.py's flags say, so these tests check the two directions that
++matter: the choices a user cannot make (a size a family does not publish, a context setup does not offer, an address
++without a key, images on a family that has none) are refused with the reason, and the flags a preset writes are the
++flags setup would be given - including that a preset's own flag wins over the one the install planner picked, and
++that a field left empty is not passed at all, so setup's own default for this PC still decides.
++"""
++from __future__ import annotations
++
++import re
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from launcher import presets as P  # noqa: E402
++
++CAT = {
++    "models": {
++        "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0,
++                 "families": ("qwen", "swift")},
++        # like setup.py's own table: a size that names no families belongs to the original model and its fine-tunes
++        "IQ3_XXS": {"about": "3-bit i-quant", "download_gb": 75.8, "ram_gb": 60, "arena_gb": 42.9},
++        "IQ3_S": {"about": "3.5-bit", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3, "families": ("qwen",)},
++        "IQ1_M": {"about": "the Coder", "download_gb": 58.4, "ram_gb": 32, "arena_gb": 23.4,
++                  "families": ("coder",)},
++        "UD-Q4_K_XL": {"about": "4-bit", "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0,
++                       "families": ("unsloth",), "budget": True},
++    },
++    "families": {
++        "qwen": {"title": "Qwen3.8-Flash-Next", "by": "Qwen", "hf": "…", "file": "…", "tag": "",
++                 "name": "qwen3.8-flash-next"},
++        "swift": {"title": "Swift 1.5", "by": "UkisAI's fine-tune", "hf": "…", "file": "…", "tag": "swift-",
++                  "name": "swift-1.5"},
++        "coder": {"title": "Qwen3.8-Flash-Next Coder", "by": "ISTA", "hf": "…", "file": "…", "tag": "coder-",
++                  "name": "qwen3.8-flash-next-coder"},
++        "unsloth": {"title": "Unsloth", "by": "Unsloth", "hf": "…", "file": "…", "tag": "unsloth-",
++                    "name": "qwen3.8-flash-next-unsloth", "experimental": True, "vision": False},
++    },
++    "contexts": [8192, 32768, 65536, 131072, 262144, 393216],
++    "ram_gb": 64.0,
++}
++REC = {"family": "qwen", "model": "IQ3_S", "context": 65536, "backend": "cuda"}
++
++
++def base(**over):
++    """A valid preset with one thing changed."""
++    p = {"name": "My 32K", "family": "qwen", "model": "Q2_0", "context": 32768, "vision": "no", "calibrate": "ask"}
++    return dict(p, **over)
++
++
++def errors(**over):
++    try:
++        P.clean(base(**over), CAT)
++    except P.PresetError as e:
++        return str(e)
++    return None
++
++
++def args(**over):
++    return P.setup_args(P.clean(base(**over), CAT))
++
++
++class Choices(unittest.TestCase):
++    def test_a_valid_preset_is_accepted(self):
++        p = P.clean(base(), CAT)
++        self.assertEqual(p["family"], "qwen")
++        self.assertEqual(p["context"], 32768)
++        self.assertEqual(p["id"], "my-32k")
++        self.assertEqual(p["calibrate"], "ask")
++
++    def test_every_problem_is_reported_at_once(self):
++        msg = errors(family="coder", model="IQ3_S", context=400, host="0.0.0.0", gpu=0, gpus="0,1")
++        self.assertIn("Coder has no IQ3_S", msg)
++        self.assertIn("outside what Strata takes", msg)
++        self.assertIn("needs an API key", msg)
++        self.assertIn("choose one GPU or a list", msg)
++
++    def test_a_context_between_setup_s_sizes_or_of_your_own_is_taken(self):
++        # setup takes any --context integer; its menu only lists some lengths, and the launcher adds 192K to them
++        self.assertEqual(P.clean(base(context=196608), CAT)["context"], 196608)
++        self.assertEqual(P.clean(base(context="200000"), CAT)["context"], 200000)
++        self.assertEqual(args(context=196608)[args(context=196608).index("--context") + 1], "196608")
++        self.assertIn("outside what Strata takes", errors(context=400))
++        self.assertIn("outside what Strata takes", errors(context=2000000))
++        self.assertIn("whole number of tokens", errors(context="a lot"))
++
++    def test_a_size_is_only_offered_for_the_families_that_publish_it(self):
++        self.assertIn("Unsloth has no IQ3_S", errors(family="unsloth", model="IQ3_S"))
++        self.assertIsNone(errors(family="coder", model="IQ1_M"))
++
++    def test_the_backend_field_offers_no_value_setup_refuses(self):
++        # setup's --backend is cuda, hip or sycl: there is no "auto" value, so "leave it to setup" is the empty
++        # field, which writes no flag; a preset saved when the page still said "auto" means the same thing
++        self.assertEqual(args(backend="auto").count("--backend"), 0)
++        self.assertEqual(args(backend="").count("--backend"), 0)
++        self.assertEqual(args(backend="hip")[args(backend="hip").index("--backend") + 1], "hip")
++        self.assertIn("not one of cuda, hip, sycl", errors(backend="metal"))
++
++    def test_the_kv_labels_do_not_claim_a_streaming_setup_does_not_write(self):
++        # 0.1.40 (#711) streams k8v4's KV too: --kv-resident is written for it.  A label that says a precision
++        # "does not stream" is a promise the page makes about setup, so it is checked against setup's own rule
++        import setup as S
++        for kv, label in P.KV.items():
++            if S.kv_streaming_wanted("IQ3_S", 196608, kv, 400.0):        # a PC with room for any of these caches
++                self.assertNotIn("does not stream", label, f"{kv} streams: the label says otherwise")
++
++    def test_no_select_offers_a_choice_setup_does_not_take(self):
++        # a value setup's parser refuses reaches the user as argparse's own "invalid choice", which is how
++        # --backend auto looked like a working choice when it never was one
++        src = (Path(__file__).resolve().parents[1] / "setup.py").read_text(encoding="utf-8")
++        defined = set(re.findall(r'add_argument\(\s*"(--[a-z0-9-]+)"', src))
++        takes = {m.group(1): set(re.findall(r'"([^"]+)"', m.group(3)))
++                 for m in re.finditer(r'add_argument\(\s*"(--[a-z0-9-]+)"([^)]*?)choices=(\[[^\]]*\])', src)}
++        for f in P.FIELDS:
++            flag = f.get("flag")
++            if not flag:
++                continue
++            self.assertIn(flag, defined, f"the page writes {flag}, which setup.py does not take")
++            if "choices" in f and flag in takes:
++                extra = {v for v in f["choices"] if v and v not in takes[flag]}
++                self.assertFalse(extra, f"{flag}: setup takes {sorted(takes[flag])}, the page offers {sorted(extra)}")
++
++    def test_a_size_that_names_no_families_belongs_to_the_fine_tunes_too(self):
++        # setup.py lists Swift's IQ2_XS and IQ3_XXS without a "families" key.  Reading that table as if such a size
++        # were the original's alone makes the page offer a size the save then refuses, with an empty list of sizes
++        # to choose from ("Swift 1.5 has no IQ3_XXS chosen; its sizes:").
++        p = P.clean(base(family="swift", model="IQ3_XXS"), CAT)
++        self.assertEqual((p["family"], p["model"]), ("swift", "IQ3_XXS"))
++        self.assertEqual(P.model_id(p, CAT), "swift-iq3_xxs")
++        self.assertEqual(P.model_name(p, CAT), "swift-1.5-iq3_xxs")
++        self.assertEqual(args(family="swift", model="IQ3_XXS")[:6],
++                         ["--yes", "--no-start", "--family", "swift", "--model", "IQ3_XXS"])
++        # a size the family really does not publish is still refused, and now says what its sizes are
++        self.assertIn("Swift 1.5 has no IQ3_S chosen; its sizes: Q2_0, IQ3_XXS", errors(family="swift", model="IQ3_S"))
++
++    def test_images_follow_what_the_family_has(self):
++        self.assertIn("images are not available", errors(family="unsloth", model="UD-Q4_K_XL", vision="gpu"))
++        self.assertIn("AMD backend has no image encoder", errors(vision="gpu", backend="hip"))
++
++    def test_a_context_past_the_trained_one_is_setup_s_to_scale(self):
++        # the page does not offer --rope-scaling: setup adds yarn by itself, so a 384K preset is simply passed on
++        self.assertIsNone(errors(context=393216))
++
++    def test_the_ram_budget_is_only_for_the_size_that_needs_it(self):
++        self.assertIn("only for", errors(resident_budget_gib=32))
++        self.assertIsNone(errors(family="unsloth", model="UD-Q4_K_XL", resident_budget_gib=32))
++
++    def test_numbers_are_numbers(self):
++        self.assertIn("is not a number", errors(vram_reserve_mib="a lot"))
++        self.assertIn("must be 0 or more", errors(vram_reserve_mib=-5))
++        self.assertIn("between 1024 and 65535", errors(port=80))
++        self.assertEqual(P.clean(base(port="8123"), CAT)["port"], 8123)
++
++    def test_unknown_keys_are_dropped(self):
++        p = P.clean(dict(base(), colour="blue", context="32768"), CAT)
++        self.assertNotIn("colour", p)
++        self.assertEqual(p["context"], 32768)
++
++
++class Flags(unittest.TestCase):
++    def test_an_empty_field_is_not_passed(self):
++        a = args()
++        for flag in ("--kv", "--gpus", "--vram-reserve-mib", "--api-key"):
++            self.assertNotIn(flag, a)
++        self.assertEqual(a[:7], ["--yes", "--no-start", "--family", "qwen", "--model", "Q2_0", "--context"])
++        self.assertEqual(a[a.index("--context") + 1], "32768")
++
++    def test_a_filled_field_is_passed(self):
++        a = args(kv="q4_0", vram_reserve_mib=1500, gpus="0,1", layer_split="18",
++                 kv_streaming="on", low_ram="resident", resident_budget_gib=None)
++        for flag, value in (("--kv", "q4_0"), ("--vram-reserve-mib", "1500"),
++                            ("--gpus", "0,1"), ("--layer-split", "18"), ("--kv-streaming", "on"),
++                            ("--low-ram", "resident")):
++            self.assertIn(flag, a)
++            self.assertEqual(a[a.index(flag) + 1], value)
++
++    def test_images_yes_means_the_gpu_encoder(self):
++        a = args(vision="gpu")
++        self.assertEqual(a[a.index("--vision") + 1], "gpu")
++
++    def test_the_preset_wins_over_the_install_plan(self):
++        plan = ["--yes", "--no-start", "--family", "qwen", "--model", "IQ3_S", "--context", "32768",
++                "--vision", "no", "--experimental-speed-projection", "off", "--port", "8080"]
++        merged = P.merge_args(plan, P.setup_args(P.clean(base(speed_projection="on", port=8123), CAT)))
++        self.assertEqual(merged.count("--experimental-speed-projection"), 1)
++        self.assertEqual(merged[merged.index("--experimental-speed-projection") + 1], "on")
++        self.assertEqual(merged[merged.index("--port") + 1], "8123")
++        self.assertEqual(merged.count("--family"), 1)
++
++    def test_a_flag_only_in_the_preset_is_appended(self):
++        merged = P.merge_args(["--yes", "--model", "Q2_0"], P.setup_args(P.clean(base(kv="k8v4"), CAT)))
++        self.assertEqual(merged[merged.index("--kv") + 1], "k8v4")
++
++
++class Names(unittest.TestCase):
++    def test_the_model_id_is_the_config_and_script_tag(self):
++        self.assertEqual(P.model_id(base(), CAT), "q2_0")
++        self.assertEqual(P.model_id(base(family="coder", model="IQ1_M"), CAT), "coder-iq1_m")
++
++    def test_the_model_name_is_what_the_server_answers_to(self):
++        self.assertEqual(P.model_name(base(), CAT), "qwen3.8-flash-next-q2_0")
++        self.assertEqual(P.model_name(base(family="coder", model="IQ1_M"), CAT),
++                         "qwen3.8-flash-next-coder-iq1_m")
++
++    def test_two_names_do_not_collide_in_the_store(self):
++        with tempfile.TemporaryDirectory() as d:
++            s = P.Store(Path(d) / "presets.json")
++            s.put(P.clean(base(), CAT))
++            s.put(P.clean(base(name="My 32K!"), CAT))          # slugs the same
++            ids = sorted(p["id"] for p in s.load())
++            self.assertEqual(ids, ["my-32k", "my-32k-2"])
++            self.assertTrue(s.delete("my-32k-2"))
++            self.assertEqual([p["id"] for p in s.load()], ["my-32k"])
++
++    def test_a_broken_file_is_not_a_store(self):
++        with tempfile.TemporaryDirectory() as d:
++            f = Path(d) / "presets.json"
++            f.write_text("{", encoding="utf-8")
++            self.assertEqual(P.Store(f).load(), [])
++
++
++class Derived(unittest.TestCase):
++    def test_builtin_presets_only_offer_sizes_this_pc_has_room_for(self):
++        items = P.builtin(CAT, REC)
++        names = [p["name"] for p in items]
++        self.assertIn("Recommended for this PC", names)
++        self.assertIn("Coding", names)
++        for p in items:
++            self.assertTrue(p["id"].startswith("builtin-"))
++            self.assertEqual(p["context"], 65536)          # the context setup would pick for this card
++        big = dict(CAT, ram_gb=32.0)          # a PC where only the Coder fits: the derived presets follow that
++        low = P.builtin(big, {"family": "coder", "model": "IQ1_M", "context": 32768, "why": "32 GB of RAM"})
++        self.assertNotIn("IQ3_S", [p["model"] for p in low])
++        self.assertIn("IQ1_M", [p["model"] for p in low])
++
++    def test_a_preset_from_an_installed_model_reads_its_config(self):
++        desc = {"model": "coder-iq1_m", "config": "strata-coder-iq1_m.json", "context": 65536, "kv": "int8",
++                "images": "off", "port": 8080, "host": "127.0.0.1", "gpu": [0, 1], "layer_split": [18]}
++        cfg = {"args": ["--max-context", "65536", "--kv", "int8", "--vram-reserve-mib", "1500",
++                        "--control-vector-scaled", "x.gguf:1.0", "--mmap-experts", "1"]}
++        p = P.from_config(desc, cfg, CAT)
++        self.assertEqual((p["family"], p["model"]), ("coder", "IQ1_M"))
++        self.assertEqual(p["context"], 65536)
++        self.assertEqual(p["vram_reserve_mib"], 1500)
++        self.assertEqual(p["speed_projection"], "on")
++        self.assertEqual(p["low_ram"], "mmap")
++        self.assertEqual(p["gpus"], "0,1")
++        self.assertEqual(p["layer_split"], "18")
++        self.assertEqual(P.model_id(p, CAT), "coder-iq1_m")
++
++    def test_the_summary_says_what_the_preset_is(self):
++        line = P.summary(P.clean(base(kv="q4_0", vision="gpu", gpus="0,1"), CAT), CAT)
++        self.assertIn("Qwen3.8-Flash-Next Q2_0", line)
++        self.assertIn("32K", line)
++        self.assertIn("kv q4_0", line)
++        self.assertIn("images", line)
++        self.assertIn("GPUs 0,1", line)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/launcher/web/index.html b/launcher/web/index.html
+new file mode 100644
+index 0000000000..4ede4052c2
+--- /dev/null
++++ b/launcher/web/index.html
+@@ -0,0 +1,85 @@
++<!doctype html>
++<html lang="en" data-theme="light">
++<head>
++<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
++<title>Strata Launcher</title>
++<link rel="stylesheet" href="/ui/tokens.css">
++<link rel="stylesheet" href="/web/launcher.css">
++<script>
++  // the chat page's rule: follow the system unless the user chose a theme in this page
++  document.documentElement.dataset.theme =
++    localStorage.getItem("strata-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
++</script>
++<script defer src="/web/launcher.js"></script>
++</head>
++<body>
++
++<header>
++  <div class="brand">Strata <span>Model launcher</span></div>
++  <div class="pc" id="pc">checking this PC&hellip;</div>
++  <div class="controls"><button id="refresh">Refresh</button><button id="theme" aria-label="Switch color theme">Light / dark</button></div>
++</header>
++
++<div id="status" class="status" role="status"><span class="dot"></span><span id="status-text">Connecting&hellip;</span>
++  <div class="controls" id="status-actions"></div>
++</div>
++
++<main>
++  <div class="cols">
++  <aside class="col-left">
++    <section class="panel">
++      <div class="panel-bar"><h2>On this PC</h2></div>
++      <div id="installed" class="list"><p class="empty">Loading&hellip;</p></div>
++      <div class="foot" id="data-dir"></div>
++    </section>
++
++    <section class="panel">
++      <div class="panel-bar"><h2>Presets</h2><div class="controls"><button id="new-preset">New preset</button></div></div>
++      <div id="presets" class="list"></div>
++      <p class="foot">A preset is one model plus its settings: size, context, KV, images, cards, port. Nothing on this
++        PC changes until you download or start one.</p>
++    </section>
++  </aside>
++
++  <section class="panel preset" id="preset">
++    <div class="preset-head">
++      <div>
++        <h1 id="preset-name">Choose a preset</h1>
++        <p class="sub" id="preset-summary">Pick one on the left, or make a new one.</p>
++      </div>
++      <div class="controls" id="preset-actions"></div>
++    </div>
++    <p class="note" id="preset-note" hidden></p>
++    <div id="preset-warn" class="notice" hidden></div>
++    <div id="preset-diff" class="notice warn" hidden></div>
++    <form id="form" class="form" hidden></form>
++    <div id="plan" class="plan" hidden></div>
++  </section>
++
++  <aside class="col-right">
++    <section class="panel">
++      <div class="panel-bar"><h2>Model</h2></div>
++      <div id="info"><p class="empty">Nothing selected.</p></div>
++    </section>
++  </aside>
++  </div>
++
++  <section class="panel logs" id="logs">
++    <div class="panel-bar">
++      <h2>Logs</h2>
++      <div class="tabs" role="tablist">
++        <button data-pane="install" aria-selected="true">Download</button>
++        <button data-pane="calibrate" aria-selected="false">Measuring</button>
++        <button data-pane="server" aria-selected="false">Server</button>
++        <button data-pane="engine" aria-selected="false">Engine</button>
++      </div>
++      <div class="controls"><button id="log-cancel" hidden>Stop</button></div>
++    </div>
++    <pre id="log" class="log">Nothing running.</pre>
++    <p class="foot" id="log-foot"></p>
++  </section>
++</main>
++
++<div id="toast" class="toast" hidden></div>
++</body>
++</html>
+diff --git a/launcher/web/launcher.css b/launcher/web/launcher.css
+new file mode 100644
+index 0000000000..35e2831faf
+--- /dev/null
++++ b/launcher/web/launcher.css
+@@ -0,0 +1,139 @@
++/* Strata launcher — the model and preset picker.
++   Uses the chat page's design tokens (serve/web/tokens.css, served here as /ui/tokens.css): same colours, type and
++   spacing as the chat page and the Monitor, so the three look like one product. */
++
++*{box-sizing:border-box}
++body{margin:0;background:var(--st-bg);color:var(--st-ink);font:15px/1.55 var(--st-font)}
++h1{margin:0;font-size:26px;letter-spacing:-.5px}
++/* a preset's name is often a whole phrase, so it sits a step under the page's h1 and may break anywhere */
++#preset-name{font-size:21px;line-height:1.25;overflow-wrap:anywhere}
++h2{margin:0;font-size:15px;letter-spacing:-.2px}
++h3{margin:0 0 6px;font-size:13px;color:var(--st-ink-muted);text-transform:uppercase;letter-spacing:.7px;font-weight:600}
++p{margin:0}
++button,input,select,textarea{font:inherit;color:inherit}
++button{cursor:pointer;background:var(--st-surface);border:1px solid var(--st-line);border-radius:var(--st-r-sm);
++  padding:7px 12px;transition:border-color var(--st-dur) var(--st-ease),background var(--st-dur) var(--st-ease)}
++button:hover:not(:disabled){border-color:var(--st-accent)}
++button:disabled{opacity:.4;cursor:default}
++button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--st-focus);outline-offset:2px}
++button.primary{background:var(--st-accent);border-color:transparent;color:var(--st-accent-ink)}
++button.primary:hover:not(:disabled){background:var(--st-accent-hover)}
++button.ghost{background:transparent;border-color:transparent}
++button.danger{color:var(--st-danger-text)}
++[hidden]{display:none!important}
++a{color:var(--st-info-text)}
++code,.mono{font:12px/1.6 var(--st-font-mono)}
++
++header{display:flex;align-items:center;gap:20px;padding:0 26px;height:64px;background:var(--st-surface);
++  border-bottom:1px solid var(--st-line)}
++.brand{font-size:21px;font-weight:700;letter-spacing:-.4px;white-space:nowrap}
++.brand span{font-size:12px;font-weight:400;color:var(--st-ink-muted);margin-left:12px;letter-spacing:0}
++.pc{margin-left:auto;font-size:12px;color:var(--st-ink-muted);text-align:right;overflow-wrap:anywhere}
++.pc b{color:var(--st-ink-soft);font-weight:500}
++.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
++
++.status{display:flex;align-items:center;gap:10px;padding:12px 26px;background:var(--st-surface);
++  border-bottom:1px solid var(--st-line);font-size:14px}
++.status .controls{margin-left:auto}
++.dot{width:9px;height:9px;border-radius:50%;background:var(--st-ink-muted);flex:none}
++.status.running .dot{background:var(--st-accent)}
++.status.busy .dot{background:var(--st-warn)}
++.status.loading .dot,.status.installing .dot{background:var(--st-info);animation:pulse 1.4s infinite}
++.status.failed .dot{background:var(--st-danger)}
++@keyframes pulse{50%{opacity:.35}}
++
++main{display:flex;flex-direction:column;gap:16px;padding:20px 26px;max-width:1720px;margin:auto}
++/* the three columns live in their own box: that is what keeps the sticky ones from sliding over the Logs panel,
++   whose full width would otherwise pass under them */
++.cols{display:grid;grid-template-columns:300px minmax(420px,1fr) 400px;gap:16px;align-items:start}
++.col-left,.col-right{display:flex;flex-direction:column;gap:16px;position:sticky;top:16px}
++.panel{background:var(--st-surface);border:1px solid var(--st-line);border-radius:var(--st-r-md);
++  box-shadow:var(--st-sh-card);overflow:hidden}
++.panel-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 16px;
++  border-bottom:1px solid var(--st-line-soft)}
++.list{max-height:330px;overflow:auto}
++.group{padding:9px 16px 3px;font-size:11px;color:var(--st-ink-muted);text-transform:uppercase;letter-spacing:.7px}
++.foot{padding:10px 16px;font-size:12px;color:var(--st-ink-muted);border-top:1px solid var(--st-line-soft)}
++.list+.foot{border-top:1px solid var(--st-line-soft)}
++.empty{padding:26px 16px;text-align:center;color:var(--st-ink-muted);font-size:13px}
++
++.item{display:block;width:100%;text-align:left;background:transparent;border:0;border-bottom:1px solid var(--st-line-soft);
++  border-radius:0;padding:11px 16px;cursor:pointer}
++.item:hover{background:var(--st-surface-2)}
++.item.selected{background:var(--st-accent-tint);box-shadow:inset 3px 0 var(--st-accent)}
++.item .row{display:flex;align-items:center;gap:8px}
++.item strong{font-weight:500;font-size:14px}
++.item .sub{font-size:12px;color:var(--st-ink-muted);margin-top:2px;overflow-wrap:anywhere}
++.item .tag{margin-left:auto}
++.item .del{margin-left:auto;padding:2px 7px;border-radius:5px;font-size:12px;line-height:1.4;
++  color:var(--st-ink-muted)}
++.item .tag + .del{margin-left:0}
++.item .del:hover{color:var(--st-danger-text);background:var(--st-danger-tint)}
++.tag{font-size:11px;padding:2px 7px;border-radius:5px;background:var(--st-surface-2);color:var(--st-ink-muted);white-space:nowrap}
++.tag.ok{color:var(--st-accent-text);background:var(--st-accent-tint)}
++.tag.warn{color:var(--st-warn-text);background:var(--st-warn-tint)}
++.tag.bad{color:var(--st-danger-text);background:var(--st-danger-tint)}
++.tag.info{color:var(--st-info-text);background:var(--st-info-tint)}
++.tag.builtin{font-style:normal}
++
++.preset{padding:0}
++.preset-head{display:flex;gap:12px 16px;align-items:flex-start;flex-wrap:wrap;padding:18px 20px;
++  border-bottom:1px solid var(--st-line-soft)}
++/* the six buttons are wider than the middle column: without the wrap they left the title about 100px and it broke
++   one word per line, so the title now takes a line of its own when they do not fit beside it */
++.preset-head>div:first-child{flex:1 1 240px;min-width:0}
++.preset-head .controls{flex:0 1 auto}
++.sub{color:var(--st-ink-muted);font-size:13px;margin-top:4px}
++.note{padding:12px 20px;font-size:13px;color:var(--st-ink-soft);background:var(--st-surface-2);
++  border-bottom:1px solid var(--st-line-soft)}
++.notice{margin:14px 20px;padding:11px 14px;border-radius:var(--st-r-sm);background:var(--st-danger-tint);
++  color:var(--st-danger-text);font-size:13px;white-space:pre-wrap}
++.notice.info{background:var(--st-info-tint);color:var(--st-info-text)}
++.notice.warn{background:var(--st-warn-tint);color:var(--st-warn-text)}
++.plan .notice{margin:14px 0}
++.notice ul{margin:7px 0 0 18px;padding:0}
++.notice .sub{color:inherit;opacity:.8}
++
++.form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 18px;padding:20px}
++.field{display:flex;flex-direction:column;gap:5px;min-width:0}
++.field.wide{grid-column:1/-1}
++.field label{font-size:12px;color:var(--st-ink-muted);text-transform:uppercase;letter-spacing:.6px}
++.field input,.field select,.field textarea{background:var(--st-bg);border:1px solid var(--st-line);
++  border-radius:var(--st-r-sm);padding:8px 10px;min-width:0}
++.field textarea{min-height:56px;resize:vertical}
++.field .help{font-size:12px;color:var(--st-ink-muted)}
++.field.flag{opacity:.9}
++.field .flagname{font:11px var(--st-font-mono);color:var(--st-ink-muted)}
++
++.plan{margin:0;padding:16px 20px;border-top:1px solid var(--st-line);background:var(--st-surface-2)}
++.plan h3{margin-bottom:8px}
++dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px;margin:0}
++dl.one{grid-template-columns:1fr}
++/* the Model card is a narrow column: an even split left the value about 90px and broke a base URL in the middle of
++   the host, so the label takes the smaller share and the value the larger one */
++.kv{display:grid;grid-template-columns:minmax(0,38%) minmax(0,62%);gap:2px 10px;font-size:13px;
++  background:var(--st-bg);border-radius:var(--st-r-sm);padding:8px 10px}
++.kv span{color:var(--st-ink-muted)}
++.kv b{font-weight:500;text-align:right;overflow-wrap:break-word}
++pre.log,pre.cmd{margin:0;padding:12px 14px;background:var(--st-code-bg);color:var(--st-code-ink);border-radius:var(--st-r-sm);
++  font:12px/1.55 var(--st-font-mono);white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto}
++pre.cmd{margin-top:8px}
++
++.tabs{display:flex;gap:4px}
++.tabs button{border-color:transparent;background:transparent;font-size:13px;padding:6px 9px}
++.tabs button[aria-selected=true]{background:var(--st-surface-2);color:var(--st-accent-text)}
++.logs .log{border-radius:0;border:0;border-top:1px solid var(--st-line-soft);min-height:300px;
++  max-height:46vh;font-size:12.5px;line-height:1.6}
++.tabs button.live{font-weight:600}
++.tabs button.live::after{content:"\2022";color:var(--st-accent);margin-left:6px}
++
++.toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);max-width:min(720px,92vw);
++  background:var(--st-ink);color:var(--st-bg);padding:11px 16px;border-radius:var(--st-r-md);font-size:13px;
++  box-shadow:var(--st-sh-pop);white-space:pre-wrap;overflow-wrap:anywhere;z-index:20}
++.toast.bad{background:var(--st-danger);color:#fff}
++
++@media(max-width:1280px){.cols{grid-template-columns:280px minmax(0,1fr)}.col-right{grid-column:1/-1;position:static;
++  display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}}
++@media(max-width:900px){.cols{grid-template-columns:1fr}main{padding:14px}.col-left,.col-right{position:static}
++  header{padding:0 14px;gap:10px}.pc{display:none}.status{padding:10px 14px}.form{grid-template-columns:1fr}
++  dl{grid-template-columns:1fr}.logs .log{min-height:220px;max-height:40vh}}
+diff --git a/launcher/web/launcher.js b/launcher/web/launcher.js
+new file mode 100644
+index 0000000000..b120923c04
+--- /dev/null
++++ b/launcher/web/launcher.js
+@@ -0,0 +1,784 @@
++// launcher.js — the model and preset picker.
++//
++// The page holds no rules of its own: what fits this PC, what is installed, what an install would download, how
++// fast a model is — all of it comes from /api/*, which answers with setup.py's own tables and the running server's
++// own numbers.  What this file does is draw that, keep a preset being edited in memory, and ask before anything
++// big happens (a 60-110 GB download, a 5-10 minute measurement, starting a model).
++"use strict";
++
++const $ = (id) => document.getElementById(id);
++const el = (tag, cls, text) => {
++  const n = document.createElement(tag);
++  if (cls) n.className = cls;
++  if (text !== undefined) n.textContent = String(text);
++  return n;
++};
++const clear = (n) => { while (n.firstChild) n.removeChild(n.firstChild); };
++
++let SCHEMA = null, MODELS = null, S = null;      // the tables, the catalog, the state
++let sel = null;                                  // {id, preset, builtin, draft, dirty}
++let FACTS = null, PLAN = null, JOBS = {}, DIFF = null;
++let CONNECT = null, CONNECT_PORT = null;        // the base URLs of the model that is running, fetched once per start
++let logTab = "install", timer = null, busy = false;
++
++async function api(path, opts) {
++  const r = await fetch("/api/" + path, opts);
++  let body = {};
++  try { body = await r.json(); } catch (e) { /* an empty body: the message below is enough */ }
++  if (!r.ok) throw new Error((body && body.error && body.error.message) || `the launcher got HTTP ${r.status}`);
++  return body;
++}
++const post = (path, data) => api(path, {
++  method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data || {}),
++});
++
++let toastTimer = null;
++function toast(msg, bad) {
++  const t = $("toast");
++  t.textContent = msg;
++  t.className = "toast" + (bad ? " bad" : "");
++  t.hidden = false;
++  clearTimeout(toastTimer);
++  toastTimer = setTimeout(() => { t.hidden = true; }, bad ? 12000 : 6000);
++}
++function fail(e) { toast(e.message || String(e), true); }
++
++// ---------------------------------------------------------------- the chat page
++// starting a model on the page opens its chat page in a tab, as run-<model>.bat does with --open.  The tab is
++// opened inside the click (a popup blocker allows that) and filled with the chat page once the model answers.
++let CHAT_TAB = null, CHAT_WAIT = false;
++let JOB_WAS_RUNNING = false;
++
++function openChatWhenReady(withTab) {
++  CHAT_WAIT = true;
++  if (!withTab) return;
++  CHAT_TAB = window.open("about:blank", "strata-chat");
++  if (!CHAT_TAB) return;                     // blocked: showChatPage falls back to a message
++  CHAT_TAB.document.write('<!doctype html><meta charset="utf-8"><title>Strata</title>'
++    + '<body style="font:15px/1.6 system-ui,sans-serif;max-width:34em;margin:8vh auto;padding:0 22px">'
++    + '<h1 style="font-size:19px;font-weight:600">Strata is loading the model</h1>'
++    + '<p>This page becomes the chat page as soon as the model is in memory - 1-3 minutes, and the PC may be slow '
++    + 'meanwhile. Keep this window open; the launcher shows the server log.</p></body>');
++  CHAT_TAB.document.close();
++}
++
++function showChatPage(port) {
++  if (!CHAT_WAIT) return;
++  CHAT_WAIT = false;
++  const url = `http://127.0.0.1:${port}/`;
++  if (CHAT_TAB && !CHAT_TAB.closed) {
++    try { CHAT_TAB.location = url; CHAT_TAB.focus(); } catch (e) { /* the user closed it */ }
++  } else {
++    toast(`the model is ready - the chat page is at ${url}; the top bar has an Open button too`);
++  }
++  CHAT_TAB = null;
++}
++
++function dropChatTab() {                     // the start stopped: no empty tab left behind
++  if (CHAT_TAB && !CHAT_TAB.closed) { try { CHAT_TAB.close(); } catch (e) {} }
++  CHAT_TAB = null;
++  CHAT_WAIT = false;
++}
++
++// ---------------------------------------------------------------- the preset being shown
++function allPresets() {
++  return [...(S.presets || []), ...(S.builtin || [])];
++}
++function presetById(id) {
++  return allPresets().find((p) => p.id === id) || null;
++}
++function familyOf(id) {
++  return (MODELS.families || []).find((f) => f.id === id) || null;
++}
++
++async function select(id) {
++  const p = presetById(id);
++  if (!p) return;
++  sel = { id, listId: id, preset: JSON.parse(JSON.stringify(p)), builtin: !!p.builtin, draft: false, dirty: false };
++  PLAN = null; FACTS = null;
++  $("plan").hidden = true;
++  renderPreset();
++  checkDiff();
++  try { FACTS = await api(`model?id=${encodeURIComponent(id)}`); renderInfo(); } catch (e) { fail(e); }
++  markList();
++}
++
++// a draft preset: from an installed model, or a new one. Not stored until Save.
++async function openDraft(preset, title, listId) {
++  sel = { id: preset.id, listId: listId || preset.id, preset, builtin: false, draft: true, dirty: true };
++  PLAN = null; FACTS = null;
++  $("plan").hidden = true;
++  renderPreset(title);
++  checkDiff();
++  renderInfo();
++  markList();
++}
++
++function collect() {
++  if (!sel) return;
++  const out = {};
++  for (const f of SCHEMA.fields) {
++    const n = $(`f-${f.key}`);
++    if (!n) continue;
++    out[f.key] = f.type === "number" ? (n.value.trim() === "" ? "" : n.value.trim()) : n.value;
++  }
++  out.name = $("f-name").value.trim();
++  out.note = $("f-note").value.trim();
++  out.id = sel.preset.id;
++  Object.assign(sel.preset, out);
++  const dirty = JSON.stringify(sel.preset) !== JSON.stringify(presetById(sel.id) || {});
++  if (dirty !== sel.dirty) { sel.dirty = dirty; renderActions(); }
++}
++
++// ---------------------------------------------------------------- drawing: the preset
++function renderPreset(title) {
++  const p = sel.preset;
++  $("preset-name").textContent = title || p.name || "New preset";
++  $("preset-summary").textContent = summaryLine(p);
++  const note = $("preset-note");
++  note.textContent = p.note || "";
++  note.hidden = !p.note;
++  renderForm();
++  renderActions();
++  const warn = $("preset-warn");
++  warn.hidden = true;
++  clear(warn);
++}
++
++function summaryLine(p) {
++  const fam = familyOf(p.family);
++  const bits = [`${fam ? fam.title : p.family} ${p.model}`, `${Math.round((p.context || 0) / 1024)}K context`];
++  if (p.kv) bits.push(`KV ${p.kv}`);
++  bits.push(p.vision === "no" || !p.vision ? "text only" : `images (${p.vision})`);
++  if (p.gpus) bits.push(`cards ${p.gpus}`);
++  else if (p.gpu) bits.push(`card ${p.gpu}`);
++  if (p.low_ram && p.low_ram !== "auto") bits.push(`low-RAM ${p.low_ram}`);
++  if (p.calibrate && p.calibrate !== "ask") bits.push(`measure this PC: ${p.calibrate}`);
++  return bits.join(" · ");
++}
++
++function renderForm() {
++  const form = $("form");
++  clear(form);
++  form.hidden = false;
++  form.appendChild(field("name", "Preset name", sel.preset.name, { wide: true, type: "text" }));
++  form.appendChild(field("note", "Note", sel.preset.note, { wide: true, type: "textarea" }));
++  for (const f of SCHEMA.fields) form.appendChild(field(f.key, f.label, sel.preset[f.key], f));
++  fillSizes();
++}
++
++function field(key, label, value, f) {
++  const wrap = el("div", "field" + (f.wide ? " wide" : ""));
++  const id = `f-${key}`;
++  const lab = el("label", null, label);
++  lab.htmlFor = id;
++  wrap.appendChild(lab);
++  let input, ownInput = null;
++  if (f.type === "textarea") input = el("textarea");
++  else if (f.type === "select" || f.type === "family" || f.type === "size" || f.type === "context") input = el("select");
++  else input = el("input");
++  input.id = id;
++  input.name = key;
++  if (f.type === "number") input.type = "number";
++  if (f.type === "text") input.type = "text";
++  if (f.secret) input.type = "text";
++  if (f.type === "family") {
++    for (const fam of MODELS.families) input.appendChild(new Option(fam.title, fam.id));
++  } else if (f.type === "context") {
++    const list = MODELS.contexts || [];
++    for (const c of list) {
++      input.appendChild(new Option(`${Math.round(c / 1024)}K` + (c > SCHEMA.trained_context ? " (scaled)" : ""), c));
++    }
++    if (value && !list.includes(Number(value))) {
++      input.appendChild(new Option(`${Math.round(Number(value) / 1024)}K (your own value)`, value));
++    }
++    input.appendChild(new Option("own value…", "__own"));
++    ownInput = el("input");
++    ownInput.id = "f-context-own";
++    ownInput.type = "number"; ownInput.min = 1024; ownInput.max = 1048576; ownInput.step = 1024;
++    ownInput.hidden = true;
++    ownInput.oninput = ownInput.onchange = () => {
++      const n = parseInt(ownInput.value, 10);
++      if (!n) return;
++      if (![...input.options].some((o) => o.value === String(n))) {
++        input.insertBefore(new Option(`${Math.round(n / 1024)}K (your own value)`, n), input.lastElementChild);
++      }
++      input.value = String(n);            // the field's value stays the token count the preset stores
++    };
++    input.onchange = () => {
++      if (input.value !== "__own") return;
++      ownInput.hidden = false;
++      ownInput.value = value && !list.includes(Number(value)) ? value : 196608;
++      ownInput.focus();
++    };
++  } else if (f.type === "select") {
++    for (const c of f.choices) input.appendChild(new Option(c.label, c.value));
++  }
++  if (f.type === "number" || f.type === "text" || f.type === "textarea") input.value = value === null ? "" : (value ?? "");
++  else input.value = value ?? "";
++  wrap.appendChild(input);
++  if (ownInput) wrap.appendChild(ownInput);
++  const help = [];
++  if (f.help) help.push(f.help);
++  if (f.flag) help.push(`setup: ${f.flag}`);
++  if (f.type === "context") help.push("1,024 to 1,048,576 tokens: setup takes any --context, its menu lists the ones above");
++  if (help.length) wrap.appendChild(el("div", "help", help.join(" · ")));
++  return wrap;
++}
++
++function fillSizes() {
++  const selEl = $("f-model");
++  if (!selEl) return;
++  const fam = familyOf(sel.preset.family);
++  if (!fam) return;
++  clear(selEl);
++  const known = (MODELS.sizeInfo || {});
++  for (const m of fam.sizes) {
++    const info = known[m] || {};
++    const fit = info.on_this_pc && info.on_this_pc !== "fits" ? ` — ${info.on_this_pc}` : "";
++    selEl.appendChild(new Option(`${m} (${info.download_gb || "?"} GB download)${fit}`, m));
++  }
++  // the preset's own size, not what the select happens to hold: a form that was just built has an empty one, and
++  // that used to leave the first size of the family (Q2_0) showing for every preset
++  const want = sel.preset.model || selEl.value;
++  selEl.value = fam.sizes.includes(want) ? want : fam.sizes[0];
++  sel.preset.model = selEl.value;
++}
++
++function renderActions() {
++  const box = $("preset-actions");
++  clear(box);
++  if (!sel) return;
++  const installed = installedById(modelId(sel.preset));  const running = (S.running || [])[0];
++
++  const add = (label, cls, fn, disabled) => {
++    const b = el("button", cls, label);
++    b.disabled = !!disabled;
++    b.onclick = fn;
++    box.appendChild(b);
++    return b;
++  };
++  if (sel.draft || sel.dirty) {
++    add(sel.draft ? "Save preset" : "Save changes", "primary", savePreset);
++  }
++  if (!sel.draft && sel.dirty) add("Discard", "ghost", () => select(sel.id));
++  add("Duplicate", "", duplicatePreset);
++  if (sel.draft) add("Delete", "ghost", () => deletePreset(), true).title = "not stored yet: nothing to delete";
++  else if (sel.builtin) add("Delete", "ghost", null, true).title =
++    "this preset is not stored: it is made from this PC or from the model's own config";
++  else add("Delete", "danger", () => deletePreset());
++  add("What installing it would do", "", showPlan);
++  if (installed) add("Apply these settings", "", applyNow);
++  else add("Download", "primary", installNow);
++  if (installed) {
++    const runningThis = running && FACTS && running.model === FACTS.model_name;
++    const other = running && !runningThis;
++    const start = add(runningThis ? "Running" : "Start", runningThis ? "" : "primary", startNow, runningThis || other);
++    if (other) start.title = `stop ${running.model} first - one model runs at a time on this PC`;
++    if (installed && !other && DIFF && DIFF.changes && DIFF.changes.length) {
++      start.title = "Start runs the settings in the model's own config; this preset differs from them";
++    }
++    add("Measure this PC", "", () => calibrateNow(false), !!running || !!(JOBS.calibrate && JOBS.calibrate.running));
++  }
++}
++
++function modelId(p) {
++  const fam = familyOf(p.family) || {};
++  return `${fam.tag || ""}${p.model || ""}`.toLowerCase();
++}
++function installedById(id) {
++  return (S.installed?.models || []).find((m) => m.model === id) || null;
++}
++
++// ---------------------------------------------------------------- actions
++async function savePreset() {
++  collect();
++  try {
++    const r = await post("preset/save", sel.preset);
++    toast(`saved the preset "${r.preset.name}"`);
++    await refresh(false);
++    sel = { id: r.preset.id, preset: r.preset, builtin: false, draft: false, dirty: false };
++    renderPreset();
++    renderActions();
++    markList();
++  } catch (e) { showErrors(e); }
++}
++
++function showErrors(e) {
++  const box = $("preset-warn");
++  box.hidden = false;
++  box.textContent = e.message || String(e);
++}
++
++async function duplicatePreset() {
++  collect();
++  const copy = { ...sel.preset, id: "", name: `${sel.preset.name} (copy)`.slice(0, 60) };
++  try {
++    const r = await post("preset/save", copy);
++    await refresh(false);
++    select(r.preset.id);
++  } catch (e) { showErrors(e); }
++}
++
++async function deletePreset(p) {
++  p = p || sel.preset;
++  if (!confirm(`Remove the preset "${p.name}"? The model it installed stays on this PC.`)) return;
++  try {
++    await post("preset/delete", { id: p.id });
++    if (sel && sel.id === p.id) {
++      sel = null;
++      $("preset-name").textContent = "No preset selected";
++      $("preset-summary").textContent = "";
++      $("preset-note").hidden = true;
++      $("form").hidden = true;
++      $("plan").hidden = true;
++    }
++    await refresh(false);
++    const first = allPresets()[0];
++    if (first) select(first.id);
++  } catch (e) { fail(e); }
++}
++
++async function showPlan() {
++  if (sel.draft) { toast("save the preset first — the plan is made from a saved preset"); return; }
++  try {
++    PLAN = await api(`plan?id=${encodeURIComponent(sel.id)}`);
++    drawPlan();
++  } catch (e) { fail(e); }
++}
++
++// what the preset differs from on the model's own config: Start runs the config, not the preset
++let diffTimer = null;
++function queueDiff() { clearTimeout(diffTimer); diffTimer = setTimeout(checkDiff, 400); }
++
++async function checkDiff() {
++  if (!sel) { DIFF = null; renderDiff(); return; }
++  try { DIFF = await post("preset/diff", sel.preset); } catch (e) { DIFF = null; }
++  renderDiff();
++}
++
++function renderDiff() {
++  const box = $("preset-diff");
++  clear(box);
++  box.hidden = true;
++  if (!DIFF || !DIFF.installed || !(DIFF.changes || []).length) return;
++  box.appendChild(el("b", null, `Starting ${DIFF.model_id} runs the settings in its own config, not this preset:`));
++  const ul = el("ul");
++  for (const c of DIFF.changes) {
++    ul.appendChild(el("li", null, `${c.label}: the model runs with ${c.config}, this preset says ${c.preset}`));
++  }
++  box.appendChild(ul);
++  box.appendChild(el("div", "sub", "Start applies them first: setup re-writes the model's own config - a few "
++    + "seconds to a minute here, the files already downloaded are only checked again. 'Apply these settings' does "
++    + "the same without starting it."));
++  box.hidden = false;
++}
++
++function drawPlan() {
++  const box = $("plan");
++  clear(box);
++  box.hidden = false;
++  const p = PLAN;
++  box.appendChild(el("h3", null, p.already_installed ? `Applying ${p.title} to this model`
++    : `Installing ${p.title}`));
++  const dl = el("dl");
++  const facts = [
++    ["Download", p.already_installed ? "already here: nothing is fetched again, setup only re-checks it"
++      : `${p.download_gb} GB of model files, plus ~8 GB of the draft layer`],
++    ["Disk", `${p.disk_needed_gb} GB needed · ${p.disk_free_gb ?? "?"} GB free in ${p.data_folder}`],
++    ["RAM", p.ram || "not checked"],
++    ["Context", `${Math.round(p.context / 1024)}K · images ${p.images}` +
++      (p.own_context ? " · a length of your own: setup takes any --context, and the published numbers mark the "
++        + "nearest length they measured" : "")],
++    ["Takes", p.already_installed ? "a few seconds to a minute" : p.takes],
++    ["Already here", p.already_installed ? "this model is installed: setup will re-check it and apply these settings" : "no"],
++  ];
++  for (const [k, v] of facts) {
++    const row = el("div", "kv");
++    row.appendChild(el("span", null, k));
++    row.appendChild(el("b", null, v));
++    dl.appendChild(row);
++  }
++  box.appendChild(dl);
++  if (p.changes && p.changes.length) {
++    const w = el("div", "notice warn");
++    w.appendChild(el("b", null, "This model is installed. Installing this preset would change how it runs:"));
++    const ul = el("ul");
++    for (const c of p.changes) ul.appendChild(el("li", null, `${c.label}: ${c.config} becomes ${c.preset}`));
++    w.appendChild(ul);
++    w.appendChild(el("div", "sub", "the model keeps these settings after the install; the running server needs a "
++      + "stop and a start to use them"));
++    box.appendChild(w);
++  }
++  if (p.note) box.appendChild(el("p", "sub", p.note));
++  if (p.license) box.appendChild(el("p", "sub", `Licence: ${p.license}`));
++  box.appendChild(el("pre", "cmd", p.setup_command));
++  const go = el("button", "primary", p.already_installed ? "Apply these settings to the model"
++    : `Download and prepare it (${p.download_gb} GB)`);
++  go.onclick = p.already_installed ? applyNow : installNow;
++  const row = el("div", "controls");
++  row.style.marginTop = "12px";
++  row.appendChild(go);
++  if (p.calibrate === "always") row.appendChild(el("span", "sub", "this preset measures this PC after installing (5-10 minutes)"));
++  box.appendChild(row);
++}
++
++async function applyNow() {
++  if (sel.draft) { toast("save the preset first — the settings are applied from a saved preset"); return; }
++  try {
++    const r = await post("apply", { id: sel.id });
++    toast(r.summary);
++    await refresh(false);
++    checkDiff();
++  } catch (e) { fail(e); }
++}
++
++async function installNow() {
++  if (sel.draft) { toast("save the preset first"); return; }
++  if (!PLAN) await showPlan();
++  try {
++    await post("install", { id: sel.id });
++    toast("the download started — its progress is in the Download panel");
++    logTab = "install";
++    renderTabs();
++    await refresh(false);
++  } catch (e) { fail(e); }
++}
++
++async function startNow() {
++  // a preset that says "ask": offer the measurement once, the first time this model runs on this PC
++  const neverCalibrated = !FACTS || !(FACTS.calibrations || []).length;
++  if (sel.preset.calibrate === "ask" && neverCalibrated) {
++    const first = confirm("This model has never been measured on this PC.\n\n"
++      + "Measure it first (5-10 minutes, the PC is busy) and start it with the settings that were fastest,\n"
++      + "or start now with the settings the engine ships with.\n\n"
++      + "OK = measure first, then start. Cancel = start now.");
++    if (first) { await calibrateNow(true); return; }
++  }
++  try {
++    openChatWhenReady(true);                                  // the tab is opened in the click, filled when ready
++    const r = await post("start", { id: sel.id, wait_seconds: 10 });
++    toast(r.summary);
++    await refresh(false);
++  } catch (e) { dropChatTab(); fail(e); }
++}
++
++async function stopNow() {
++  dropChatTab();
++  try {
++    const r = await post("stop", {});
++    toast(r.summary);
++    await refresh(false);
++  } catch (e) { fail(e); }
++}
++
++async function calibrateNow(thenStart) {
++  const m = modelId(sel.preset);
++  if (!thenStart && !confirm("Measuring this PC takes 5-10 minutes and keeps it busy: the model is started a few " +
++    "times with different settings, and the fastest ones are kept in the model's own config. Continue?")) return;
++  try {
++    await post("calibrate", { model: m, then_start: !!thenStart });
++    if (thenStart) openChatWhenReady(false);        // the launcher starts the model when the measurement ends
++    logTab = "calibrate";
++    renderTabs();
++    toast("measuring this PC — " + (thenStart ? "the model starts when it is done" : "watch the Measuring panel"));
++    await refresh(false);
++  } catch (e) { fail(e); }
++}
++
++// ---------------------------------------------------------------- drawing: the lists
++function markList() {
++  const want = sel ? (sel.listId || sel.id) : null;
++  for (const n of document.querySelectorAll(".item")) n.classList.toggle("selected", n.dataset.id === want);
++}
++
++function renderInstalled() {
++  const box = $("installed");
++  clear(box);
++  const models = S.installed?.models || [];
++  if (!models.length) {
++    box.appendChild(el("p", "empty", "No model is installed here yet. Pick a preset and download one."));
++  }
++  for (const m of models) {
++    const b = el("button", "item");
++    b.dataset.id = `model:${m.model}`;
++    const row = el("div", "row");
++    row.appendChild(el("strong", null, m.model));
++    const running = (S.running || []).some((r) => r.model === m.model_name);
++    row.appendChild(el("span", "tag " + (running ? "ok" : m.ready ? "" : "bad"),
++      running ? "running" : m.ready ? "installed" : "files missing"));
++    b.appendChild(row);
++    b.appendChild(el("div", "sub", [
++      m.context ? `${Math.round(m.context / 1024)}K` : "", m.kv ? `KV ${m.kv}` : "",
++      m.images && m.images !== "off" ? `images ${m.images}` : "", m.port ? `:${m.port}` : "",
++      m.last_used ? `used ${m.last_used}` : "",
++    ].filter(Boolean).join(" · ")));
++    b.onclick = () => fromModel(m.model);
++    box.appendChild(b);
++  }
++  $("data-dir").textContent = `Strata folder: ${S.strata_folder || "?"} · model files: ${S.installed?.data_folder || "?"}` +
++    ` · engine ${S.installed?.engine?.version || "?"}`;
++}
++
++async function fromModel(id) {
++  try {
++    const r = await post("preset/from-model", { model: id });
++    await openDraft(r.preset, `${id} — installed model`, `model:${id}`);
++    FACTS = await api(`model?id=${encodeURIComponent(id)}`).catch(() => null);   // its missing files, if any
++    renderInfo();
++  } catch (e) { fail(e); }
++}
++
++function renderPresets() {
++  const box = $("presets");
++  clear(box);
++  const all = S.builtin || [];
++  const here = all.filter((p) => p.id.startsWith("builtin-installed-"));
++  const groups = [["Your presets", S.presets || [], "none yet"],
++                  ["As it is set up here", here, ""],
++                  ["For this PC", all.filter((p) => !p.id.startsWith("builtin-installed-")), "none yet"]];
++  for (const [title, items, ifEmpty] of groups) {
++    if (!items.length && !ifEmpty) continue;
++    box.appendChild(el("div", "group", title));
++    if (!items.length) { box.appendChild(el("p", "empty", ifEmpty)); continue; }
++    for (const p of items) {
++      const b = el("button", "item");
++      b.dataset.id = p.id;
++      const row = el("div", "row");
++      row.appendChild(el("strong", null, p.name));
++      const inst = installedById(modelId(p));
++      if (inst) row.appendChild(el("span", "tag ok", "on this PC"));
++      else if (p.builtin) row.appendChild(el("span", "tag builtin", "for this PC"));
++      if (!p.builtin) {
++        const x = el("span", "del", "\u2715");
++        x.title = "remove this preset";
++        x.onclick = (e) => { e.stopPropagation(); deletePreset(p); };
++        row.appendChild(x);
++      }
++      b.appendChild(row);
++      b.appendChild(el("div", "sub", summaryLine(p)));
++      b.onclick = () => select(p.id);
++      box.appendChild(b);
++    }
++  }
++  markList();
++}
++
++function renderStatus() {
++  const box = $("status");
++  const text = $("status-text");
++  const running = (S.running || [])[0];
++  const job = S.install;
++  box.className = "status";
++  if (running) {
++    box.classList.add(running.busy ? "busy" : "running");
++    text.textContent = running.busy ? `answering a request — ${running.model}` :
++      `${running.model} is running on http://127.0.0.1:${running.port}/ (idle)`;
++  } else if (S.loading) {
++    box.classList.add("loading");
++    text.textContent = `loading ${S.loading.model}… (1-3 minutes; the PC can be slow meanwhile)`;
++  } else if (job && job.running) {
++    box.classList.add("installing");
++    text.textContent = `installing ${job.model || ""}: ${job.step || "starting"}` +
++      (job.download ? ` — ${job.download.file} ${job.download.percent}%` : "");
++  } else if (job && job.error) {
++    box.classList.add("failed");
++    text.textContent = `the install stopped: ${job.error}`;
++  } else if (JOBS.calibrate && JOBS.calibrate.running) {
++    box.classList.add("loading");
++    text.textContent = "measuring this PC (5-10 minutes, the PC is busy)";
++  } else {
++    text.textContent = S.summary || "Strata is not running";
++  }
++  const actions = $("status-actions");
++  clear(actions);
++  if (running) {
++    const open = el("a", null);
++    const b = el("button", "primary", `Open the chat page (:${running.port})`);
++    open.href = `http://127.0.0.1:${running.port}/`;
++    open.target = "_blank";
++    open.appendChild(b);
++    actions.appendChild(open);
++    const stop = el("button", "", "Stop");
++    stop.onclick = stopNow;
++    actions.appendChild(stop);
++  }
++  const pc = $("pc");
++  const hw = S.hardware;
++  if (hw) {
++    clear(pc);
++    const g = (hw.gpus || []).map((x) => `${x.name.replace(/^NVIDIA |^AMD /, "")} ${x.vram_gb} GB`).join(" + ");
++    pc.appendChild(el("span", null, `${hw.os} · `));
++    pc.appendChild(el("b", null, g || "no usable GPU"));
++    pc.appendChild(el("span", null, ` · ${hw.ram_gb} GB RAM · engine ${S.installed?.engine?.version || "?"}`));
++  }
++}
++
++function renderInfo() {
++  const box = $("info");
++  clear(box);
++  if (!sel) { box.appendChild(el("p", "empty", "Nothing selected.")); return; }
++  const p = sel.preset;
++  const fam = familyOf(p.family) || {};
++  const info = (MODELS.sizeInfo || {})[p.model] || {};
++  const inst = installedById(modelId(p));
++  // one column: two .kv rows side by side in this card left a base URL about 110px, and it broke mid-host
++  const dl = el("dl", "one");
++  const rows = [
++    ["Model", `${fam.title || p.family} ${p.model}`],
++    ["By", fam.by || ""],
++    ["About", info.about || ""],
++    ["Download", `${info.download_gb ?? "?"} GB`],
++    ["RAM it wants", `${info.ram_needed_gb ?? "?"} GB`],
++    ["Experts", `${info.experts_gb ?? "?"} GB`],
++    ["On this PC", info.on_this_pc || "not checked"],
++    ["Context / KV / images", `${Math.round((p.context || 0) / 1024)}K · ${p.kv || "setup's choice"} · ${p.vision === "gpu" ? "on the GPU" : p.vision === "cpu" ? "on the CPU" : "off"}`],
++    ["Address", `http://127.0.0.1:${p.port || 8080}/`],
++  ];
++  if (inst) {
++    rows.push(["Config", inst.config]);
++    rows.push(["Start script", inst.start_script || `run-${inst.model}.bat`]);
++    rows.push(["Last used", inst.last_used || ""]);
++  }
++  if (CONNECT) {
++    // the same answer the strata_connect_info MCP tool gives, for pointing the user's apps at Strata
++    rows.push(["OpenAI base URL", CONNECT.openai_base_url]);
++    rows.push(["Anthropic base URL", CONNECT.anthropic_base_url]);
++    rows.push(["API key", CONNECT.api_key ? "set" : "none: this PC only"]);
++  }
++  if (FACTS?.model_settings?.ready === false) rows.push(["Missing files", (FACTS.model_settings.missing_files || []).join(", ")]);
++  for (const [k, v] of rows) {
++    if (!v) continue;
++    const r = el("div", "kv");
++    r.appendChild(el("span", null, k));
++    r.appendChild(el("b", null, v));
++    dl.appendChild(r);
++  }
++  box.appendChild(dl);
++  const rec = MODELS.recommendation;
++  if (rec && rec.model && p.model !== rec.model) {
++    box.appendChild(el("p", "sub", `setup would pick ${rec.title} for this PC: ${rec.why}`));
++  }
++}
++
++// ---------------------------------------------------------------- logs and jobs
++function renderTabs() {
++  const live = {
++    install: !!(S.install && S.install.running),
++    calibrate: !!(JOBS.calibrate && JOBS.calibrate.running),
++    server: !!(S.running || []).length,
++    engine: !!(S.running || []).length,
++  };
++  for (const b of document.querySelectorAll(".tabs button")) {
++    b.setAttribute("aria-selected", b.dataset.pane === logTab ? "true" : "false");
++    b.classList.toggle("live", !!live[b.dataset.pane]);
++    b.title = live[b.dataset.pane] ? `${b.textContent}: something is writing here now` : `${b.textContent}: not writing`;
++  }
++  const running = (logTab === "install" && live.install) || (logTab === "calibrate" && live.calibrate);
++  $("log-cancel").hidden = !running;
++}
++
++// the log pane follows the file: it is re-read on every poll, and only scrolls when you were already at the bottom
++let LOG_TEXT = "";
++async function showLog() {
++  const box = $("log");
++  renderTabs();
++  let text = "", foot = "";
++  try {
++    if (logTab === "install" || logTab === "calibrate") {
++      const job = logTab === "install" ? S.install : JOBS.calibrate;
++      const lines = job && (job.lines || job.last_lines);      // the install job names them last_lines
++      text = (lines && lines.length) ? (job.running ? "running — " : "") + lines.join("\n")
++                                     : ((job && job.result_note) || "Nothing running.");
++      foot = job && job.log ? `${job.log} · ${lines ? lines.length : 0} lines · re-read every 3 s` : "";
++    } else {
++      const r = await api(`logs?source=${logTab}&lines=120`);
++      text = (r.lines || []).join("\n") || r.summary || "no log yet";
++      foot = `${r.log || ""} · ${(r.lines || []).length} lines · re-read every 3 s`;
++    }
++  } catch (e) {
++    text = e.message || String(e);
++  }
++  if (text === LOG_TEXT) return;                                // nothing new: leave the scroll where it is
++  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
++  LOG_TEXT = text;
++  box.textContent = text;
++  $("log-foot").textContent = foot;
++  if (atBottom) box.scrollTop = box.scrollHeight;
++}
++
++// ---------------------------------------------------------------- the loop
++async function refresh(hardware) {
++  S = await api("state" + (hardware ? "?hardware=1" : ""));
++  JOBS = await api("jobs").catch(() => JOBS);
++  if (JOBS.calibrate && JOBS.calibrate.then_start) toast(JOBS.calibrate.then_start.summary);
++  const port = (S.running[0] || {}).port || null;      // the connection settings change only when a model starts
++  if (port !== CONNECT_PORT) {
++    CONNECT = port ? await api("connect").catch(() => null) : null;
++    CONNECT_PORT = port;
++  }
++  renderStatus();
++  if (CHAT_WAIT && (S.running || []).length) showChatPage(S.running[0].port);
++  const jobRunning = !!(S.install && S.install.running) || !!(JOBS.calibrate && JOBS.calibrate.running);
++  if (JOB_WAS_RUNNING && !jobRunning) checkDiff();      // an install or a measurement rewrote the model's config
++  JOB_WAS_RUNNING = jobRunning;
++  renderInstalled();
++  renderPresets();
++  renderActions();
++  renderTabs();
++  showLog();                       // every tab, not only the jobs: the Server and Engine panes follow their files
++}
++
++async function tick() {
++  if (busy) return;
++  busy = true;
++  try {
++    await refresh(false);
++
++  } catch (e) {
++    toast(`the launcher lost its own server: ${e.message}`, true);
++  } finally {
++    busy = false;
++  }
++}
++
++// ---------------------------------------------------------------- start
++async function boot() {
++  $("theme").onclick = () => {
++    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
++    document.documentElement.dataset.theme = next;
++    localStorage.setItem("strata-theme", next);
++  };
++  $("refresh").onclick = () => refresh(false).catch(fail);
++  $("new-preset").onclick = async () => {
++    try {
++      const r = await api("preset/new");        // the defaults are setup's own answers for this PC
++      await openDraft(r.preset, "New preset");
++      $("f-name").focus();
++    } catch (e) { fail(e); }
++  };
++  const form = $("form");                        // one listener for the whole form, kept across re-renders
++  form.addEventListener("input", () => { collect(); queueDiff(); });
++  form.addEventListener("change", () => { collect(); if (sel && sel.preset.family) fillSizes(); queueDiff(); });
++  for (const b of document.querySelectorAll(".tabs button")) {
++    b.onclick = () => { logTab = b.dataset.pane; showLog(); };
++  }
++  $("log-cancel").onclick = async () => {
++    try {
++      if (logTab === "install") await post("install/cancel", {});
++      else await post("calibrate/cancel", {});
++      await refresh(false);
++    } catch (e) { fail(e); }
++  };
++  try {
++    [SCHEMA, MODELS] = await Promise.all([api("schema"), api("models")]);
++    await refresh(true);
++    const first = (S.presets || [])[0] || (S.builtin || [])[0];
++    if (first) await select(first.id);
++    else toast("no preset is available: this PC's hardware may not fit any model — see the note in the header");
++    timer = setInterval(tick, 3000);
++  } catch (e) {
++    fail(e);
++  }
++}
++boot();

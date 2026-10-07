@@ -1,0 +1,43 @@
+{
+ "exe": "D:\\llm-dev\\strata\\engine\\strata.exe",
+ "args": [
+  "--pack",
+  "C:\\Users\\maddo\\.lmstudio\\models\\packs\\iq2_xs",
+  "--native",
+  "C:\\Users\\maddo\\.lmstudio\\models\\models\\IQ2_XS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+  "--ple-gguf",
+  "C:\\Users\\maddo\\.lmstudio\\models\\models\\IQ2_XS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+  "--expert-profile",
+  "D:\\llm-dev\\strata\\data\\expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto:16384",
+  "--spec",
+  "4",
+  "--mtp",
+  "C:\\Users\\maddo\\.lmstudio\\models\\mtp\\rt",
+  "--max-context",
+  "131072",
+  "--kv",
+  "int8",
+  "--resident-experts",
+  "--spec-min-p",
+  "0.5"
+ ],
+ "cwd": "D:\\llm-dev\\strata",
+ "tokenizer": "C:\\Users\\maddo\\.lmstudio\\models\\packs\\iq2_xs\\tokenizer",
+ "model_name": "qwen3.8-flash-next-iq2_xs",
+ "log": "D:\\llm-dev\\strata\\strata-iq2_xs.log",
+ "lib_dirs": [
+  "D:\\llm-dev\\strata\\engine\\rocm\\bin"
+ ],
+ "backend": "hip",
+ "env": {
+  "STRATA_RESIDENT_PIN": "0",
+  "STRATA_PREFILL_MMQ": "1",
+  "STRATA_PREFILL_RING": "96",
+  "STRATA_IO_THREADS": "32"
+ },
+ "draft_vocab": "en"
+}

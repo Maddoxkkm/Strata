@@ -1,0 +1,252 @@
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 3eda5a0866..71aec8f687 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -170,6 +170,10 @@ class ExpertSource {
+     virtual bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
+         (void) pairs; (void) n; return false;
+     }
++    /// pp-opt: `n` blobs at once (the prompt path's stager claims runs of consecutive experts): `dst[i]` gets the
++    /// blob of (layers[i], experts[i]).  A source that reads a drive may merge neighbouring blobs into one request.
++    /// Default: copy_blob one by one.
++    virtual bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
+     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
+     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
+     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
+@@ -548,6 +552,11 @@ class FileExpertSource : public ExpertSource {
+     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
+     bool recheck_unbuffered(std::string& why);
+     bool unbuffered() const { return !direct_.empty(); }
++    /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
++    /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
++    /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
++    /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
++    bool drop_mapping(std::string& why);
+     /// Every expert's bytes (n_layers x n_expert blobs).
+     uint64_t expert_bytes() const;
+     /// #286, unbuffered: assembles the blobs of these pairs ahead of the `blob` calls that will ask for them (the
+@@ -566,6 +575,8 @@ class FileExpertSource : public ExpertSource {
+     bool pcie_layer(int64_t layer) const override;
+     bool transient(int64_t layer, int64_t expert) const override;
+     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
++    /// pp-opt, unbuffered: the file-tier blobs of the run in one read_direct batch (neighbours merged into one request)
++    bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
+     /// CS-T: advances the assembled blobs' age (see staged_blob).
+     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
+@@ -681,6 +692,7 @@ class FileExpertSource : public ExpertSource {
+ #else
+     int fd_ = -1;
+ #endif
++    bool unmapped_ = false;   ///< pp-opt: drop_mapping closed the view (base_ stays as the "opened" mark only)
+ };
+ 
+ // ================================ THE RESIDENT ARENA (R2.1) ================================
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index d0ff201ec6..603338ce4c 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -665,7 +665,8 @@ void FileExpertSource::close() {
+     file_blob_bytes_.store(0);
+     file_us_.store(0);
+ #if defined(_WIN32)
+-    if (base_ != nullptr) UnmapViewOfFile((LPCVOID) base_);
++    if (base_ != nullptr && !unmapped_) UnmapViewOfFile((LPCVOID) base_);
++    unmapped_ = false;
+     if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
+     if (file_ != nullptr) CloseHandle((HANDLE) file_);
+     mapping_ = nullptr;
+@@ -693,6 +694,12 @@ bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+     return true;
+ }
+ 
++bool ExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
++    for (size_t i = 0; i < n; ++i)
++        if (!copy_blob(layers[i], experts[i], dst[i])) return false;
++    return true;
++}
++
+ // ================================ CS-T: THE GGUF SHARDS IN PLACE ================================
+ //
+ // A native pack without experts.bin: every file native_experts.txt names is mapped (MapViewOfFile / mmap, no
+@@ -1122,6 +1129,26 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
+ #endif
+ }
+ 
++bool FileExpertSource::drop_mapping(std::string& why) {
++#if defined(_WIN32)
++    if (direct_.empty()) { why = "the reads are not unbuffered"; return false; }
++    if (!role_ptr_.empty() || !maps_.empty()) { why = "the GGUF in place keeps its maps (token embedding, PLE)"; return false; }
++    if (base_ == nullptr || unmapped_) { why = base_ == nullptr ? "not open" : "already closed"; return unmapped_; }
++    if (!UnmapViewOfFile((LPCVOID) base_)) { why = "UnmapViewOfFile failed"; return false; }
++    unmapped_ = true;
++    if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
++    mapping_ = nullptr;
++    // the cached handle too: only the unbuffered handles (direct_) read the file from here on
++    if (file_ != nullptr) CloseHandle((HANDLE) file_);
++    file_ = nullptr;
++    why = "every expert outside RAM and VRAM is read unbuffered";
++    return true;
++#else
++    why = "not Windows";
++    return false;
++#endif
++}
++
+ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+ #if defined(_WIN32)
+     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
+@@ -1570,8 +1597,41 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+     return true;
+ }
+ 
++// pp-opt: the prompt path streams a chunk's experts in file order, so a stager thread's run of jobs is mostly
++// neighbouring blobs of experts.bin.  One read_direct batch merges them into requests of up to 32 MiB (kMerge) where
++// copy_blob made one ~2 MB request each - and NTFS serves the unbuffered reads of a mapped file one at a time, so the
++// request size is what sets the rate (see read_direct).  The blobs the RAM copy holds are copied as before.
++bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
++    if (direct_.empty() || n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
++    thread_local std::vector<Fill> fills;
++    fills.clear();
++    uint64_t bytes = 0;
++    for (size_t i = 0; i < n; ++i) {
++        const int64_t l = layers[i], e = experts[i];
++        if (base_ == nullptr || dst[i] == nullptr || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return false;
++        const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
++        if (complement_ready_ &&
++            (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr))) {
++            if (!copy_blob(l, e, dst[i])) return false;
++            continue;
++        }
++        fills.push_back({0, l, e, dst[i]});
++        bytes += layer_blob_bytes_[(size_t) l];
++    }
++    if (fills.empty()) return true;
++    const auto t0 = std::chrono::steady_clock::now();
++    if (!read_direct(fills.data(), fills.size()))
++        for (const Fill& f : fills)   // a failed batch: each blob on its own (copy_from_files falls back to the mapping)
++            if (!copy_from_files(f.layer, f.e, f.dst)) return false;
++    file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
++                       std::memory_order_relaxed);
++    file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
++    return true;
++}
++
+ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
+     if (!role_ptr_.empty()) return nullptr;   // the GGUF in place: no contiguous blob in any file
++    if (unmapped_) return nullptr;            // pp-opt: drop_mapping closed the view; read_direct reads them
+     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+     const size_t i = (size_t) layer;
+     if (i >= layer_offsets_.size() || i >= layer_blob_bytes_.size()) return nullptr;
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 7b53ac9a4a..3063757984 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -318,6 +318,9 @@ struct Stager {
+     // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
+     // DMAs of the unpinned experts' blobs
+     int kRing = 16;
++    // pp-opt: the jobs a thread claims at once (STRATA_STAGER_BATCH; set by init's caller, at most kMaxBatch and kRing)
++    static constexpr int kMaxBatch = 32;
++    int batch = 1;
+     // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
+     // role slices; a pointer to it would not live as long as the queue)
+     struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; };
+@@ -380,33 +383,47 @@ struct Stager {
+             }
+             for (;;) {
+                 active.fetch_add(1, std::memory_order_acq_rel);
+-                const int j = claim(seen);
++                // pp-opt: a run of up to `batch` consecutive jobs (batch <= kRing, so the earliest unfinished run
++                // never waits for a buffer of its own)
++                int k = 1;
++                const int j = claim(seen, batch, k);
+                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
+-                const int b = j % kRing;
+-                if (j >= kRing)   // job j - kRing's DMA from this buffer is queued
+-                    while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
+-                // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
+-                // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
+-                // was a ring entry the routing skipped (an event never recorded returns at once)
+-                cudaEventSynchronize(dma_done[b]);
+-                const Job& jb = jobs[(size_t) j];
+-                if (jb.from == nullptr) std::memcpy(buf[b], jb.src, jb.bytes);
+-                else if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
+-                    std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
++                for (int i = j; i < j + k; ++i) {
++                    if (i >= kRing)   // job i - kRing's DMA from this buffer is queued
++                        while (issued.load(std::memory_order_acquire) <= i - kRing) std::this_thread::yield();
++                    // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
++                    // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
++                    // was a ring entry the routing skipped (an event never recorded returns at once)
++                    cudaEventSynchronize(dma_done[i % kRing]);
++                }
++                int32_t rl[kMaxBatch], re[kMaxBatch];
++                uint8_t* rd[kMaxBatch];
++                size_t nr = 0;
++                core::ExpertSource* from = nullptr;
++                for (int i = j; i < j + k; ++i) {
++                    const Job& jb = jobs[(size_t) i];
++                    if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
++                    from = jb.from;
++                    rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
++                }
++                if (nr > 0 && !from->copy_blobs(rl, re, rd, nr)) {
++                    std::fprintf(stderr, "prefill: the expert source could not copy experts %d.. of layer %d\n", re[0], rl[0]);
+                     std::abort();
+                 }
+-                ready[(size_t) j].store(1, std::memory_order_release);
++                for (int i = j; i < j + k; ++i) ready[(size_t) i].store(1, std::memory_order_release);
+                 active.fetch_sub(1, std::memory_order_acq_rel);
+             }
+         }
+     }
+-    int claim(uint32_t g) {
++    int claim(uint32_t g, int want, int& k) {
+         uint64_t cur = head.load(std::memory_order_acquire);
+         for (;;) {
+             if ((uint32_t) (cur >> 32) != g) return -1;
+             const int n = (int) ((cur >> 16) & 0xffff), j = (int) (cur & 0xffff);
+             if (j >= n) return -1;
+-            if (head.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) return j;
++            k = std::min(want, n - j);
++            if (head.compare_exchange_weak(cur, cur + (uint64_t) k, std::memory_order_acq_rel, std::memory_order_acquire))
++                return j;
+         }
+     }
+     /// A layer's jobs; the previous layer's are finished (finish()).
+@@ -860,7 +877,15 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
+             for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
+         const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
++        // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
++        // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
++        {
++            const char* bv = std::getenv("STRATA_STAGER_BATCH");
++            const int want = bv ? std::atoi(bv) : files ? 8 : 1;
++            m.stager->batch = std::clamp(want, 1, Stager::kMaxBatch);
++        }
+         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
++        m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
+     }
+     m.steps_host.resize(T * strata::kernels::kStepCount);
+     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3b551f3aaf..71f3db68e1 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -5535,6 +5535,14 @@ int main(int argc, char** argv) {
+ #endif
+     }
+     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
++    // pp-opt: with the file tier unbuffered, the mapped view of experts.bin is only a fallback from here on - and while
++    // it exists NTFS serves the unbuffered reads one at a time (drop_mapping).  STRATA_KEEP_MAPPING=1 keeps it (A/B).
++    if (srcp == &src && src.unbuffered() && std::getenv("STRATA_KEEP_MAPPING") == nullptr) {
++        std::string why;
++        const bool dropped = src.drop_mapping(why);
++        std::fprintf(stderr, "strata generate: the mapped view of the experts %s (%s)\n",
++                     dropped ? "is closed" : "stays open", why.c_str());
++    }
+     if (o.serve) {
+         if (o.spec < 2 || o.prefill_chunk <= 0 ||
+             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {

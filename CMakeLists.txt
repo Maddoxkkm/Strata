@@ -526,6 +526,27 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
     add_executable(tune_hipblaslt tools/hip/tune_hipblaslt.cpp)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
+
+    # local addition (not upstream): can gfx11 (RDNA3) use its matrix cores through rocWMMA, and how fast?
+    # Answers the two questions a gfx11 WMMA port of the prompt kernels depends on. Build:
+    #   tools/hip/rebuild-windows.bat wmma_probe
+    # rocWMMA's own CMake package is not used: its imported target links OpenMP::OpenMP_CXX, which this project
+    # does not look for, and that would break the configure. The device-side API is header-only, so the include
+    # directory is enough.
+    set(_rocwmma_root "${CMAKE_HIP_COMPILER_ROCM_ROOT}")
+    if(NOT _rocwmma_root AND DEFINED ENV{HIP_PATH})
+      set(_rocwmma_root "$ENV{HIP_PATH}")
+    endif()
+    if(EXISTS "${_rocwmma_root}/include/rocwmma/rocwmma.hpp")
+      # the probe includes rocWMMA device headers, so it must be compiled as HIP, not as host C++
+      set_source_files_properties(tools/hip/wmma_probe.cpp PROPERTIES LANGUAGE HIP)
+      add_executable(wmma_probe tools/hip/wmma_probe.cpp)
+      target_link_libraries(wmma_probe PRIVATE hip::host)
+      target_include_directories(wmma_probe PRIVATE "${_rocwmma_root}/include")
+      message(STATUS "wmma_probe: rocWMMA headers under ${_rocwmma_root}/include, probe target enabled")
+    else()
+      message(STATUS "wmma_probe: rocWMMA headers not found, probe target skipped")
+    endif()
   endif()
 
   add_executable(strata src/program/generate.cpp)

@@ -1,0 +1,220 @@
+
+====================================================================================================
+#1232 enable --kv-grow with --batch
+  base 82f46a8 (== our HEAD: applies as-is) | +196/-53 in 3 file(s) | created 2026-10-06
+  dirs: include/strata, src/core, src/program
+  knobs: STRATA_KV_GROW_SLOT_INIT
+  flags: --batch, --kv-grow, --max-context, --peer-device, --vram-elastic
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1324 file tier: an LRU part of the RAM budget (--resident-lru-gib), elastic under memory pressu
+  base 82f46a8 (== our HEAD: applies as-is) | +491/-28 in 5 file(s) | created 2026-10-07
+  dirs: bench/results, include/strata, src/core, src/prefill, src/program
+  knobs: STRATA_KEEP_MAPPING, STRATA_LRU_KEEP_FREE_GIB, STRATA_PORTABLE, STRATA_STAGER_BATCH, STRATA_STAGE_KEEP_MIB, STRATA_TIER_TRACE, STRATA_UNBUFFERED_LOAD
+  flags: --kv-resident, --max-context, --pipeline-windows, --prefill, --resident-budget-gib, --resident-lru-gib, --spec, --spec-min-p, --stage, --vision
+  added lines mention hip/amd 0x vs cuda/nvml 2x
+
+====================================================================================================
+#1237 perf(expert): the cache fill's stage buffers pinned with cudaHostAlloc
+  base 82f46a8 (== our HEAD: applies as-is) | +33/-3 in 2 file(s) | created 2026-10-06
+  dirs: include/strata, src/core
+  added lines mention hip/amd 0x vs cuda/nvml 5x
+
+====================================================================================================
+#1240 Avoid unused MTP branch stream on HIP
+  base 82f46a8 (== our HEAD: applies as-is) | +3/-0 in 1 file(s) | created 2026-10-06
+  dirs: src/core
+  knobs: STRATA_USE_HIP
+  added lines mention hip/amd 1x vs cuda/nvml 1x
+
+====================================================================================================
+#1287 feat(vision): support Windows HIP image encoding
+  base 82f46a8 (== our HEAD: applies as-is) | +647/-7 in 6 file(s) | created 2026-10-07
+  dirs: bench/results, docs, tools/vision
+  knobs: STRATA_HIP_ARCHS, STRATA_ROCM_INDEX, STRATA_ROCM_VERSION, STRATA_VISION_CUDA, STRATA_VISION_HIP, STRATA_WDDM_BUDGET
+  flags: --build, --disable-pip-version-check, --gpu, --gpus, --image-min-tokens, --index-url, --native, --offload-arch, --parallel, --ple-gguf
+  numbers in the diff: 0 %, 1 %, 29.1%, 29.3%, 33.4%, 37.2%, 37.5%, 49.8%
+  added lines mention hip/amd 60x vs cuda/nvml 5x
+
+====================================================================================================
+#1345 calibrate: the sweep visits every value in every round instead of once
+  base 82f46a8 (== our HEAD: applies as-is) | +32/-12 in 1 file(s) | created 2026-10-07
+  dirs: tools
+  numbers in the diff: -28%
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1332 calibrate: the PCIe share sweep reaches 1.0, where no expert goes to the CPU pool
+  base 82f46a8 (== our HEAD: applies as-is) | +1/-1 in 1 file(s) | created 2026-10-07
+  dirs: tools
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1265 Add the engine updater: verify, stage, all-or-nothing swap, rollback
+  base 82f46a8 (== our HEAD: applies as-is) | +2683/-0 in 6 file(s) | created 2026-10-06
+  dirs: docs, serve
+  knobs: STRATA_EXPERIMENTAL_SM60, STRATA_TEST_LIB_DIR
+  flags: --format, --help, --pack, --query-gpu, --rollback-engine, --tokens, --update
+  numbers in the diff: 0%, 100%
+  added lines mention hip/amd 22x vs cuda/nvml 69x
+
+====================================================================================================
+#1354 docs: the expert cache is a budget, and on Windows an over-sized one pages instead of fail
+  base 82f46a8 (== our HEAD: applies as-is) | +56/-0 in 1 file(s) | created 2026-10-07
+  dirs: docs
+  flags: --context, --expert-cache, --max-context, --vram-reserve-mib
+  numbers in the diff: 3%, 59.9%, 63.0%, 93.9%, 94.7%
+  added lines mention hip/amd 0x vs cuda/nvml 1x
+
+====================================================================================================
+#1179 Pipelined windows over the active slots + slot allocator, /metrics for Prometheus (replace
+  base 82f46a8 (== our HEAD: applies as-is) | +1555/-4 in 9 file(s) | created 2026-10-06
+  dirs: docs, docs/monitoring, serve, src/program
+  flags: --api-key, --batch
+  numbers in the diff: 90 %
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1190 resident RAM mode with a layer split: the copy keeps each stage's lend region
+  base 82f46a8 (== our HEAD: applies as-is) | +442/-0 in 6 file(s) | created 2026-10-06
+  dirs: CMakeLists.txt, include/strata, src/core, src/program, tests/core
+  knobs: STRATA_ENABLE_HIP, STRATA_SPLIT_OWN_BUFFERS
+  flags: --prefill, --resident-budget-gib, --wrap
+  added lines mention hip/amd 0x vs cuda/nvml 2x
+
+====================================================================================================
+#1264 verify: the batched K/V append writes a streamed K8V4 state's host copy (#1188, #1169)
+  base 82f46a8 (== our HEAD: applies as-is) | +7/-2 in 1 file(s) | created 2026-10-06
+  dirs: src/core
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1262 STRATA_HC_REQ8: hyper-connection projections requantized to int8 + fp32 scale per 32 at lo
+  base 82f46a8 (== our HEAD: applies as-is) | +442/-38 in 11 file(s) | created 2026-10-06
+  dirs: bench/results, include/strata, src/core, src/kernels, src/prefill, src/program
+  knobs: STRATA_HCD_EXACT, STRATA_HC_Q8, STRATA_HC_REQ8, STRATA_LOGPOS, STRATA_LOGPOS_TOPK
+  flags: --adapt-every, --adapt-swaps, --collect, --config, --engine, --kv-resident, --max-context, --pcie-frac, --port, --short-read
+  numbers in the diff: 0 %, 100%, 100.0%, 91.1%, 92.2%, 93.3%, 95.4%, 97.7%, 99.7%
+  added lines mention hip/amd 1x vs cuda/nvml 3x
+
+====================================================================================================
+#1340 core: retain fixed RAM originals during native async exchanges
+  base 82f46a8 (== our HEAD: applies as-is) | +5881/-15 in 12 file(s) | created 2026-10-07
+  dirs: CMakeLists.txt, docs/experiments, include/strata, src/core, src/program, tests/core
+  knobs: STRATA_ASYNC_LAYER_ADMIT, STRATA_BUILD_TESTS, STRATA_DEEPGEMM_TAIL, STRATA_DEEPGEMM_TAIL_RESERVE, STRATA_DF_BRANCH, STRATA_EXCHANGE_DUPLEX, STRATA_EXCHANGE_RETAIN_GIB, STRATA_EXCHANGE_ROTATE, STRATA_EXCHANGE_SEED_PROFILE_TAIL, STRATA_POOL_SPIN_US
+  flags: --adapt-async, --adapt-decay, --adapt-every, --adapt-swaps, --conversation-cache-mib, --eos-ids, --expert-cache, --expert-profile, --lookup-chain, --lookup-chain-min
+  numbers in the diff: +0.1%, +0.2%, +1.8%, 13.1%, 13.12%, 13.48%, 13.5%, 13.9%, 13.93%, 14.0%, 14.05%
+  added lines mention hip/amd 1x vs cuda/nvml 5x
+
+====================================================================================================
+#1316 spec: re-probe stale lookup window costs
+  base 82f46a8 (== our HEAD: applies as-is) | +122/-16 in 3 file(s) | created 2026-10-07
+  dirs: include/strata, src/spec
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1305 decode: --lookup-chain 1 and 2 do not change the window cap with the default --suffix-draf
+  base 82f46a8 (== our HEAD: applies as-is) | +5/-2 in 1 file(s) | created 2026-10-07
+  dirs: src/program
+  flags: --lookup-chain, --spec
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1278 HIP: run the K-quant MMQ test on HIP builds; UD-Q4_K_XL measured on an R9700
+  base 82f46a8 (== our HEAD: applies as-is) | +43/-5 in 2 file(s) | created 2026-10-06
+  dirs: CMakeLists.txt, docs
+  knobs: STRATA_MMQ_KQUANTS, STRATA_PREFILL_MMQ, STRATA_RESIDENT_PIN
+  flags: --backend, --kv-resident, --max-context, --model, --resident-budget-gib, --vision, --yes
+  added lines mention hip/amd 10x vs cuda/nvml 2x
+
+====================================================================================================
+#1151 hip: the QSA block scores on rocBLAS SGEMM, the solution measured at engine start (opt-in;
+  base 82f46a8 (== our HEAD: applies as-is) | +452/-0 in 9 file(s) | created 2026-10-06
+  dirs: CMakeLists.txt, bench/results, cmake, docs, include/strata, src/kernels, src/prefill
+  knobs: STRATA_ENABLE_HIP, STRATA_IO_THREADS, STRATA_PREFILL_TIMING, STRATA_ROCBLAS_AVAILABLE, STRATA_SELECT_OLD, STRATA_SELECT_SGEMM, STRATA_SELECT_SGEMM_TUNE, STRATA_SELECT_SGEMM_VERBOSE
+  flags: --adapt-every, --kv-resident, --max-context, --ple-io
+  numbers in the diff: +2.8%, 0.0%, 0.0000%, 0.1%, 0.2%, 0.3%, 0.4%, 0.5%, 0.6%, 0.7%, 0.8%, 0.9%, 1%, 1.0%
+  added lines mention hip/amd 178x vs cuda/nvml 2x
+
+====================================================================================================
+#1123 HIP RDNA2 (gfx103x): prompt GEMMs as FP32 SGEMMs, a faster default that cannot overflow (R
+  base 82f46a8 (== our HEAD: applies as-is) | +136/-4 in 4 file(s) | created 2026-10-06
+  dirs: docs, include/strata, src/prefill, tests/hip
+  knobs: STRATA_F16_RANGE, STRATA_HIP_ARCHS, STRATA_HIP_PROMPT_F16, STRATA_PF_PAD, STRATA_PREFILL_TIMING, STRATA_RDNA2_SGEMM
+  added lines mention hip/amd 11x vs cuda/nvml 1x
+
+====================================================================================================
+#1167 hip: a rocBLAS solution table for the FP16 prompt GEMMs on gfx103x (the GDN projection 7x 
+  base 82f46a8 (== our HEAD: applies as-is) | +1305/-6 in 14 file(s) | created 2026-10-06
+  dirs: CMakeLists.txt, bench/results, cmake, docs, include/strata, setup.py, src/prefill, tests/hip
+  knobs: STRATA_ENABLE_HIP, STRATA_HIPBLASLT_TUNING, STRATA_HIP_PROMPT_F16, STRATA_PREFILL_TIMING, STRATA_RESIDENT_PIN, STRATA_ROCBLAS_AVAILABLE, STRATA_ROCBLAS_TUNING, STRATA_ROCBLAS_TUNING_V1, STRATA_ROCBLAS_VERBOSE
+  flags: --adapt-every, --build, --case, --expert-cache, --help, --kv-resident, --max-context, --min-gain, --native, --prefill
+  numbers in the diff: -10.3%, -13.6%, -4.3%, 0.0%, 0.1%, 0.2%, 0.3%, 0.4%, 0.5%, 0.6%, 0.8%, 0.9%, 1.0%, 1.1%
+  added lines mention hip/amd 352x vs cuda/nvml 0x
+
+====================================================================================================
+#1321 bench: publish an IQ2_XS speed report for the Radeon AI PRO R9700
+  base 82f46a8 (== our HEAD: applies as-is) | +1161/-0 in 11 file(s) | created 2026-10-07
+  dirs: bench/results, docs
+  knobs: STRATA_HC_SPLIT, STRATA_HIP_WMMA, STRATA_SSD_KEEPALIVE
+  flags: --expert-cache, --expert-profile, --host-core, --max-context, --mtp, --native, --out, --pack, --ple-gguf, --prefill
+  numbers in the diff: 1.6%, 17%, 35%, 84.5%, 99.2%, 99.3%
+  added lines mention hip/amd 16x vs cuda/nvml 0x
+
+====================================================================================================
+#1293 Community benchmark: RX 7900 XTX 24 GB — ROCm 7.1.1 vs ROCm 10.2 nightly
+  base 82f46a8 (== our HEAD: applies as-is) | +770/-0 in 6 file(s) | created 2026-10-07
+  dirs: bench/results
+  knobs: STRATA_GR_V3, STRATA_HIPBLASLT_TUNING, STRATA_HIPBLASLT_TUNING_V1, STRATA_PREFILL_RING, STRATA_PREFILL_TIMING, STRATA_SELECT_WMMA
+  flags: --build, --collect, --expert-cache, --expert-profile, --kv-resident, --max-context, --max-new, --mtp, --native, --pack
+  numbers in the diff: +82%, 40%
+  added lines mention hip/amd 78x vs cuda/nvml 0x
+
+====================================================================================================
+#1114 Monitor: per-GPU view, more cards, and a layout you can rearrange
+  base 82f46a8 (== our HEAD: applies as-is) | +1613/-79 in 11 file(s) | created 2026-10-06
+  dirs: docs, serve, serve/web
+  knobs: STRATA_FORGE_URL, STRATA_LHM_URL
+  flags: --icon, --pcie-frac, --secondary, --st-danger, --st-fs-sm, --st-fs-xs, --st-fw-regular, --st-ink, --st-ink-muted, --st-line
+  numbers in the diff: 0%, 100%
+  added lines mention hip/amd 17x vs cuda/nvml 25x
+
+====================================================================================================
+#1093 Monitor: Load/Unload split button + idle-unload slider, load busy guard, honest unload
+  base 82f46a8 (== our HEAD: applies as-is) | +502/-55 in 10 file(s) | created 2026-10-06
+  dirs: README.md, docs, serve, serve/web
+  flags: --batch, --caret, --idle-unload, --max-context, --pos, --secondary, --st-accent, --st-accent-text, --st-fs-sm, --st-fs-xs
+  numbers in the diff: -50%, 0%, 100%
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1092 launcher: pick a model and its settings in one window (experimental)
+  base 82f46a8 (== our HEAD: applies as-is) | +3443/-14 in 29 file(s) | created 2026-10-06
+  dirs: .gitignore, AGENTS.md, LAUNCHER.bat, README.de.md, README.es.md, README.fr.md, README.ja.md, README.md
+  flags: --api-key, --backend, --calibrate, --config, --context, --control-vector-scaled, --engine, --experimental-speed-projection, --family, --gpu
+  numbers in the diff: -50%, 100%, 23%, 3%, 38%, 4%, 50%, 62%
+  added lines mention hip/amd 16x vs cuda/nvml 6x
+
+====================================================================================================
+#1325 file tier (Windows): read each expert from experts.bin and a mirror on a second drive at o
+  base 82f46a8 (== our HEAD: applies as-is) | +284/-29 in 5 file(s) | created 2026-10-07
+  dirs: bench/results, include/strata, src/core, src/prefill, src/program
+  knobs: STRATA_DECODE_TIMING, STRATA_DIRECT_SPLIT_KIB, STRATA_EXPERTS_MIRROR, STRATA_KEEP_MAPPING, STRATA_STAGER_BATCH, STRATA_UNBUFFERED_LOAD
+  flags: --pipeline-windows, --resident-budget-gib, --resident-lru-gib, --spec, --spec-min-p
+  numbers in the diff: +8.7%
+  added lines mention hip/amd 0x vs cuda/nvml 0x
+
+====================================================================================================
+#1269 serve: restore a session file without holding its K/V in RAM
+  base 82f46a8 (== our HEAD: applies as-is) | +579/-64 in 8 file(s) | created 2026-10-06
+  dirs: docs, include/strata, src/core, src/program
+  added lines mention hip/amd 0x vs cuda/nvml 1x
+
+====================================================================================================
+#1271 serve: --conversation-cache-spill-dir keeps evicted conversations on disk across restarts
+  base 82f46a8 (== our HEAD: applies as-is) | +958/-24 in 7 file(s) | created 2026-10-06
+  dirs: CMakeLists.txt, docs, include/strata, src/core, src/program
+  knobs: STRATA_VERSION
+  flags: --conversation-cache-disk-mib, --conversation-cache-mib, --conversation-cache-min-free-mib, --conversation-cache-n-min, --conversation-cache-similarity, --conversation-cache-slots, --conversation-cache-spill-dir, --layer-split, --prompt-cache, --serve
+  added lines mention hip/amd 0x vs cuda/nvml 2x

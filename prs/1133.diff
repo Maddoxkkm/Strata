@@ -1,0 +1,1895 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cd60517799..7ca58d9d69 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -467,6 +467,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_test(NAME expert_profile_save_test COMMAND expert_profile_save_test)
+     set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
+   endif()
++  # #796 part C: the advisory VRAM planner - pure arithmetic over injected byte costs, no GPU and no engine
++  # library needed.  Every case asserts WARNINGS, never a refusal.
++  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/vram_plan_test.cpp")
++    enable_testing()
++    add_executable(vram_plan_test tests/core/vram_plan_test.cpp src/prefill/vram_plan.cpp)
++    target_include_directories(vram_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
++    add_test(NAME vram_plan_test COMMAND vram_plan_test)
++    set_tests_properties(vram_plan_test PROPERTIES TIMEOUT 60)
++  endif()
+   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
+     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
+     # synthetic GGUF shards at the real expert dimensions
+@@ -513,7 +522,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
+   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
+   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
+-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
++  # #796 part C: the advisory VRAM planner - pure arithmetic over injected costs, no device code in it.
++  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp
++    src/prefill/vram_plan.cpp)
+   if(STRATA_ENABLE_HIP)
+     # #313: the RDNA3 WMMA GEMMs include hip_runtime.h: AMD builds only (a CUDA build never sees this file)
+     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index eaeadf08d4..f733648fb7 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -1268,6 +1268,21 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
+   93.5% (92.2%); 32K prompt KL 0.020 (0.019), top-1 95.3% (95.0%) - the same band as before. `STRATA_RING_BYTES=0`
+   restores 0.1.39's ring, loan and chunk choice.
+ 
++- **The advisory VRAM plan (#796 part C):** before the expert cache takes what is left of the VRAM, the engine
++  prints what it is about to commit - the free figure, the draft head, the prompt path's predicted mode and cost
++  (owned buffers at the exact `Prefill::bytes_needed_owned` price beside the sizing rule's reservation, or the
++  loan the auto scan is expected to pick), and the predicted cache. It is WARNINGS ONLY: a configuration the
++  arithmetic cannot confirm (a short card, an over-large `--expert-cache`, a chunk no cache can lend) is one
++  `warning:` line with the knobs that make room, and the engine starts anyway - the sizing branches, the loan
++  scan and the existing error paths stay the only authorities. When the runtime later resolves something else
++  than the prediction (a loan that became owned buffers, a bigger chunk), that is reported the same way.
++  `STRATA_ADVISORY_PLAN=0` silences it; `STRATA_POSTTOUCH=1` additionally writes an explicit cache's slots
++  before the free read (the deep WDDM check; it costs the write's time at startup, so it is off by default).
++  Measured on an RTX 4070 Ti SUPER (16 GB), IQ3_XXS, 12K prompt, `--prefill auto`: the plan predicts the
++  8192-token chunk, 2,489-slot loan and the opened 5,539-slot / 8.98 GiB cache exactly, with no warning; with
++  the planner off (`STRATA_ADVISORY_PLAN=0`) the run makes the same decisions at the same speed (2,199 vs 2,194
++  tok/s prefill - run noise).
++
+ The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
+ 
+ ---
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 037385a650..89cb9277d5 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -111,6 +111,23 @@ class Prefill {
+     /// Monitor tab shows the pair the run really got, not what it asked for.
+     static int64_t ring_slots_for(int64_t chunk);
+ 
++    /// The small chunks' staging ring (chunks below stream_all_min_tokens() resolve to it, whatever the budget):
++    /// the constant the advisory planner prices those chunks with.
++    static int64_t ring_stage_slots();
++
++    /// The advisory planner's PURE what-if pricing: the same rules priced at an explicit pinned share, in place
++    /// of the measured global (which the planner must neither set nor wait for the runtime to set).  share < 0.9
++    /// prices the unpinned arm (the 96-slot rule), share >= 0.9 the pinned one; nothing else differs.
++    static int64_t ring_slots_at_share(int64_t chunk, double share);
++    static int64_t ring_default_slots_at(double share);
++    static int64_t ring_max_slots_at(double share);
++    static int64_t ring_cap_for_at(int64_t old_chunk, double share);
++    /// The allocation sequence of `init` counted at an explicit pinned share (`owned_pages`: the 2 MiB pages
++    /// and the one-piece ring, as bytes_needed_owned).  The runtime's bytes_needed/bytes_needed_owned price the
++    /// same way at the measured share.
++    static uint64_t bytes_needed_at_share(const core::ModelGeometry& g, const core::SessionState& ss,
++                                          int64_t chunk, double share, bool owned_pages);
++
+     /// 0.1.39b (#583, the default): the ring as a byte budget, the loan's corrected count and the auto chunk scan that
+     /// keeps the ring full.  STRATA_RING_BYTES=0: 0.1.39's ring, loan and chunk list.
+     static bool ring_bytes_enabled();
+@@ -163,8 +180,6 @@ class Prefill {
+     bool set_stage_helper(Prefill* helper, std::string& err);
+ 
+ private:
+-    static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+-                                      bool owned_pages);
+     // Stage-1 pipeline: intermediate stages return after handing their chunk to
+     // the direct successor. The public run() drains the chain once at prompt end.
+     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+diff --git a/include/strata/prefill/vram_plan.hpp b/include/strata/prefill/vram_plan.hpp
+new file mode 100644
+index 0000000000..61e5a999d0
+--- /dev/null
++++ b/include/strata/prefill/vram_plan.hpp
+@@ -0,0 +1,251 @@
++// include/strata/prefill/vram_plan.hpp - #796 part C: the ADVISORY VRAM planner.
++//
++// Startup used to size the expert cache from `cudaMemGetInfo` and a one-line prefill estimate, and only the first
++// prompt told whether the chunk it had committed to could still be served.  Part A (0.1.40) priced the owned
++// buffers exactly (`Prefill::bytes_needed_owned`) and put the streamed ring in one allocation; part C here says
++// what that arithmetic predicts BEFORE the cache is committed - free VRAM, the reserve, the later allocations,
++// the prompt path's cost, the loan, the cache budget - and warns when a configuration looks short or when the
++// runtime later does something else than the prediction.
++//
++// THIS PLANNER IS ADVISORY ONLY.  It never refuses: a predicted shortfall is a warning with the knobs that make
++// room, a mismatch between the prediction and the runtime is a warning, and the engine's own sizing, its loan
++// scan and its existing error paths stay the only authorities.  `STRATA_ADVISORY_PLAN=0` silences it.  A helper
++// like `check_runtime_prefill_use` returns a mismatch for DIAGNOSTICS; no caller may abort on it.
++//
++// Everything in this header is pure arithmetic over injected byte costs, so the policy is unit-testable without
++// a GPU (tests/core/vram_plan_test.cpp); generate.cpp injects Prefill's real costs.
++#pragma once
++
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace strata::prefill {
++
++/// One environment-flag parser for the planner's knobs, with the usual on/off semantics: unset (or empty) means
++/// `default_on`, a value starting with '0' is OFF, anything else is ON.  STRATA_ADVISORY_PLAN defaults on
++/// (`=0` silences the planner), STRATA_POSTTOUCH defaults off (the deep touch only when asked for).
++inline bool env_enabled(const char* value, bool default_on) {
++    if (value == nullptr || value[0] == '\0') return default_on;
++    return value[0] != '0';
++}
++
++/// Read-only lend surface of one expert cache - the real one (`ExpertCache`, whose slot offsets exist once open)
++/// or a planned layout (offsets built from the profile's per-pair slot sizes).  One definition of "what the
++/// prompt path may borrow" for both.
++struct CacheLendView {
++    int64_t slots = 0;
++    int64_t bytes = 0;
++    const uint64_t* slot_offsets = nullptr;   ///< open_sized's n+1 ascending slot starts; null = uniform slots
++    int64_t max_blob = 0;                     ///< the uniform slot size (the pack's largest blob)
++
++    /// The bytes the cache's last `k` slots hold - the region a prompt borrows (generate.cpp's bytes_from_slots).
++    uint64_t tail_bytes(int64_t k) const {
++        if (k <= 0 || slots <= 0) return 0;
++        if (k > slots) k = slots;
++        if (slot_offsets != nullptr) return (uint64_t) (bytes - (int64_t) slot_offsets[slots - k]);
++        return (uint64_t) k * (uint64_t) max_blob;
++    }
++    /// The smallest slot count whose tail holds `need` (exact over sized offsets, ceil over the uniform blob;
++    /// past the cache's own bytes the sized count stops at `slots`).
++    int64_t slots_for_bytes(uint64_t need) const {
++        if (need == 0) return 0;
++        if (slot_offsets == nullptr) {
++            const int64_t blob = max_blob > 0 ? max_blob : 1;
++            return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
++        }
++        int64_t k = 0;
++        while (k < slots && tail_bytes(k) < need) ++k;
++        return k;
++    }
++};
++
++/// The chunk/lend policy knobs the advisory predictor describes - the same numbers the runtime's loan scan
++/// obeys.  The predictor never sets them; it answers "what would a loan of this cache look like".
++struct LendOpts {
++    int64_t min_keep_slots = 128;   ///< slots a loan must leave outside itself (#496's non-lendable minimum)
++    int64_t lend_pct = 90;          ///< an auto loan takes at most this share of the cache (STRATA_PREFILL_LEND_PCT)
++    int64_t auto_ceiling = 8192;    ///< --prefill auto's largest chunk: max(8192, min(--prefill auto:N, context))
++    int64_t prefill_auto_max = 8192;
++    int64_t max_context = 0;
++    bool ring_bytes = true;         ///< STRATA_RING_BYTES != 0 (0.1.39b's byte-budget ring and scan)
++};
++
++/// The byte costs the predictor prices its candidates with.  At runtime these wrap Prefill's statics (v0.1.40's
++/// exact owned pricing included); the unit tests inject fakes.
++/// `bytes_with_ring(chunk, ring_budget)`: `ring_budget` >= 0 prices a what-if ring of exactly that many slots
++/// (the auto scan's rooms, clamped to at least 16 like the runtime's ring resolution); < 0 prices at the ring
++/// the CURRENT globals resolve to.  `bytes_owned` is the exact owned-prefill price (`bytes_needed_owned` plus a
++/// margin); `bytes_owned_reserved` is what the runtime's cache sizing withholds for owned buffers (the 0.1.39
++/// rule, or the exact price under STRATA_OWNED_PRICE=exact) - the planner reports both.
++struct LendCosts {
++    std::function<uint64_t(int64_t chunk, int64_t ring_budget)> bytes_with_ring;
++    std::function<int64_t(int64_t chunk, int64_t ring_budget)> ring_slots_under;
++    std::function<int64_t(int64_t small_chunk)> ring_cap_for;
++    std::function<int64_t()> ring_default_slots;
++    std::function<uint64_t(int64_t chunk)> bytes_owned;
++    std::function<uint64_t(int64_t chunk)> bytes_owned_reserved;
++};
++
++/// The chunk/loan prediction for one cache: `chunk` 0 = nothing lends.  `ring_budget` >= 0 is what the runtime
++/// would set with `Prefill::set_ring_budget(ring_budget, ring_small_max)` to run the prediction; < 0 leaves the
++/// globals.  Pure: no Prefill global is touched.
++struct LendOutcome {
++    int64_t chunk = 0;
++    int64_t slots = 0;          ///< the loan's slot count
++    int64_t ring_budget = -1;
++    int64_t ring_small_max = 0;
++};
++
++/// The prompt path's chunk and loan against one cache - the policy behind generate.cpp's `plan_lend` (--prefill
++/// auto's bisection over the 256-token grid, 0.1.39's list under STRATA_RING_BYTES=0, a fixed chunk's halving),
++/// mirrored here so the advisory can PREDICT it.  Pure.  `chunk` in/out: auto ignores the incoming value, a
++/// fixed chunk starts halving from it.  This is a DIAGNOSTIC mirror, not the policy: the runtime's scan stays
++/// the only decision maker, and the mirror's job is precisely to be compared against it - a future drift
++/// between the two is the caller's mismatch warning, never a decision of its own.
++LendOutcome plan_lend_chunks(const CacheLendView& cache, const LendOpts& opts, const LendCosts& costs,
++                             bool auto_chunk, int64_t& chunk);
++
++/// The largest chunk on the 256-token grid whose `ok` holds (`ok` monotone in the chunk) - the auto scan's
++/// bisection, shared with the runtime's scans.  log2(ceiling/256) probes at one cost evaluation each.
++int64_t biggest_lend_chunk(int64_t ceiling, const std::function<bool(int64_t)>& ok);
++
++/// The inputs the advisory prices.  `pair_slot_bytes` is the profile's ranked pairs' raw blob sizes (a native
++/// pack's per-layer slots); null or empty keeps uniform `max_blob` slots.
++struct AdvisoryInput {
++    uint64_t free_bytes = 0;            ///< free VRAM at planning time (after weights, session, drafter, head)
++    uint64_t user_reserve_bytes = 0;    ///< --vram-reserve-mib: left free for the driver/desktop, not a Strata budget
++    bool reserve_given = false;         ///< on the command line (#496: the auto adaptation may not shrink it)
++    int64_t small_reserve_mib = 300;    ///< #496's floor for the adapted reserve
++    uint64_t mtp_bytes = 0;             ///< the draft head/logits bound after the cache (mtp.bind_bytes)
++    uint64_t runtime_reserve_bytes = 0; ///< later allocations booked beside the reserve (--pipeline-windows)
++
++    int64_t max_blob = 0;
++    bool sized_slots_wanted = false;    ///< native pack + profile + not --expert-cache-per-layer
++    const std::vector<int64_t>* pair_slot_bytes = nullptr;  ///< raw blob bytes per ranked pair
++    int64_t profile_pairs = -1;         ///< cap on the auto slot count (-1: none)
++    int64_t min_loan_slots = 1;         ///< the smallest working cache the runtime's sizing aims for
++                                        ///  (a 256-token loan + the 128-slot floor when borrowing, else 1)
++
++    bool prefill_borrow = false;        ///< borrowing is possible (an expert profile, not --no-prefill-borrow)
++    bool prefill_auto = false;
++    int64_t prefill_chunk = 0;          ///< the requested explicit chunk (0 = the token path)
++    bool fixed_chunk_halves = false;    ///< serve semantics: the loan scan may run a HALVED fixed chunk (generate
++                                        ///  rejects a halve and keeps the requested chunk on buffers of its own)
++    bool spec_needs_cache = false;      ///< --spec T: the verify windows read the residency graph, so a
++                                        ///  zero-slot cache cannot run the engine the user asked for
++    bool kv_stream_possible = false;    ///< the model can stream KV from RAM (--kv-resident is a suggestion)
++
++    bool explicit_cache = false;        ///< --expert-cache N: the plan describes it instead of sizing it
++    int64_t explicit_cache_slots = -1;
++
++    LendOpts lend;
++    LendCosts costs;
++};
++
++/// One advisory startup picture: the mandatory items, the prompt path's predicted mode and cost, and the expert
++/// residency that is left - what the engine is about to commit, said before it commits.  `warnings` non-empty
++/// means the configuration looks dangerous; NOTHING here stops startup.
++struct VramAdvisory {
++    uint64_t free_at_plan = 0;
++    uint64_t user_reserve_bytes = 0;
++    uint64_t mtp_bytes = 0;
++    uint64_t runtime_reserve_bytes = 0;
++    uint64_t mandatory_bytes = 0;       ///< user reserve + mtp + runtime reserve
++
++    bool prefill_borrow = false;
++    bool prefill_auto = false;
++    bool fixed_chunk_halves = false;    ///< the input's serve/generate semantics, carried for the re-derivation
++    int64_t requested_prefill = 0;
++    int64_t selected_prefill = 0;       ///< the chunk the plan expects to run (0 = the token path)
++    uint64_t prefill_bytes = 0;         ///< owned: the exact allocation; borrowed: the loan's bytes
++    uint64_t prefill_reserved_bytes = 0;///< owned: what the runtime's sizing rule withholds for it
++    bool prefill_owned = false;         ///< the prompt path is expected on its own buffers
++    int64_t lend_slots = 0;             ///< the predicted loan
++    LendOutcome lend;                   ///< the predicted chunk/loan outcome (informational)
++
++    int64_t max_blob = 0;               ///< the uniform slot size the plan was priced with
++
++    uint64_t expert_budget_bytes = 0;   ///< what the cache may take
++    int64_t expert_slots = 0;           ///< the predicted cache (the runtime sizes it on its own)
++    std::vector<int64_t> sized_slots;   ///< the native pack's per-slot byte sizes, hottest pair first
++    std::vector<uint64_t> sized_offsets;///< the predicted open_sized layout (the lend view over it)
++
++    int reserve_adapted_from_mib = 0;   ///< the #496 adaptation the runtime is expected to make (predicted, not made)
++    int64_t short_by_bytes = 0;         ///< > 0: how far the predicted configuration is over the free VRAM
++
++    std::vector<std::string> notes;     ///< every clamp and fallback, printed verbatim by the caller
++    std::vector<std::string> warnings;  ///< predicted shortfalls, too-large caches, expected owned fallbacks
++    std::vector<std::string> suggestions;///< what to lower when a warning stands (smaller --max-context, ...)
++
++    bool has_warning() const { return !warnings.empty(); }
++};
++
++/// The VRAM the predicted cache layout takes: the sized layout's exact bytes when one is predicted (native pack
++/// + profile), the uniform slot count times the blob otherwise.
++uint64_t actual_cache_bytes(const VramAdvisory& p);
++
++/// What must still fit after the cache is committed: the mandatory items (the user reserve, the draft head, the
++/// runtime reserve) plus an owned prompt path at its EXACT price, booked exactly once.  A borrowed prompt path
++/// lives inside the cache and is not part of this.  The advisory's post-open check compares the free read with it.
++uint64_t post_cache_required_bytes(const VramAdvisory& p);
++
++/// The prompt path re-derived against a cache that actually exists (the opened one, after a WDDM shrink): what
++/// the runtime is about to do, predicted from the same policy.  Pure; callers WARN on divergence, never enforce.
++struct EffectivePrefillPlan {
++    bool borrowed = false;
++    bool owned = false;
++    int64_t chunk = 0;          ///< the chunk the runtime is expected to run (an owned auto fallback: at most 1024)
++    int64_t lend_slots = 0;     ///< borrowed: the loan against this cache
++    uint64_t lend_bytes = 0;    ///< borrowed: the loan's bytes
++    uint64_t owned_bytes = 0;   ///< owned: the buffers' exact price
++    LendOutcome lend;           ///< borrowed auto: the outcome the runtime is expected to re-derive
++};
++
++EffectivePrefillPlan revalidate_prefill_after_cache(const VramAdvisory& startup, const CacheLendView& cache,
++                                                    const LendOpts& opts, const LendCosts& costs);
++
++/// The post-open requirement after the re-derivation: the mandatory items plus the re-derived owned buffers,
++/// counted exactly once (a borrowed prompt path lives inside the cache and adds nothing here).
++uint64_t effective_post_cache_required(const VramAdvisory& startup, const EffectivePrefillPlan& effective);
++
++/// The prompt path as the runtime is about to run it, for the diagnostic comparison.
++struct RuntimePrefillUse {
++    bool borrowed = false;
++    int64_t chunk = 0;
++    uint64_t borrow_bytes = 0;  ///< borrowed: the loan's bytes (0 when the caller does not track them)
++};
++
++/// A mismatch between the advisory prediction and the runtime, for the caller's warning line.  `mismatch` is
++/// information, never permission to stop: the runtime may run whatever the engine's own policy chose.
++struct RuntimePlanCheck {
++    bool mismatch = false;
++    const char* why = nullptr;   ///< mismatch: what differs, for the warning
++};
++RuntimePlanCheck check_runtime_prefill_use(const EffectivePrefillPlan& predicted, const RuntimePrefillUse& actual);
++
++/// The post-touch arithmetic for one opened cache: does the free read meet the requirement within the
++/// tolerance, and - informational - how many bytes the cache would have to give up if it does not.  The
++/// tolerance enters twice BY DESIGN (acceptance margin and shrink target, so a borderline cache is not
++/// re-flagged on the next read).  The advisory never drives a shrink; the engine's open-retry loop stays.
++struct PostTouchVerdict {
++    bool accept = false;
++    int64_t give_back_bytes = 0;    ///< !accept: the shortfall the next open would have to make room for
++};
++inline PostTouchVerdict post_touch_verdict(uint64_t free_after_touch, uint64_t required,
++                                           int64_t tolerance_bytes, bool can_shrink_more) {
++    PostTouchVerdict v;
++    const uint64_t tolerance = (uint64_t) (tolerance_bytes > 0 ? tolerance_bytes : 0);
++    v.accept = free_after_touch + tolerance >= required;
++    if (!v.accept)
++        v.give_back_bytes =
++            can_shrink_more ? (int64_t) (required - free_after_touch + tolerance) : 0;
++    return v;
++}
++
++/// The advisory startup plan: the prompt path's exact requirement said before the expert cache is committed,
++/// borrowing never booked twice, and a predicted shortfall WARNED, never refused.
++VramAdvisory advise_startup_vram(const AdvisoryInput& in);
++
++}  // namespace strata::prefill
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 7b53ac9a4a..eb96c1bb11 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -163,10 +163,11 @@ inline int ring_cap() { return fused_ring() && !strata::kernels::cpu::expert_lay
+ // The ring's budget in bytes: the measured slot counts above, at the blob size they were measured with.  It is
+ // bytes and not slots because a slot is one whole blob and the blob is the pack's - see the note above.
+ inline constexpr uint64_t Q2_0_BLOB = 1382400ull;   // the blob of the pack the ring was tuned on
+-inline uint64_t ring_bytes() {
++inline uint64_t ring_bytes_at_share(double share) {
+     const uint64_t slots = fused_ring() ? 1024ull : 384ull;   // #136: a fused ring holds two layers' experts
+-    return (g_pinned_share >= 0.9 ? slots : slots / 4) * Q2_0_BLOB;
++    return (share >= 0.9 ? slots : slots / 4) * Q2_0_BLOB;
+ }
++inline uint64_t ring_bytes() { return ring_bytes_at_share(g_pinned_share); }
+ // ...and what that buys on THIS pack, never past ring_cap(): the slot count `init` lays out, and what the auto
+ // chunk scan treats as a full ring.  A pack whose blobs are larger than Q2_0's gets fewer slots for the same
+ // bytes, which is the point - the ring competes with the expert cache for the same VRAM.
+@@ -178,13 +179,14 @@ inline bool ring_bytes_on() {
+     static const bool on = [] { const char* v = std::getenv("STRATA_RING_BYTES"); return v == nullptr || v[0] != '0'; }();
+     return on;
+ }
+-inline int ring_budget_slots() {
++inline int ring_budget_slots_for_share(double share) {
+     const int64_t per = MAXBLOB();
+-    const int64_t n = per > 0 ? (int64_t) (ring_bytes() / (uint64_t) per) : 0;
++    const int64_t n = per > 0 ? (int64_t) (ring_bytes_at_share(share) / (uint64_t) per) : 0;
+     const int cap = ring_cap();
+     return (int) (n <= 0 ? 0 : (n > cap ? cap : n));
+ }
+-inline int ring_slots(size_t T) {
++inline int ring_budget_slots() { return ring_budget_slots_for_share(g_pinned_share); }
++inline int ring_slots_for_share(size_t T, double share) {
+     const char* v = std::getenv("STRATA_PREFILL_RING");
+ #if defined(STRATA_USE_HIP)
+     // S6: with the opt-in RDNA4 matrix-core attention (STRATA_HIP_WMMA=1) a 96-slot ring: measured with it, 9070 XT
+@@ -200,13 +202,14 @@ inline int ring_slots(size_t T) {
+     // is not what is competing for VRAM.
+     // 0.1.39's ring (1024 fused / 384 pinned, 96 when a large share goes through host copies), and the #583 byte
+     // budget the auto scan chose for chunks past the size 0.1.39's rule would have picked (set_ring_budget)
+-    const int pinned_ring = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
++    const int pinned_ring = share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
+     const bool budget = ring_bytes_on() && g_ring_budget > 0 && (int64_t) T > g_ring_small_max;
+     const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : budget ? g_ring_budget : pinned_ring;
+     if (v && r == STAGE) return STAGE; // Explicit opt-in to routed-only staging, including large chunks.
+     const int big = r < 16 ? 16 : r > ring_cap() ? ring_cap() : r;
+     return (int64_t) T >= stream_all_min() ? big : STAGE;
+ }
++inline int ring_slots(size_t T) { return ring_slots_for_share(T, g_pinned_share); }
+ constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
+ // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
+ // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
+@@ -1474,18 +1477,20 @@ double Prefill::pinned_share() { return g_pinned_share; }
+ int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
+ 
+ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+-    return bytes_needed_impl(g, ss, chunk, false);
++    return bytes_needed_at_share(g, ss, chunk, g_pinned_share, false);
+ }
+ 
+ // What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
+ // page, and the ring is one allocation (carve).  `bytes_needed` stays the borrowed region's sum.
+ uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+-    return bytes_needed_impl(g, ss, chunk, true);
++    return bytes_needed_at_share(g, ss, chunk, g_pinned_share, true);
+ }
+ 
+-uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+-                                    bool owned_pages) {
+-    // the same allocation sequence as `init`, counted
++uint64_t Prefill::bytes_needed_at_share(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
++                                        double share, bool owned_pages) {
++    // the same allocation sequence as `init`, counted - at `share`, the pinned share the pricing assumes (the
++    // runtime prices at the measured global; the advisory planner passes its own measured figure and touches
++    // nothing)
+     const size_t T = (size_t) chunk;
+     bool ok = true;
+     Alloc o;
+@@ -1527,10 +1532,11 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
+         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+     }
++    const int ring = ring_slots_for_share(T, share);
+     if (owned_pages) {
+-        if (ring_slots(T) > 0) o.take<uint8_t>((size_t) ring_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
++        if (ring > 0) o.take<uint8_t>((size_t) ring * (size_t) MAXBLOB(), ok);   // one allocation
+     } else {
+-        for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
++        for (int i = 0; i < ring; ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
+     }
+     f(T * N);
+     f((size_t) strata::kernels::NG_HC_DIM);
+@@ -1543,27 +1549,39 @@ uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core:
+     return bytes_needed(g, ss, chunk) - (uint64_t) ring_slots((size_t) chunk) * (uint64_t) MAXBLOB();
+ }
+ 
+-int64_t Prefill::ring_default_slots() {
+-    const int r = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
++int64_t Prefill::ring_default_slots_at(double share) {
++    const int r = share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
+     return (int64_t) std::min(r, ring_cap());
+ }
+ 
+-int64_t Prefill::ring_cap_for(int64_t old_chunk) {
++int64_t Prefill::ring_default_slots() { return ring_default_slots_at(g_pinned_share); }
++
++int64_t Prefill::ring_cap_for_at(int64_t old_chunk, double share) {
+     // 0.1.39b (#583, measured on the RTX 5070): giving up ring slots for a bigger chunk paid where 0.1.39's ring held
+     // the chunk at 4096 or less (IQ3_XXS 32K prompts +14% to +26%: 4096/384 -> 6656/56) and lost where 0.1.39 already
+     // read 6144-token chunks (the Coder: 6144/384 -> 7936/199, 32K -12%).  From kKeepRingChunk on the ring keeps its
+     // 0.1.39 size and the scan only looks for a bigger chunk next to it (IQ3_XXS unpinned 6144/96 -> 6912/96: +9%).
+     constexpr int64_t kKeepRingChunk = 6144;
+-    return old_chunk >= kKeepRingChunk ? ring_default_slots() : ring_max_slots();
++    return old_chunk >= kKeepRingChunk ? ring_default_slots_at(share) : ring_max_slots_at(share);
+ }
+ 
++int64_t Prefill::ring_cap_for(int64_t old_chunk) { return ring_cap_for_at(old_chunk, g_pinned_share); }
++
+ // the unpinned arm keeps its measured 96 (the PR's rule; the byte budget would have been ~49 slots on IQ3_S)
+-int64_t Prefill::ring_max_slots() {
+-    return g_pinned_share >= 0.9 ? (int64_t) ring_budget_slots() : (int64_t) std::min(96, ring_cap());
++int64_t Prefill::ring_max_slots_at(double share) {
++    return share >= 0.9 ? (int64_t) ring_budget_slots_for_share(share) : (int64_t) std::min(96, ring_cap());
+ }
+ 
++int64_t Prefill::ring_max_slots() { return ring_max_slots_at(g_pinned_share); }
++
+ int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
+ 
++int64_t Prefill::ring_slots_at_share(int64_t chunk, double share) {
++    return ring_slots_for_share((size_t) chunk, share);
++}
++
++int64_t Prefill::ring_stage_slots() { return STAGE; }
++
+ bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
+ 
+ namespace {
+diff --git a/src/prefill/vram_plan.cpp b/src/prefill/vram_plan.cpp
+new file mode 100644
+index 0000000000..329c85b1e5
+--- /dev/null
++++ b/src/prefill/vram_plan.cpp
+@@ -0,0 +1,469 @@
++// src/prefill/vram_plan.cpp - #796 part C: the ADVISORY startup VRAM plan and the shared chunk/loan predictor.
++//
++// `plan_lend_chunks` mirrors generate.cpp's `plan_lend` (the same 0.1.39 list, the same #583 bisection and ring
++// what-ifs, the same fixed-chunk halving) so the advisory can say what the runtime's loan scan will pick; the
++// runtime's scan stays the only decision maker, and a drift between the two shows up as the caller's mismatch
++// warning.  `advise_startup_vram` prices the prompt path with v0.1.40's exact owned pricing BEFORE the cache is
++// committed and warns about shortfalls - it never refuses and never sets an allocation.
++
++#include "strata/prefill/vram_plan.hpp"
++
++#include <algorithm>
++#include <utility>
++
++namespace strata::prefill {
++namespace {
++
++// 0.1.39's auto chunk list (also the size up to which a prompt keeps that ring under #583)
++constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
++constexpr int64_t kRingMin = 16;   // the second scan's floor, when no chunk affords a full ring
++
++// the bytes for `chunk` with no ring counted: bytes_needed's ring term is exactly additive, so pricing at any
++// budget and subtracting that budget's slots is budget-invariant
++uint64_t no_ring_bytes(const CacheLendView& cache, const LendCosts& costs, int64_t chunk) {
++    const int64_t blob = cache.max_blob > 0 ? cache.max_blob : 1;
++    return costs.bytes_with_ring(chunk, 0) - (uint64_t) costs.ring_slots_under(chunk, 0) * (uint64_t) blob;
++}
++
++}  // namespace
++
++// the largest chunk on the 256-token grid whose `ok` holds; `ok` is monotone in the chunk
++int64_t biggest_lend_chunk(int64_t ceiling, const std::function<bool(int64_t)>& ok) {
++    if (ceiling < 256) return 0;
++    int64_t lo = 1, hi = ceiling / 256, best = 0;   // n = T / 256
++    while (lo <= hi) {
++        const int64_t mid = lo + (hi - lo) / 2;
++        if (ok(mid * 256)) { best = mid * 256; lo = mid + 1; } else hi = mid - 1;
++    }
++    return best;
++}
++
++LendOutcome plan_lend_chunks(const CacheLendView& cache, const LendOpts& opts, const LendCosts& costs,
++                             bool auto_chunk, int64_t& chunk) {
++    auto fits = [&](int64_t k, bool pct) {
++        return k + opts.min_keep_slots <= cache.slots && (!pct || k * 100 <= opts.lend_pct * cache.slots);
++    };
++    // 0.1.39's list, priced at the pinned-default ring (the runtime sets set_ring_budget(0, 0) first)
++    auto old_rule = [&]() -> LendOutcome {
++        for (const int64_t c : kAutoChunks) {
++            // above 8192: only when asked for, and only when a prompt of the context can use it
++            if (c > 8192 && (c > opts.prefill_auto_max || c > opts.max_context)) continue;
++            const int64_t k = cache.slots_for_bytes(costs.bytes_with_ring(c, -1));
++            if (fits(k, true)) return {c, k, 0, 0};
++        }
++        return {0, 0, 0, 0};
++    };
++    if (auto_chunk && !opts.ring_bytes) return old_rule();   // STRATA_RING_BYTES=0: 0.1.39's list
++    if (auto_chunk) {   // the default since 0.1.39b (#583): the ring and the chunk are one byte budget
++        const LendOutcome small = old_rule();
++        const int64_t ring_max = costs.ring_cap_for(small.chunk);
++        const int64_t budget_slots = std::min(cache.slots - opts.min_keep_slots, opts.lend_pct * cache.slots / 100);
++        const uint64_t avail = cache.tail_bytes(budget_slots);
++        auto room_of = [&](int64_t t) -> int64_t {
++            const uint64_t nonring = no_ring_bytes(cache, costs, t);
++            const int64_t blob = cache.max_blob > 0 ? cache.max_blob : 1;
++            return std::min((int64_t) ((avail - std::min(avail, nonring)) / (uint64_t) blob), ring_max);
++        };
++        // `room_of` is capped at ring_max, so "the ring is full" is exactly room == ring_max, and both that test
++        // and the ones below it only get harder as t grows - the bisection stays valid
++        auto scan = [&](int64_t floor) -> int64_t {
++            return biggest_lend_chunk(opts.auto_ceiling, [&](int64_t t) -> bool {
++                const int64_t room = room_of(t);
++                if (room < floor) return false;
++                const int64_t k = cache.slots_for_bytes(costs.bytes_with_ring(t, std::max<int64_t>(room, kRingMin)));
++                return fits(k, true);
++            });
++        };
++        int64_t c = scan(ring_max);
++        if (c == 0 && ring_max < costs.ring_default_slots()) c = scan(kRingMin);
++        if (small.chunk >= c) {   // the scan bought nothing: 0.1.39's choice
++            if (small.chunk > 0)
++                return {small.chunk, cache.slots_for_bytes(costs.bytes_with_ring(small.chunk, -1)), 0, 0};
++            return {0, 0, 0, 0};
++        }
++        return {c, cache.slots_for_bytes(costs.bytes_with_ring(c, room_of(c))), room_of(c), small.chunk};
++    }
++    for (int64_t c = chunk; c >= 256; c /= 2) {   // a fixed chunk halves until its loan fits
++        const int64_t k = cache.slots_for_bytes(costs.bytes_with_ring(c, -1));
++        if (fits(k, false)) { chunk = c; return {c, k, -1, 0}; }
++    }
++    chunk = 0;
++    return {0, 0, -1, 0};
++}
++
++namespace {
++
++/// the lend view over a predicted layout (offsets like ExpertCache::open_sized's), written into `offs`
++CacheLendView planned_view(int64_t slots, const std::vector<int64_t>& sized, int64_t max_blob,
++                           std::vector<uint64_t>& offs) {
++    CacheLendView v;
++    v.slots = slots;
++    v.max_blob = max_blob;
++    if (!sized.empty()) {
++        offs.assign(sized.size() + 1, 0);
++        for (size_t i = 0; i < sized.size(); ++i)
++            offs[(size_t) i + 1] = offs[i] + (uint64_t) ((sized[i] + 255) / 256 * 256);
++        v.bytes = (int64_t) offs.back();
++        v.slot_offsets = offs.data();
++    } else {
++        v.bytes = slots * max_blob;
++        v.slot_offsets = nullptr;
++    }
++    return v;
++}
++
++}  // namespace
++
++uint64_t actual_cache_bytes(const VramAdvisory& p) {
++    if (!p.sized_offsets.empty()) return p.sized_offsets.back();
++    return (uint64_t) (p.expert_slots > 0 ? p.expert_slots : 0) * (uint64_t) (p.max_blob > 0 ? p.max_blob : 0);
++}
++
++uint64_t post_cache_required_bytes(const VramAdvisory& p) {
++    return p.mandatory_bytes + (p.prefill_owned ? p.prefill_bytes : 0);
++}
++
++VramAdvisory advise_startup_vram(const AdvisoryInput& in) {
++    VramAdvisory p;
++    p.free_at_plan = in.free_bytes;
++    p.user_reserve_bytes = in.user_reserve_bytes;
++    p.mtp_bytes = in.mtp_bytes;
++    p.runtime_reserve_bytes = in.runtime_reserve_bytes;
++    p.mandatory_bytes = in.user_reserve_bytes + in.mtp_bytes + in.runtime_reserve_bytes;
++    p.prefill_borrow = in.prefill_borrow;
++    p.prefill_auto = in.prefill_auto;
++    p.fixed_chunk_halves = in.fixed_chunk_halves;
++    p.requested_prefill = in.prefill_chunk;
++    p.max_blob = in.max_blob;
++
++    const int64_t blob = in.max_blob > 0 ? in.max_blob : 1;
++    const bool prefill_on = in.prefill_auto || in.prefill_chunk > 0;
++    const int64_t keep = in.lend.min_keep_slots;
++
++    // The prompt path, said before the cache is committed.  Owned buffers are priced EXACTLY (v0.1.40's
++    // bytes_needed_owned plus the allocator margin the caller folds into bytes_owned); what the runtime's sizing
++    // rule withholds for them is reported beside it, because the cache is sized from the rule, not the truth.
++    const auto owned_exact = [&](int64_t c) -> uint64_t { return in.costs.bytes_owned(c); };
++    const auto owned_reserved = [&](int64_t c) -> uint64_t { return in.costs.bytes_owned_reserved(c); };
++    const auto warn_short = [&](uint64_t need, const char* what) {
++        if (in.free_bytes >= need) return;
++        p.short_by_bytes = (int64_t) (need - in.free_bytes);
++        p.warnings.push_back(std::string("the advisory VRAM plan predicts this configuration is short by ") +
++                             std::to_string((p.short_by_bytes + (1 << 20) - 1) >> 20) + " MiB (" + what + ")");
++        if (in.kv_stream_possible)
++            p.suggestions.push_back("stream more KV from RAM (--kv-resident, e.g. 32768)");
++        p.suggestions.push_back("a smaller --max-context");
++        p.suggestions.push_back("a smaller --kv");
++        if (prefill_on && !p.prefill_owned) p.suggestions.push_back("a smaller --prefill");
++        p.suggestions.push_back("a smaller --vram-reserve-mib");
++    };
++
++    // the elastic consumer: everything after the mandatory items (and, when the prompt path owns its buffers,
++    // what the sizing rule withholds for them) is expert residency
++    const auto cache_budget_of = [&]() -> uint64_t {
++        const uint64_t reserved = p.prefill_owned && p.selected_prefill > 0 ? owned_reserved(p.selected_prefill) : 0;
++        const uint64_t taken = p.mandatory_bytes + reserved;
++        return in.free_bytes > taken ? in.free_bytes - taken : 0;
++    };
++
++    uint64_t cache_budget = 0;
++    int64_t slots = 0;
++    std::vector<int64_t> sized;
++
++    // the predicted cache layout: at most `n` uniform slots under `cap` bytes; the native pack's per-pair sizes
++    // (the profile's hottest pairs first, each slot one whole aligned blob - the layout open_sized() will get)
++    // where they are wanted.  A PREDICTION of the runtime's walk, not a decision.
++    auto build_layout = [&](int64_t n, uint64_t cap) {
++        std::vector<int64_t> out;
++        if (in.sized_slots_wanted && in.pair_slot_bytes != nullptr) {
++            cap = std::min<uint64_t>(cap, (uint64_t) n * (uint64_t) blob);
++            uint64_t used = 0;
++            for (const int64_t b : *in.pair_slot_bytes) {
++                const uint64_t rb = (uint64_t) ((b + 255) / 256 * 256);
++                if (used + rb > cap) break;
++                used += rb;
++                out.push_back(b);
++            }
++        }
++        return std::make_pair(out.empty() ? n : (int64_t) out.size(), std::move(out));
++    };
++
++    // The owned reservation exists ONLY where the runtime's sizing makes it: with borrowing possible the sizing
++    // withholds nothing (it expects a loan), so a lend that fails lands its buffers ON TOP of the cache - the
++    // advisory says so instead of pretending the reservation away.
++    if (prefill_on && !in.prefill_auto && !in.prefill_borrow) {
++        p.selected_prefill = in.prefill_chunk;
++        p.prefill_owned = true;
++        p.prefill_bytes = owned_exact(in.prefill_chunk);
++        p.prefill_reserved_bytes = owned_reserved(in.prefill_chunk);
++        if (p.prefill_reserved_bytes < p.prefill_bytes)
++            p.notes.push_back("the prompt path's own buffers for a " + std::to_string(in.prefill_chunk) +
++                              "-token chunk price at " + std::to_string(p.prefill_bytes >> 20) +
++                              " MiB exact, where the sizing rule withholds " +
++                              std::to_string(p.prefill_reserved_bytes >> 20) + " MiB");
++    }
++    cache_budget = cache_budget_of();
++
++    // the #496 adaptation the runtime is expected to make (it makes it itself; predicted here so the table is
++    // the truth): a default reserve that leaves less than the minimum working cache shrinks to what leaves
++    // exactly that, down to small_reserve_mib.  A reserve given on the command line is kept, and so is an
++    // explicit cache (the operator's decision).
++    if (!in.explicit_cache && !in.reserve_given &&
++        in.user_reserve_bytes > (uint64_t) in.small_reserve_mib << 20) {
++        slots = (int64_t) (cache_budget / (uint64_t) blob);
++        if (in.profile_pairs >= 0) slots = std::min<int64_t>(slots, in.profile_pairs);
++        if (slots < in.min_loan_slots) {
++            const uint64_t fixed = p.mandatory_bytes - in.user_reserve_bytes;
++            const int64_t fit_mib =
++                ((int64_t) (in.free_bytes - fixed) - in.min_loan_slots * blob) / (1 << 20) -
++                (int64_t) (p.prefill_owned && p.selected_prefill > 0 ? owned_reserved(p.selected_prefill) >> 20 : 0);
++            if (fit_mib >= in.small_reserve_mib) {
++                const int64_t r = std::min<int64_t>(fit_mib, (int64_t) (in.user_reserve_bytes >> 20));
++                p.reserve_adapted_from_mib = (int64_t) (in.user_reserve_bytes >> 20);
++                p.notes.push_back("the runtime is expected to lower the " + std::to_string(p.reserve_adapted_from_mib) +
++                                  " MiB reserve to " + std::to_string(r) + " MiB (a working cache needs " +
++                                  std::to_string(in.min_loan_slots) + " slots)");
++                const uint64_t reserve2 = (uint64_t) r << 20;
++                p.user_reserve_bytes = reserve2;
++                p.mandatory_bytes = fixed + reserve2;
++                cache_budget = cache_budget_of();
++            }
++        }
++    }
++
++    if (in.explicit_cache) {
++        slots = in.explicit_cache_slots;
++        if (prefill_on && in.prefill_borrow) {
++            // the lend decision over the cache the operator asked for (its layout, capped by the room past the
++            // reserve - the walk the sizing makes for a native pack)
++            std::vector<uint64_t> offs;
++            const uint64_t room = in.free_bytes > in.user_reserve_bytes + in.runtime_reserve_bytes
++                                      ? in.free_bytes - in.user_reserve_bytes - in.runtime_reserve_bytes : 0;
++            auto [se, sizede] = build_layout(slots, room);
++            slots = se;
++            sized = std::move(sizede);
++            const CacheLendView v = planned_view(slots, sized, blob, offs);
++            uint64_t cache_bytes_local = (uint64_t) v.slots * (uint64_t) blob;
++            if (!sized.empty()) {
++                cache_bytes_local = 0;
++                for (const int64_t s : sized) cache_bytes_local += (uint64_t) ((s + 255) / 256 * 256);
++            }
++            if (in.prefill_auto || in.fixed_chunk_halves) {
++                int64_t chunk_in = in.prefill_chunk;
++                p.lend = plan_lend_chunks(v, in.lend, in.costs, in.prefill_auto, chunk_in);
++            } else {
++                // generate semantics: the requested chunk is lent EXACTLY or not at all
++                const int64_t k = v.slots_for_bytes(in.costs.bytes_with_ring(in.prefill_chunk, -1));
++                if (k + keep <= v.slots) p.lend = {in.prefill_chunk, k, -1, 0};
++            }
++            if (p.lend.chunk > 0) {
++                p.prefill_bytes = v.tail_bytes(p.lend.slots);
++                p.lend_slots = p.lend.slots;
++                p.selected_prefill = p.lend.chunk;
++                if (in.prefill_auto)
++                    p.notes.push_back("prefill auto: the loan scan is expected to pick " +
++                                      std::to_string(p.lend.chunk) + " tokens (" + std::to_string(p.lend_slots) +
++                                      " cache slots) from the --expert-cache " +
++                                      std::to_string(in.explicit_cache_slots) + "-slot cache");
++            } else {
++                // the sizing withholds nothing when borrowing is possible: the owned buffers land beside the
++                // cache the operator asked for - said now, not at init
++                p.prefill_owned = true;
++                p.selected_prefill = in.prefill_auto ? 1024 : in.prefill_chunk;
++                p.prefill_bytes = owned_exact(p.selected_prefill);
++                p.notes.push_back("the expert cache (" + std::to_string(v.slots) + " slots) cannot lend the prompt "
++                                  "path's buffers; the prompt path is expected on buffers of its own (" +
++                                  std::to_string(p.selected_prefill) + "-token chunk)");
++                p.warnings.push_back("the advisory VRAM plan expects the prompt path on its own buffers: the "
++                                     "--expert-cache " + std::to_string(in.explicit_cache_slots) + "-slot cache "
++                                     "cannot lend " + std::string(in.prefill_auto ? "a chunk's loan" : "a " +
++                                                                         std::to_string(in.prefill_chunk) +
++                                                                         "-token chunk"));
++                warn_short(p.mandatory_bytes + p.prefill_bytes + cache_bytes_local,
++                           "the prompt path's own buffers beside the explicit cache");
++            }
++        }
++        // too large beside the mandatory items and the owned buffers?
++        const uint64_t reserved = p.prefill_owned && p.selected_prefill > 0 ? owned_reserved(p.selected_prefill) : 0;
++        const uint64_t cache_bytes = (uint64_t) slots * (uint64_t) blob;   // the sizing rule's uniform price
++        if ((uint64_t) slots > 0 && in.free_bytes < p.mandatory_bytes + reserved + cache_bytes) {
++            const uint64_t room = in.free_bytes > p.mandatory_bytes + reserved ? in.free_bytes - p.mandatory_bytes - reserved : 0;
++            const int64_t fit = (int64_t) (room / (uint64_t) blob);
++            p.warnings.push_back("the advisory VRAM plan reads --expert-cache " + std::to_string(in.explicit_cache_slots) +
++                                 " as too large: " + std::to_string(std::max<int64_t>(fit, 0)) +
++                                 " slots fit beside the reserve" +
++                                 std::string(p.prefill_owned ? " and the prompt path's own buffers" : ""));
++        }
++    } else if (prefill_on && in.prefill_borrow) {
++        // the auto sizing's cache, predicted: everything the mandatory items leave, capped by the profile
++        slots = (int64_t) (cache_budget / (uint64_t) blob);
++        if (in.profile_pairs >= 0) slots = std::min<int64_t>(slots, in.profile_pairs);
++        std::vector<uint64_t> offs;
++        auto [s0, sized0] = build_layout(slots, cache_budget);
++        slots = s0;
++        sized = std::move(sized0);
++        const CacheLendView v0 = planned_view(slots, sized, blob, offs);
++        int64_t chunk_in = in.prefill_chunk;   // auto ignores it; a fixed chunk starts halving from it
++        if (in.prefill_auto || in.fixed_chunk_halves) {
++            p.lend = plan_lend_chunks(v0, in.lend, in.costs, in.prefill_auto, chunk_in);
++        } else {
++            // generate semantics: the requested chunk is lent EXACTLY or not at all - a halve is discarded and
++            // the requested chunk runs on buffers of its own
++            const int64_t k = v0.slots_for_bytes(in.costs.bytes_with_ring(in.prefill_chunk, -1));
++            if (k + keep <= v0.slots) p.lend = {in.prefill_chunk, k, -1, 0};
++        }
++        if (p.lend.chunk > 0) {
++            p.prefill_owned = false;
++            p.lend_slots = p.lend.slots;
++            p.prefill_bytes = v0.tail_bytes(p.lend.slots);
++            p.selected_prefill = p.lend.chunk;
++            if (in.prefill_auto)
++                p.notes.push_back("prefill auto: the loan scan is expected to pick " + std::to_string(p.lend.chunk) +
++                                  " tokens (" + std::to_string(p.lend_slots) + " cache slots)");
++        } else {
++            // no loan affords: the runtime's fallback - auto at its 1024 bound, a fixed chunk at its own size -
++            // lands its buffers on top of a cache the sizing booked no reservation for (it expected a loan)
++            p.prefill_owned = true;
++            p.selected_prefill = in.prefill_auto ? 1024 : in.prefill_chunk;
++            p.prefill_bytes = owned_exact(p.selected_prefill);
++            p.notes.push_back(std::string("no cache can lend even a 256-token chunk's buffers; the prompt path is "
++                                          "expected on its own buffers for a ") +
++                              std::to_string(p.selected_prefill) + "-token chunk");
++            p.warnings.push_back("the advisory VRAM plan expects the prompt path on its own buffers (no cache can "
++                                 "lend a loan): " + std::to_string(p.prefill_bytes >> 20) + " MiB on top of a " +
++                                 std::to_string(slots) + "-slot cache");
++            warn_short(p.mandatory_bytes + p.prefill_bytes + (uint64_t) slots * (uint64_t) blob,
++                       "the prompt path's own buffers on top of the cache the sizing booked no room for");
++        }
++    } else if (prefill_on) {
++        // no borrowing (no profile, or --no-prefill-borrow): an owned chunk is a real allocation, and
++        // --prefill auto without a profile stays the runtime's no-op (it needs the profile to lend from)
++        if (in.prefill_auto)
++            p.notes.push_back("prefill auto needs an expert profile to lend from (none is loaded); the token path "
++                              "reads the prompt");
++    }
++
++    // the final predicted layout
++    p.expert_budget_bytes = cache_budget;
++    p.expert_slots = slots < 0 ? 0 : slots;
++    if (!sized.empty()) {
++        p.sized_slots = std::move(sized);
++        p.sized_offsets.assign(p.sized_slots.size() + 1, 0);
++        for (size_t i = 0; i < p.sized_slots.size(); ++i)
++            p.sized_offsets[(size_t) i + 1] =
++                p.sized_offsets[i] + (uint64_t) ((p.sized_slots[i] + 255) / 256 * 256);
++    }
++
++    // THE advisory check, in one place, over the predicted layout: the mandatory items, an owned prompt path at
++    // its exact price, and the cache inside the VRAM the plan saw.  Over the line: a warning with the knobs.
++    const uint64_t need_final = post_cache_required_bytes(p) + actual_cache_bytes(p);
++    if (need_final > in.free_bytes && p.short_by_bytes == 0) {
++        p.short_by_bytes = (int64_t) (need_final - in.free_bytes);
++        p.warnings.push_back("the advisory VRAM plan predicts this configuration is short by " +
++                             std::to_string((p.short_by_bytes + (1 << 20) - 1) >> 20) + " MiB (the " +
++                             std::to_string(p.expert_slots) + "-slot expert cache" +
++                             (p.prefill_owned ? ", the prompt path's own buffers" : "") + " and the reserve together)");
++        if (in.kv_stream_possible)
++            p.suggestions.push_back("stream more KV from RAM (--kv-resident, e.g. 32768)");
++        p.suggestions.push_back("a smaller --max-context");
++        p.suggestions.push_back("a smaller --kv");
++        p.suggestions.push_back("a smaller --prefill");
++        p.suggestions.push_back("a smaller --vram-reserve-mib");
++    }
++
++    // what the prediction must still answer for: a zero-slot cache with the prompt path on it, or with --spec
++    if (p.expert_slots <= 0 && prefill_on && in.prefill_borrow && p.lend_slots <= 0 && !p.prefill_owned)
++        p.warnings.push_back("the advisory VRAM plan predicts no expert-cache slot at all for a prompt path that "
++                             "expects to borrow one");
++    if (p.expert_slots <= 0 && in.spec_needs_cache)
++        p.warnings.push_back("the advisory VRAM plan predicts no expert-cache slot, and --spec needs one (the "
++                             "verify window cannot start)");
++
++    return p;
++}
++
++EffectivePrefillPlan revalidate_prefill_after_cache(const VramAdvisory& startup, const CacheLendView& cache,
++                                                    const LendOpts& opts, const LendCosts& costs) {
++    EffectivePrefillPlan e;
++    if (startup.prefill_owned) {   // an owned prediction stays owned; the cache cannot take its room back
++        e.owned = true;
++        e.chunk = startup.selected_prefill;
++        e.owned_bytes = startup.selected_prefill > 0 ? costs.bytes_owned(startup.selected_prefill) : 0;
++        return e;
++    }
++    if (startup.prefill_auto) {
++        // the same policy the prediction used, against the cache that actually exists now
++        int64_t ignored = 0;
++        e.lend = plan_lend_chunks(cache, opts, costs, true, ignored);
++        if (e.lend.chunk > 0) {
++            e.borrowed = true;
++            e.chunk = e.lend.chunk;
++            e.lend_slots = e.lend.slots;
++            e.lend_bytes = cache.tail_bytes(e.lend.slots);
++        } else {
++            e.owned = true;          // the runtime's fallback: an owned path at request_chunk's 1024 bound
++            e.chunk = 1024;
++            e.owned_bytes = costs.bytes_owned(1024);
++        }
++        return e;
++    }
++    if (startup.selected_prefill <= 0) return e;   // the token path: nothing to re-derive
++    if (startup.fixed_chunk_halves) {
++        // serve semantics: the loan scan may run a halved fixed chunk
++        int64_t chunk = startup.selected_prefill;
++        e.lend = plan_lend_chunks(cache, opts, costs, false, chunk);
++        if (e.lend.chunk > 0) {
++            e.borrowed = true;
++            e.chunk = e.lend.chunk;
++            e.lend_slots = e.lend.slots;
++            e.lend_bytes = cache.tail_bytes(e.lend.slots);
++        } else {
++            e.owned = true;
++            e.chunk = startup.selected_prefill;
++            e.owned_bytes = costs.bytes_owned(e.chunk);
++        }
++        return e;
++    }
++    // generate semantics: a fixed chunk must lend EXACTLY - the runtime rejects a halved chunk (k = 0) and
++    // allocates its own buffers at the original size, so a smaller chunk the halving would find is not a loan here
++    const int64_t k = cache.slots_for_bytes(costs.bytes_with_ring(startup.selected_prefill, -1));
++    if (k + opts.min_keep_slots <= cache.slots) {
++        e.borrowed = true;
++        e.chunk = startup.selected_prefill;
++        e.lend_slots = k;
++        e.lend_bytes = cache.tail_bytes(k);
++    } else {
++        e.owned = true;
++        e.chunk = startup.selected_prefill;
++        e.owned_bytes = costs.bytes_owned(startup.selected_prefill);
++    }
++    return e;
++}
++
++uint64_t effective_post_cache_required(const VramAdvisory& startup, const EffectivePrefillPlan& effective) {
++    return startup.mandatory_bytes + (effective.owned ? effective.owned_bytes : 0);
++}
++
++RuntimePlanCheck check_runtime_prefill_use(const EffectivePrefillPlan& predicted, const RuntimePrefillUse& actual) {    RuntimePlanCheck c;
++    if (predicted.borrowed) {
++        if (!actual.borrowed)
++            c.why = "the advisory VRAM plan expected the prompt path to borrow from the expert cache, but the "
++                    "runtime is on buffers of its own";
++        else if (actual.chunk > predicted.chunk)
++            c.why = "the runtime's loan is larger than the predicted chunk";
++        else if (predicted.lend_bytes > 0 && actual.borrow_bytes > predicted.lend_bytes)
++            c.why = "the runtime's loan is larger than the predicted loan bytes";
++    } else if (predicted.owned) {
++        if (actual.borrowed)
++            c.why = "the advisory VRAM plan expected the prompt path on its own buffers, but the runtime set up "
++                    "a loan";
++        else if (actual.chunk > predicted.chunk)
++            c.why = "the runtime's owned prompt buffers are larger than the predicted chunk";
++    } else if (actual.chunk > 0) {
++        c.why = "the advisory VRAM plan expected no prompt path; the runtime is running one";
++    }
++    c.mismatch = c.why != nullptr;
++    return c;
++}
++
++}  // namespace strata::prefill
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3b551f3aaf..a1d0e4c438 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -55,6 +55,7 @@
+ #include "strata/core/verify.hpp"
+ #include "strata/core/mtp.hpp"
+ #include "strata/prefill/prefill.hpp"
++#include "strata/prefill/vram_plan.hpp"
+ #include "strata/core/native_dense.hpp"
+ #include "strata/program/logits_selection.hpp"
+ #include "strata/program/conv_cache.hpp"
+@@ -3819,6 +3820,176 @@ int main(int argc, char** argv) {
+                      (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
+         return mib + 64;   // a margin for the allocator
+     };
++    // The auto loan's share cap and --prefill auto's ceiling, defined here so the advisory VRAM plan below prices
++    // with the same numbers the loan scans apply (the scans read them too).
++    const int64_t kAutoLendPct = [] {
++        const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
++        return v ? (int64_t) std::atoi(v)
++                 : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
++    }();
++    // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the
++    // context, but a bare `auto` always reaches 8192.  32768 and 16384 stay opt-in (#282).
++    const int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
++    // the share of expert bytes the arena could pin (sizes the prompt path's streamed ring and its lend cap):
++    // one measurement, two readers - the advisory planner prices its own arithmetic with the figure it returns,
++    // and the runtime calls it at the SAME site upstream always did (below, before the loan scans), so no
++    // Prefill global is set or shifted for the planner's sake
++    auto measured_pinned_share = [&]() -> double {
++        if (srcp == nullptr || o.prefill_chunk <= 0) return 1.0;
++        uint64_t pinned = 0, total = 0;
++        const auto& lay = strata::kernels::cpu::expert_layout();
++        for (int64_t l = 0; l < g.n_layers; ++l)
++            for (int64_t e = 0; e < g.n_expert; ++e) {
++                const uint64_t b = lay.blob_bytes(l);
++                total += b;
++                if (srcp->pinned(l, e)) pinned += b;
++            }
++        return total ? (double) pinned / (double) total : 1.0;
++    };
++    // the advisory planner's policy knobs and costs, built once: v0.1.40's pricing, injected.  The ring term is
++    // exactly additive, so a what-if budget prices as no_ring + budget slots; budget < 0 prices at the ring the
++    // current globals resolve to (the runtime's own rule).  Owned: the exact allocation (+ the allocator's
++    // margin, as the exact sizing arm does), and the reservation the sizing rule makes - the advisory reports
++    // the difference between the two.
++    const strata::prefill::LendOpts advisory_lend_opts = [&] {
++        strata::prefill::LendOpts v;
++        v.min_keep_slots = 128;
++        v.lend_pct = kAutoLendPct;
++        v.auto_ceiling = auto_ceiling;
++        v.prefill_auto_max = o.prefill_auto_max;
++        v.max_context = o.max_context;
++        v.ring_bytes = strata::prefill::Prefill::ring_bytes_enabled();
++        return v;
++    }();
++    // the advisory prices at ITS OWN measured pinned share (the figure the runtime will measure at its upstream
++    // site below): every cost is the share-pure pricing, so no Prefill global is read here that the runtime has
++    // not set yet - the default 1.0 the global still carries would price the pinned ring where the run will
++    // measure the unpinned 96-slot one
++    const double advisory_pinned_share = measured_pinned_share();
++    const strata::prefill::LendCosts advisory_lend_costs = [&] {
++        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
++        const double share = advisory_pinned_share;
++        auto ring_at = [&](int64_t ch, int64_t budget) -> int64_t {
++            if (ch < strata::prefill::Prefill::stream_all_min_tokens())
++                return strata::prefill::Prefill::ring_stage_slots();
++            if (budget >= 0) return std::max<int64_t>(budget, 16);
++            return strata::prefill::Prefill::ring_slots_at_share(ch, share);
++        };
++        auto no_ring_at = [&](int64_t ch) -> uint64_t {
++            return strata::prefill::Prefill::bytes_needed_at_share(g, ss, ch, share, false) -
++                   (uint64_t) strata::prefill::Prefill::ring_slots_at_share(ch, share) * (uint64_t) blob;
++        };
++        strata::prefill::LendCosts c;
++        c.bytes_with_ring = [&, ring_at, no_ring_at](int64_t ch, int64_t budget) -> uint64_t {
++            if (budget >= 0) return no_ring_at(ch) + (uint64_t) ring_at(ch, budget) * (uint64_t) blob;
++            return strata::prefill::Prefill::bytes_needed_at_share(g, ss, ch, share, false);
++        };
++        c.ring_slots_under = [ring_at](int64_t ch, int64_t budget) -> int64_t {
++            return ring_at(ch, budget);
++        };
++        c.ring_cap_for = [share](int64_t small) {
++            return strata::prefill::Prefill::ring_cap_for_at(small, share);
++        };
++        c.ring_default_slots = [share] { return strata::prefill::Prefill::ring_default_slots_at(share); };
++        c.bytes_owned = [&](int64_t ch) -> uint64_t {
++            return strata::prefill::Prefill::bytes_needed_at_share(g, ss, ch, share, true) + (64ull << 20);
++        };
++        static const bool exact_price = [] {
++            const char* v = std::getenv("STRATA_OWNED_PRICE");
++            return v != nullptr && std::string(v) == "exact";
++        }();
++        c.bytes_owned_reserved = [&, exact_price](int64_t ch) -> uint64_t {
++            // the reservation the sizing arm makes: the 0.1.39 rule, or under STRATA_OWNED_PRICE=exact the
++            // rounded exact price plus the same 64 MiB allocator margin `owned_prefill_mib` adds
++            return (uint64_t) (exact_price ? (((int64_t) strata::prefill::Prefill::bytes_needed_at_share(
++                                                 g, ss, ch, share, true) +
++                                              (1 << 20) - 1) >> 20) + 64
++                                           : 160 + (ch * 680) / 1024) << 20;
++        };
++        return c;
++    }();
++    // ---- #796 part C: THE ADVISORY VRAM PLAN.  Everything the engine is about to commit, priced with the exact
++    // owned-prefill arithmetic and said BEFORE the expert cache takes what is left - WARNINGS ONLY.  The sizing
++    // branches below stay the only authority: the advisory sets no option, sizes no cache and refuses nothing; a
++    // configuration it cannot confirm is one warning line with the knobs that make room, and a runtime that
++    // later does something else than the prediction is reported the same way.  STRATA_ADVISORY_PLAN=0 silences it.
++    strata::prefill::VramAdvisory advisory;   // outlives the block: the post-open and loan-time checks compare with it
++    strata::prefill::EffectivePrefillPlan advisory_effective;   // the prediction re-derived against the opened cache
++    strata::prefill::CacheLendView advisory_opened;             // the opened cache as the re-derivation saw it
++    bool advisory_ready = false;
++    bool advisory_effective_valid = false;
++    // STRATA_ADVISORY_PLAN: unset or any non-zero value enables the advisory, =0 silences it
++    if (!multi_gpu && strata::prefill::env_enabled(std::getenv("STRATA_ADVISORY_PLAN"), /*default_on=*/true)) {
++        advisory_ready = true;
++        strata::prefill::AdvisoryInput in;
++        size_t adv_free = strata::core::device_free_bytes();
++        in.free_bytes = adv_free;
++        in.user_reserve_bytes = (uint64_t) o.vram_reserve_mib << 20;
++        in.reserve_given = o.vram_reserve_given;
++        in.mtp_bytes = (uint64_t) ((!o.mtp.empty() && native_head.loaded())
++                                       ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0);
++        for (const auto& d : slot_mtp) in.mtp_bytes += (uint64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
++        in.runtime_reserve_bytes = (uint64_t) pipe_first;
++        in.max_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
++        in.sized_slots_wanted = native_pack && !profile.empty() && !o.expert_cache_per_layer;
++        std::vector<int64_t> pair_bytes;
++        if (in.sized_slots_wanted) {
++            pair_bytes.reserve(profile.size());
++            for (const auto& pr : profile)
++                pair_bytes.push_back((int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first));
++            in.pair_slot_bytes = &pair_bytes;
++        }
++        in.profile_pairs = profile.empty() ? -1 : (int64_t) profile.size();
++        in.min_loan_slots = (o.prefill_chunk > 0 && pf_borrow)
++            ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + in.max_blob - 1) / in.max_blob + 128 : 1;
++        in.prefill_borrow = pf_borrow;
++        in.prefill_auto = o.prefill_auto;
++        in.prefill_chunk = o.prefill_chunk;
++        in.fixed_chunk_halves = o.serve;    // the serve loan scan may run a halved fixed chunk; generate rejects a halve
++        in.spec_needs_cache = o.spec > 0;
++        in.kv_stream_possible = g.n_qsa_layers() > 0;
++        in.explicit_cache = !auto_cache && o.expert_cache > 0;
++        in.explicit_cache_slots = in.explicit_cache ? o.expert_cache : -1;
++        in.lend.min_keep_slots = 128;
++        in.lend.lend_pct = kAutoLendPct;
++        in.lend.auto_ceiling = auto_ceiling;
++        in.lend.prefill_auto_max = o.prefill_auto_max;
++        in.lend.max_context = o.max_context;
++        in.lend.ring_bytes = strata::prefill::Prefill::ring_bytes_enabled();
++        in.costs = advisory_lend_costs;
++        advisory = strata::prefill::advise_startup_vram(in);
++        std::string pf_line = "off (the token path)";
++        if (advisory.selected_prefill > 0) {
++            pf_line = advisory.prefill_owned
++                ? std::to_string(advisory.selected_prefill) + " tokens, own buffers (" +
++                  std::to_string((double) advisory.prefill_bytes / 1073741824.0) + " GiB exact; the sizing rule " +
++                  std::to_string((double) advisory.prefill_reserved_bytes / 1073741824.0) + " GiB)"
++                : std::to_string(advisory.selected_prefill) + " tokens, borrowed: " +
++                  std::to_string(advisory.lend_slots) + " cache slots (" +
++                  std::to_string((double) advisory.prefill_bytes / 1073741824.0) + " GiB)";
++        }
++        std::fprintf(stderr,
++                     "strata generate: advisory VRAM plan (warnings only; the engine's own sizing decides):\n"
++                     "  free at planning:       %.2f GiB\n"
++                     "  later runtime:          %lld MiB (the draft head%s)\n"
++                     "  prefill:                %s\n"
++                     "  user reserve:           %d MiB%s\n"
++                     "  expert cache:           ~%.2f GiB / %lld slots (predicted)\n",
++                     (double) advisory.free_at_plan / 1073741824.0, (long long) (advisory.mtp_bytes >> 20),
++                     advisory.runtime_reserve_bytes > 0 ? " + --pipeline-windows" : "", pf_line.c_str(),
++                     o.vram_reserve_mib,
++                     advisory.reserve_adapted_from_mib > 0 ? " (the runtime lowers it to fit a working cache)" : "",
++                     (double) strata::prefill::actual_cache_bytes(advisory) / 1073741824.0,
++                     (long long) advisory.expert_slots);
++        for (const std::string& note : advisory.notes)
++            std::fprintf(stderr, "strata generate: VRAM plan: %s\n", note.c_str());
++        for (const std::string& w : advisory.warnings) {
++            std::fprintf(stderr, "strata generate: warning: %s. The engine starts anyway; if the first prompt "
++                                 "fails, make room:", w.c_str());
++            for (const std::string& s : advisory.suggestions) std::fprintf(stderr, " %s;", s.c_str());
++            std::fprintf(stderr, "\n");
++        }
++    }
+     if (o.expert_cache < 0) {
+         size_t free_b = 0, total_b = 0;
+         free_b = strata::core::device_free_bytes(); (void) total_b;
+@@ -4047,6 +4218,47 @@ int main(int argc, char** argv) {
+                                  "page file lets it use more of the free VRAM\n",
+                          o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
+     }
++    // ---- the advisory plan, against the cache that actually opened (part C stays warnings-only here too).  The
++    // auto sizing's own post-touch loop above already wrote the slots and re-read the free figure; this reads it
++    // once more, asks what the prompt path would be against THIS cache, and says it when the picture moved.
++    // STRATA_POSTTOUCH=1 touches an explicit cache too (one full write) before the read - the deep WDDM check,
++    // off by default because it costs the write's time at startup.
++    if (advisory_ready && o.expert_cache > 0) {
++        // STRATA_POSTTOUCH: the deep WDDM check for an explicit cache - unset or =0 keeps it off (it costs the
++        // full cache write's time at startup), any non-zero value runs it
++        if (!auto_cache && strata::prefill::env_enabled(std::getenv("STRATA_POSTTOUCH"), /*default_on=*/false)) {
++            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
++            cudaDeviceSynchronize();
++            std::fprintf(stderr, "strata generate: STRATA_POSTTOUCH: the explicit cache's slots are written\n");
++        }
++        const uint64_t free_after = strata::core::device_free_bytes();
++        const strata::prefill::CacheLendView opened{
++            xcache.slots(), xcache.bytes(), xcache.slot_offsets(),
++            (int64_t) strata::kernels::cpu::expert_layout().max_blob};
++        advisory_opened = opened;
++        advisory_effective = strata::prefill::revalidate_prefill_after_cache(advisory, opened, advisory_lend_opts,
++                                                                             advisory_lend_costs);
++        advisory_effective_valid = true;
++        const uint64_t required = strata::prefill::effective_post_cache_required(advisory, advisory_effective);
++        if (free_after + (64ull << 20) < required)
++            std::fprintf(stderr, "strata generate: warning: the advisory VRAM plan reads %.2f GiB free after the "
++                                 "cache opened, below the %.2f GiB its requirement needs (the reserve, the draft "
++                                 "head%s). The engine continues; if the first prompt stalls, lower --max-context, "
++                                 "--prefill or --vram-reserve-mib\n",
++                         (double) free_after / 1073741824.0, (double) required / 1073741824.0,
++                         advisory_effective.owned ? ", the prompt path's own buffers" : "");
++        if (advisory_effective.owned && !advisory.prefill_owned && advisory.selected_prefill > 0)
++            std::fprintf(stderr, "strata generate: warning: the opened cache (%lld slots) does not lend the prompt "
++                                 "path its %lld-token chunk; the advisory VRAM plan expects it on buffers of its "
++                                 "own (%.2f GiB) - the engine continues\n",
++                         (long long) xcache.slots(), (long long) advisory.selected_prefill,
++                         (double) advisory_effective.owned_bytes / 1073741824.0);
++        else if (advisory.prefill_auto && advisory_effective.borrowed && advisory.selected_prefill > 0 &&
++                 advisory_effective.chunk != advisory.selected_prefill)
++            std::fprintf(stderr, "strata generate: warning: the advisory VRAM plan expected prefill auto to pick "
++                                 "%lld tokens, the opened cache affords %lld; the engine continues\n",
++                         (long long) advisory.selected_prefill, (long long) advisory_effective.chunk);
++    }
+     if (o.expert_cache > 0) {
+         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
+                      (long long) xcache.slots(), xcache.gib());
+@@ -5048,18 +5260,11 @@ int main(int argc, char** argv) {
+     // and its last token through the first verify window - the path all three model files share.  Decoding is greedy.
+     // The expert-cache slots (from the end of the cache) that hold the prompt path's buffers for a chunk, and the
+     // bytes from the first of them to the end.
+-    // the share of expert bytes the arena could pin (sizes the prompt path's streamed ring and its lend cap)
+-    if (srcp != nullptr && o.prefill_chunk > 0) {
+-        uint64_t pinned = 0, total = 0;
+-        const auto& lay = strata::kernels::cpu::expert_layout();
+-        for (int64_t l = 0; l < g.n_layers; ++l)
+-            for (int64_t e = 0; e < g.n_expert; ++e) {
+-                const uint64_t b = lay.blob_bytes(l);
+-                total += b;
+-                if (srcp->pinned(l, e)) pinned += b;
+-            }
+-        strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
+-    }
++    // the share of expert bytes the arena could pin (sizes the prompt path's streamed ring and its lend cap) -
++    // the runtime's own measurement, at the site upstream always had it, AFTER the cache sizing above: with the
++    // advisory off this run reaches this point exactly as pristine main does
++    if (srcp != nullptr && o.prefill_chunk > 0)
++        strata::prefill::Prefill::set_pinned_share(measured_pinned_share());
+     // bytes -> slots for CUDA0's cache: exact when it knows its per-slot offsets (a native pack's blobs differ
+     // per layer), otherwise max_blob each.
+     auto slots_from_bytes = [&](uint64_t need) -> int64_t {
+@@ -5119,17 +5324,8 @@ int main(int argc, char** argv) {
+     // at 8192-token chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the
+     // copies are DMA from pinned RAM (Q2_0 8192 + a 384-slot ring: 1283 tok/s), 85% when host copies are the
+     // limit (lending more only streams more through them).  STRATA_PREFILL_LEND_PCT overrides (tuning).
+-    // Hoisted out of plan_lend: the serve path's per-stage loans obey the same cap, one participant at a time.
+-    const int64_t kAutoLendPct = [] {
+-        const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+-        return v ? (int64_t) std::atoi(v)
+-                 : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
+-    }();
+-    // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the
+-    // context, but a bare `auto` always reaches 8192.  32768 and 16384 stay opt-in (#282): a 32K prompt with
+-    // IQ2_XS (RTX 5090, 64K context) read at 5,624 tok/s in 8192-token chunks and 6,465 in one 32768 chunk (40K
+-    // -> 18K experts streamed; an NVFP4 pack at 262K: 3,535 -> 5,201).
+-    const int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
++    // (kAutoLendPct and auto_ceiling are defined above the cache sizing: the advisory VRAM plan prices with the
++    // same numbers, and the loan scans below read them too.)
+     // The auto scan used to walk a fixed list of sizes - 32768, 16384, 8192, 6144, ... - and take the first that
+     // fit.  That list is coarse exactly where a rig needs it: this one affords ~8,700 tokens and was handed 8192,
+     // and 8704 is not on it.  `bytes_needed` is a sum of (T x positive constant) terms plus a max of such sums,
+@@ -5817,6 +6013,27 @@ int main(int argc, char** argv) {
+         } else {
+             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
+         }
++        // the advisory plan's loan-time check (single GPU, like every advisory comparison): what the serve loan
++        // scan resolved, against what the prediction said.  A mismatch is one warning line - the scan stays.
++        if (advisory_effective_valid) {
++            strata::prefill::EffectivePrefillPlan predicted = advisory_effective;
++            if (!o.prefill_auto) {
++                // a fixed chunk: the scan may have run a HALVE - re-derive with serve semantics at what it chose
++                strata::prefill::VramAdvisory p2 = advisory;
++                p2.fixed_chunk_halves = true;
++                p2.prefill_auto = false;
++                p2.prefill_owned = false;
++                p2.selected_prefill = o.prefill_chunk;
++                predicted = strata::prefill::revalidate_prefill_after_cache(p2, advisory_opened, advisory_lend_opts,
++                                                                            advisory_lend_costs);
++            }
++            const strata::prefill::RuntimePrefillUse use{borrow != nullptr, o.prefill_chunk, borrow_bytes};
++            const strata::prefill::RuntimePlanCheck c =
++                strata::prefill::check_runtime_prefill_use(predicted, use);
++            if (c.mismatch)
++                std::fprintf(stderr, "strata serve: warning: runtime prefill differs from the advisory VRAM plan: "
++                                     "%s (advisory only; serving continues)\n", c.why);
++        }
+         rss_probe("the prompt path set up");
+         // layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next.
+         // THE CHUNK STEPS DOWN INSTEAD OF EXITING.  A split's stage caches are sized after the arena is registered, and
+@@ -10145,6 +10362,16 @@ int main(int argc, char** argv) {
+         }
+         if (borrow == nullptr)
+             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
++        // the advisory plan's loan-time check: what the runtime resolved, against what the prediction said.
++        // A mismatch is one warning line - the run keeps the engine's own decision.
++        if (advisory_effective_valid) {
++            const strata::prefill::RuntimePrefillUse use{borrow != nullptr, o.prefill_chunk, borrow_bytes};
++            const strata::prefill::RuntimePlanCheck c =
++                strata::prefill::check_runtime_prefill_use(advisory_effective, use);
++            if (c.mismatch)
++                std::fprintf(stderr, "strata generate: warning: runtime prefill differs from the advisory VRAM "
++                                     "plan: %s (advisory only; the run continues)\n", c.why);
++        }
+         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
+                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
+                           borrow_bytes)) {
+diff --git a/tests/core/vram_plan_test.cpp b/tests/core/vram_plan_test.cpp
+new file mode 100644
+index 0000000000..27217c20a2
+--- /dev/null
++++ b/tests/core/vram_plan_test.cpp
+@@ -0,0 +1,599 @@
++// tests/core/vram_plan_test.cpp - #796 part C: the ADVISORY VRAM planner and the shared chunk/loan predictor.
++//
++// The planner is pure arithmetic over injected byte costs, so every case runs without a GPU.  The one semantic
++// under test throughout: a predicted shortfall, an over-large explicit cache or an owned fallback is a WARNING
++// the caller is expected to print - the advisory has no refusal to make and startup goes on.  Where the old
++// #796 draft asserted `!p.ok` (a fatal plan), these cases assert `has_warning()` plus usable numbers, and the
++// runtime-mismatch checker is asserted to REPORT, never to stop.
++#include "strata/prefill/vram_plan.hpp"
++
++#include <cstdio>
++#include <algorithm>
++#include <string>
++#include <vector>
++
++namespace {
++int fails = 0;
++void check(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++fails;
++    }
++}
++
++constexpr int64_t BLOB = 2 << 20;          // one uniform expert slot: 2 MiB
++constexpr int64_t KIB = 1024, MIB = 1024 * 1024, GIB = 1024 * 1024 * 1024;
++constexpr uint64_t MARGIN = 64ull << 20;   // the allocator margin the engine's exact owned price carries
++
++// the fake pack: a chunk costs 64 KiB a token plus its streamed ring at 2 MiB a slot, 199 slots full (the
++// ring_cap every fake answers), 8 slots below stream_all_min - monotone in the chunk, like the real one
++int64_t base_bytes(int64_t chunk) { return chunk * 64 * KIB; }
++int64_t fake_ring(int64_t chunk, int64_t budget) {
++    if (chunk < 1024) return 8;
++    return budget > 0 ? std::min<int64_t>(budget, 199) : 199;
++}
++uint64_t fake_bytes(int64_t chunk, int64_t budget) {
++    return (uint64_t) (base_bytes(chunk) + fake_ring(chunk, budget) * BLOB);
++}
++
++strata::prefill::LendCosts fake_costs() {
++    strata::prefill::LendCosts c;
++    c.bytes_with_ring = fake_bytes;
++    c.ring_slots_under = fake_ring;
++    c.ring_cap_for = [](int64_t) { return (int64_t) 199; };
++    c.ring_default_slots = [] { return (int64_t) 199; };
++    c.bytes_owned = [](int64_t chunk) { return fake_bytes(chunk, -1) + MARGIN; };
++    c.bytes_owned_reserved = [](int64_t chunk) { return fake_bytes(chunk, -1) + MARGIN; };
++    return c;
++}
++
++strata::prefill::LendOpts fake_opts(int64_t ceiling = 8192) {
++    strata::prefill::LendOpts o;
++    o.min_keep_slots = 128;
++    o.lend_pct = 90;
++    o.auto_ceiling = ceiling;
++    o.prefill_auto_max = 32768;
++    o.max_context = 131072;
++    o.ring_bytes = true;
++    return o;
++}
++
++strata::prefill::AdvisoryInput plan_input(uint64_t free_bytes) {
++    strata::prefill::AdvisoryInput in;
++    in.free_bytes = free_bytes;
++    in.user_reserve_bytes = 700 * MIB;
++    in.small_reserve_mib = 300;
++    in.max_blob = BLOB;
++    in.profile_pairs = -1;
++    in.min_loan_slots = 1;
++    in.lend = fake_opts();
++    in.costs = fake_costs();
++    return in;
++}
++
++// the invariant every healthy advisory keeps - the predicted final layout inside the free VRAM
++bool plan_fits(const strata::prefill::VramAdvisory& p, uint64_t free_bytes) {
++    return strata::prefill::post_cache_required_bytes(p) + strata::prefill::actual_cache_bytes(p) <= free_bytes;
++}
++void check_healthy(const strata::prefill::VramAdvisory& p, uint64_t free_bytes, const char* what) {
++    check(!p.has_warning(), (std::string(what) + ": no warning").c_str());
++    check(plan_fits(p, free_bytes), (std::string(what) + ": the predicted layout fits").c_str());
++}
++}  // namespace
++
++int main() {
++    using namespace strata::prefill;
++
++    // ---- Case A: plenty of VRAM - a healthy plan, no warning, the requested chunk kept on its own buffers
++    {
++        AdvisoryInput in = plan_input(8 * GIB);
++        in.prefill_chunk = 24576;              // own buffers: ~1.9 GiB of the fake pack's bytes
++        const VramAdvisory p = advise_startup_vram(in);
++        check_healthy(p, in.free_bytes, "A: the plan is healthy");
++        check(p.prefill_owned && p.selected_prefill == 24576, "A: the requested chunk is kept, on its own buffers");
++        check(p.prefill_bytes == fake_bytes(24576, -1) + MARGIN, "A: the exact owned price is reported");
++        check(p.prefill_reserved_bytes == p.prefill_bytes, "A: the sizing rule reserves the same (no divergence note)");
++        check(p.expert_slots >= 1, "A: the cache keeps what the owned buffers leave");
++        // the sizing rule's reservation is reported beside the exact price: over-reserving (0.1.39's rule at big
++        // chunks) is quiet; under-reserving honestly over-subscribes the card, and the warning says so
++        AdvisoryInput over = in;
++        over.costs.bytes_owned_reserved = [](int64_t chunk) {
++            return (uint64_t) (160 + (chunk * 680) / 1024) * MIB;   // 0.1.39's rule: ~16 GiB at 24576
++        };
++        const VramAdvisory ov = advise_startup_vram(over);
++        check(ov.prefill_reserved_bytes > ov.prefill_bytes, "A: the 0.1.39 rule over-reserves at this chunk");
++        check(!ov.has_warning(), "A: an over-reserving rule is not a warning");
++        AdvisoryInput under = in;
++        under.costs.bytes_owned_reserved = [](int64_t c) { return fake_bytes(c, -1) + MARGIN - 10 * MIB; };
++        const VramAdvisory un = advise_startup_vram(under);
++        check(un.prefill_bytes > un.prefill_reserved_bytes, "A: the exact price exceeds the rule's reservation");
++        check(un.has_warning() && un.short_by_bytes > 0,
++              "A: under-reserving over-subscribes the card by the gap - WARNED");
++        bool noted = false;
++        for (const std::string& n : un.notes) noted = noted || n.find("MiB exact") != std::string::npos;
++        check(noted, "A: the divergence is a note naming both prices");
++    }
++
++    // ---- Case B: --prefill auto predicted through the shared policy, including a non-list boundary
++    {
++        AdvisoryInput in = plan_input((uint64_t) 760 * BLOB + 700 * MIB);
++        in.prefill_borrow = true;
++        in.prefill_auto = true;
++        in.lend.auto_ceiling = 24576;
++        // 760 slots: 16384's loan does not fit - the bisection lands on 13824, a size no hardcoded list holds
++        const VramAdvisory p = advise_startup_vram(in);
++        check_healthy(p, in.free_bytes, "B: the plan is healthy");
++        check(p.selected_prefill == 13824, "B: the largest fitting chunk on the grid is predicted");
++        check(!p.prefill_owned && p.lend_slots == 631, "B: the chunk is lent, 631 slots");
++        check(p.expert_slots >= p.lend_slots + 128, "B: the loan leaves the non-lendable minimum");
++        // a smaller budget whose true maximum is 8704 - also off every list - to pin the bisection
++        AdvisoryInput odd = plan_input((uint64_t) 600 * BLOB + 700 * MIB);
++        odd.prefill_borrow = true;
++        odd.prefill_auto = true;
++        odd.lend.auto_ceiling = 24576;
++        const VramAdvisory o = advise_startup_vram(odd);
++        check_healthy(o, odd.free_bytes, "B: the non-round boundary is healthy");
++        check(o.selected_prefill == 8704, "B: 8704 predicted");
++    }
++
++    // ---- Case C: nothing fits - a WARNING with a positive shortfall and usable numbers, never a refusal
++    {
++        AdvisoryInput in = plan_input(718 * MIB);   // the reserve alone eats nearly all of it
++        in.prefill_chunk = 4096;
++        const VramAdvisory p = advise_startup_vram(in);
++        check(p.has_warning(), "C: the impossible configuration is WARNED");
++        check(p.short_by_bytes > 0, "C: the shortfall is positive");
++        check(p.expert_slots >= 0, "C: the advisory still reports a slot count (the caller prints and continues)");
++        bool says_short = false;
++        for (const std::string& w : p.warnings) says_short = says_short || w.find("short by") != std::string::npos;
++        check(says_short, "C: the warning says how far the configuration is short");
++        check(!p.suggestions.empty(), "C: the warning carries the knobs that make room");
++        // the borrowed arm warns its own way: nothing can be lent, nothing can be owned
++        AdvisoryInput b = plan_input(718 * MIB);
++        b.prefill_borrow = true;
++        b.prefill_auto = true;
++        const VramAdvisory pb = advise_startup_vram(b);
++        check(pb.has_warning() && pb.short_by_bytes > 0, "C: the borrowed arm warns deterministically too");
++        // a configuration with no cache slot at all warns about --spec exactly when --spec is set (300 MiB free:
++        // the #496 adaptation's floor, so the reserve keeps its 700 MiB and the cache is predicted zero slots)
++        AdvisoryInput sp = plan_input(300 * MIB);
++        sp.prefill_borrow = true;
++        sp.prefill_chunk = 4096;
++        sp.spec_needs_cache = true;
++        const VramAdvisory ps = advise_startup_vram(sp);
++        check(ps.has_warning() && ps.expert_slots == 0, "C: the zero-slot configuration is WARNED about");
++        bool says_spec = false;
++        for (const std::string& w : ps.warnings) says_spec = says_spec || w.find("--spec") != std::string::npos;
++        sp.spec_needs_cache = false;
++        const VramAdvisory pn = advise_startup_vram(sp);
++        bool says_spec_without = false;
++        for (const std::string& w : pn.warnings) says_spec_without = says_spec_without || w.find("--spec") != std::string::npos;
++        check(says_spec && !says_spec_without, "C: the --spec warning appears only when --spec is set");
++    }
++
++    // ---- Case D: borrowing is never booked twice; owning is booked exactly once
++    {
++        AdvisoryInput owned = plan_input(8 * GIB);
++        owned.prefill_chunk = 4096;            // no profile: the prompt path owns its buffers
++        const VramAdvisory po = advise_startup_vram(owned);
++        AdvisoryInput borrowed = plan_input(8 * GIB);
++        borrowed.prefill_borrow = true;
++        borrowed.prefill_chunk = 4096;         // the same chunk, lent from the cache instead
++        const VramAdvisory pb = advise_startup_vram(borrowed);
++        check_healthy(po, owned.free_bytes, "D: the owned plan is healthy");
++        check_healthy(pb, borrowed.free_bytes, "D: the borrowed plan is healthy");
++        check(po.prefill_owned && po.prefill_bytes == fake_bytes(4096, -1) + MARGIN,
++              "D: the owned bytes are booked once, at the exact price");
++        check(!pb.prefill_owned && pb.expert_budget_bytes == (uint64_t) 8 * GIB - pb.mandatory_bytes,
++              "D: the borrowed plan deducts no prefill bytes from the cache's budget");
++        check(pb.expert_budget_bytes - po.expert_budget_bytes >= po.prefill_bytes,
++              "D: lending keeps the cache exactly the owned prefill's bytes larger");
++        check(strata::prefill::post_cache_required_bytes(pb) == pb.mandatory_bytes,
++              "D: a borrowed plan's post-cache need is the mandatory items alone - no prefill deduction");
++        check(strata::prefill::post_cache_required_bytes(po) == po.mandatory_bytes + po.prefill_bytes,
++              "D: an owned plan's post-cache need carries the prefill exactly once");
++    }
++
++    // ---- Case E: variable-size slots price the lend over their exact offsets, not max_blob * slots
++    {
++        CacheLendView v;
++        const std::vector<uint64_t> sizes = {3 * MIB, 1 * MIB, 2 * MIB};   // one blob each, unequal
++        std::vector<uint64_t> offs(sizes.size() + 1, 0);
++        for (size_t i = 0; i < sizes.size(); ++i) offs[(size_t) i + 1] = offs[i] + sizes[i];
++        v.slots = (int64_t) sizes.size();
++        v.bytes = (int64_t) offs.back();       // 6 MiB
++        v.slot_offsets = offs.data();
++        v.max_blob = 3 * MIB;
++        check(v.tail_bytes(2) == 3 * MIB && v.tail_bytes(3) == 6 * MIB, "E: the tail is the suffix sum");
++        check(v.slots_for_bytes((uint64_t) (3 * MIB + 512 * KIB)) == 3,
++              "E: 3.5 MiB needs the three exact-offset slots (the last slot alone is 2 MiB, two are 3)");
++        CacheLendView u;
++        u.slots = 3;
++        u.bytes = 6 * MIB;
++        u.max_blob = 3 * MIB;
++        check(u.slots_for_bytes((uint64_t) (3 * MIB + 512 * KIB)) == 2,
++              "E: the uniform view's ceil(need / max_blob) answers 2 - the two views differ, as they must");
++        // through the planner: the predicted sized cache prices over its exact offsets (the profile cap keeps
++        // this cache tiny on purpose, so the lend falls to the owned fallback - warned, numbers usable)
++        AdvisoryInput in = plan_input((uint64_t) 610 * BLOB + 700 * MIB);
++        in.prefill_borrow = true;
++        in.prefill_auto = true;
++        in.sized_slots_wanted = true;
++        in.profile_pairs = 3;
++        const std::vector<int64_t> pairs = {1 * MIB, 1 * MIB, 1 * MIB};   // each aligned slot: 1 MiB, not 2
++        in.pair_slot_bytes = &pairs;
++        const VramAdvisory p = advise_startup_vram(in);
++        check(p.has_warning() && p.prefill_owned,
++              "E: the 3-slot cache cannot lend; the owned fallback is WARNED, not refused");
++        check(!p.sized_slots.empty() && actual_cache_bytes(p) == 3 * MIB,
++              "E: actual_cache_bytes is the sized layout's exact total");
++        check(actual_cache_bytes(p) < (uint64_t) 3 * BLOB,
++              "E: the sized cache holds fewer bytes than its uniform count prices");
++        check(p.selected_prefill == 1024, "E: the owned fallback is the runtime's 1024 bound");
++    }
++
++    // ---- Case F: the reserve stays the user's knob; the #496 adaptation is PREDICTED, not made
++    {
++        AdvisoryInput in = plan_input(8 * GIB);
++        in.prefill_chunk = 4096;
++        const VramAdvisory a = advise_startup_vram(in);
++        in.user_reserve_bytes = 1400 * MIB;
++        in.reserve_given = true;
++        const VramAdvisory b = advise_startup_vram(in);
++        check_healthy(a, in.free_bytes, "F: the smaller reserve plans fine");
++        check_healthy(b, in.free_bytes, "F: the bigger reserve plans fine");
++        check(b.expert_budget_bytes == a.expert_budget_bytes - 700 * MIB,
++              "F: the extra 700 MiB of reserve comes out of the cache alone");
++        check(b.mandatory_bytes == a.mandatory_bytes + 700 * MIB, "F: the mandatory side carries the reserve");
++        // a given reserve is never adapted; the default one is predicted as adapted (the runtime makes it).
++        // A 700 MiB card with a 4096-token chunk cannot afford the loan either way - the advisory warns and
++        // keeps every number usable, it does not refuse.
++        AdvisoryInput small_card = plan_input(700 * MIB);   // the reserve alone would eat all of it
++        small_card.prefill_borrow = true;
++        small_card.prefill_chunk = 4096;
++        small_card.min_loan_slots = 144;        // a 256-token loan plus the 128-slot floor, as generate aims for
++        small_card.reserve_given = true;
++        const VramAdvisory given = advise_startup_vram(small_card);
++        check(given.has_warning() && given.short_by_bytes > 0 && given.reserve_adapted_from_mib == 0 &&
++                  given.user_reserve_bytes == (uint64_t) 700 * MIB,
++              "F: a reserve given on the command line is kept - and the shortfall is a WARNING");
++        small_card.reserve_given = false;
++        const VramAdvisory adapted = advise_startup_vram(small_card);
++        check(adapted.reserve_adapted_from_mib == 700, "F: predicted adaptation from 700");
++        check(adapted.user_reserve_bytes == (uint64_t) 412 * MIB, "F: the predicted adaptation leaves 412 MiB");
++        check(adapted.expert_slots == 144 && adapted.user_reserve_bytes >= (uint64_t) 300 * MIB,
++              "F: the predicted adaptation leaves exactly the working cache, above its floor");
++        bool noted = false;
++        for (const std::string& n : adapted.notes) noted = noted || n.find("expected to lower") != std::string::npos;
++        check(noted, "F: the adaptation is a note about what the RUNTIME is expected to do");
++        check(adapted.has_warning() && adapted.prefill_owned && adapted.selected_prefill == 4096,
++              "F: the chunk the 144-slot cache cannot lend is predicted owned, and warned");
++        check(plan_fits(adapted, 700 * MIB) == false,
++              "F: the prediction honestly does not fit - that is what the warning says");
++    }
++
++    // ---- the shared policy: 0.1.39's list, the fixed chunk's halving, the bisection
++    {
++        CacheLendView big;
++        big.slots = 4000;
++        big.bytes = 4000 * BLOB;
++        big.max_blob = BLOB;
++        // STRATA_RING_BYTES=0: the old list, ceiling and opt-in respected
++        int64_t chunk = 0;
++        LendOpts old = fake_opts();
++        old.ring_bytes = false;
++        LendOutcome out = plan_lend_chunks(big, old, fake_costs(), true, chunk);
++        check(out.chunk == 32768 && out.ring_budget == 0, "policy: the old list takes the opt-in ceiling");
++        old.prefill_auto_max = 8192;
++        out = plan_lend_chunks(big, old, fake_costs(), true, chunk);
++        check(out.chunk == 8192, "policy: without the opt-in the old list stops at 8192");
++        // a fixed chunk halves until the loan fits (the small chunks' STAGE ring included)
++        CacheLendView mid;
++        mid.slots = 300;
++        mid.bytes = 300 * BLOB;
++        mid.max_blob = BLOB;
++        chunk = 8192;
++        out = plan_lend_chunks(mid, fake_opts(), fake_costs(), false, chunk);
++        check(out.chunk == 512 && chunk == 512 && out.ring_budget == -1,
++              "policy: the fixed chunk halves to 512 (the STAGE ring) and leaves the ring globals alone");
++        chunk = 256;
++        out = plan_lend_chunks(CacheLendView{.slots = 8, .bytes = 8 * BLOB, .max_blob = BLOB}, fake_opts(),
++                               fake_costs(), false, chunk);
++        check(out.chunk == 0 && chunk == 0, "policy: nothing lends from a tiny cache");
++        // the bisection lands on the largest grid size under a monotone cap
++        check(biggest_lend_chunk(8704, [](int64_t t) { return t <= 8704; }) == 8704,
++              "policy: the bisection holds the non-round boundary");
++        check(biggest_lend_chunk(8192, [](int64_t t) { return t < 512; }) == 256,
++              "policy: the bisection walks the 256-token grid");
++    }
++
++    // ---- R1: an explicit cache that does not fit beside the mandatory items is WARNED, and the lend that would
++    // have worked is said too - the operator decides; nothing is refused or shrunk here
++    {
++        AdvisoryInput in = plan_input(1600 * MIB);
++        in.prefill_borrow = true;
++        in.prefill_chunk = 512;                 // lendable from 500 slots: 24 + 128 <= 500
++        in.explicit_cache = true;
++        in.explicit_cache_slots = 500;          // 1000 MiB the 1600 MiB of free VRAM cannot cover
++        const VramAdvisory p = advise_startup_vram(in);
++        check(p.has_warning() && p.short_by_bytes > 0, "R1: the overflowing explicit cache is WARNED at planning");
++        check(p.lend_slots > 0, "R1: the lend itself was fine - the budget is what the warning names");
++    }
++
++    // ---- R2: an explicit cache resolves --prefill auto with the ONE policy, plan_lend_chunks
++    {
++        AdvisoryInput in = plan_input((uint64_t) 460 * BLOB + 700 * MIB);
++        in.prefill_borrow = true;
++        in.prefill_auto = true;
++        in.explicit_cache = true;
++        in.explicit_cache_slots = 460;          // 8192's loan does not fit; 4096's does
++        const VramAdvisory p = advise_startup_vram(in);
++        // the reference: the same view the planner builds, through the shared policy
++        CacheLendView v;
++        v.slots = 460;
++        v.bytes = 460 * BLOB;
++        v.max_blob = BLOB;
++        int64_t ignored = 0;
++        const LendOutcome ref = plan_lend_chunks(v, in.lend, in.costs, true, ignored);
++        check(ref.chunk == 4096, "R2: the policy picks 4096 for this budget");
++        check_healthy(p, in.free_bytes, "R2: the explicit-cache auto plan is healthy");
++        check(!p.prefill_owned && p.selected_prefill == ref.chunk && p.lend_slots == ref.slots,
++              "R2: the prediction equals plan_lend_chunks' decision, borrowed, not owned");
++        // a non-list boundary through the same path
++        AdvisoryInput odd = in;
++        odd.free_bytes = (uint64_t) 600 * BLOB + 700 * MIB;
++        odd.explicit_cache_slots = 600;
++        odd.lend.auto_ceiling = 24576;
++        const VramAdvisory o2 = advise_startup_vram(odd);
++        check_healthy(o2, odd.free_bytes, "R2: the boundary plan is healthy");
++        check(!o2.prefill_owned && o2.selected_prefill == 8704,
++              "R2: the explicit cache's bisection lands on 8704 too");
++    }
++
++    // ---- R3: a sized native cache lends over its exact suffix - the uniform view would approve a loan
++    // the real layout cannot hold
++    {
++        std::vector<int64_t> pairs;             // 300 hot pairs at 2 MiB, then 100 tail pairs at 0.25 MiB
++        for (int i = 0; i < 300; ++i) pairs.push_back(2 * MIB);
++        for (int i = 0; i < 100; ++i) pairs.push_back(256 * 1024);
++        AdvisoryInput in = plan_input((uint64_t) 700 * MIB + 625 * MIB + fake_bytes(1024, -1) + MARGIN +
++                                      (uint64_t) 50 * MIB);
++        in.prefill_borrow = true;
++        in.prefill_chunk = 1024;
++        in.explicit_cache = true;
++        in.explicit_cache_slots = 400;
++        in.sized_slots_wanted = true;
++        in.pair_slot_bytes = &pairs;
++        in.profile_pairs = (int64_t) pairs.size();
++        const VramAdvisory p = advise_startup_vram(in);
++        check(p.prefill_owned && p.selected_prefill == 1024,
++              "R3: the false loan is not taken; the prompt is predicted on its own buffers");
++        check(actual_cache_bytes(p) == (uint64_t) 625 * MIB, "R3: the cache is priced at its exact 625 MiB");
++        check(p.has_warning(), "R3: the owned fallback beside the explicit cache is WARNED, not refused");
++        check(plan_fits(p, in.free_bytes), "R3: the predicted layout still fits");
++        // the uniform view WOULD have lent this chunk - the planner did not use it
++        CacheLendView u;
++        u.slots = 400;
++        u.bytes = 400 * BLOB;
++        u.max_blob = BLOB;
++        check(u.slots_for_bytes(fake_bytes(1024, -1)) + 128 <= 400,
++              "R3: the uniform view approves what the exact layout refuses");
++    }
++
++    // ---- R7: the post-open check's figure - the reserve, the head and an owned prefill, a borrowed one nothing
++    {
++        VramAdvisory w;
++        w.user_reserve_bytes = (uint64_t) 700 * MIB;
++        w.mtp_bytes = (uint64_t) 200 * MIB;
++        w.mandatory_bytes = w.user_reserve_bytes + w.mtp_bytes;
++        w.prefill_owned = true;
++        w.prefill_bytes = (uint64_t) 1000 * MIB;
++        check(post_cache_required_bytes(w) == (uint64_t) 1900 * MIB,
++              "R7: the post-open requirement is reserve + head + owned prefill (1900 MiB)");
++        w.prefill_owned = false;
++        check(post_cache_required_bytes(w) == (uint64_t) 900 * MIB,
++              "R7: a borrowed prompt adds nothing to the post-open requirement");
++    }
++
++    // ---- R8-R15: the prompt plan re-derived against a FINAL physical cache (diagnostics only)
++    {
++        VramAdvisory startup;   // a borrowed fixed-chunk prediction, as the planner emits it
++        startup.mandatory_bytes = (uint64_t) 700 * MIB;
++        startup.prefill_borrow = true;
++        startup.selected_prefill = 8192;
++        startup.max_blob = BLOB;
++        const LendOpts opts = fake_opts(8192);
++        const LendCosts costs = fake_costs();
++        const auto view_of = [](int64_t slots) {
++            CacheLendView v;
++            v.slots = slots;
++            v.bytes = slots * BLOB;
++            v.max_blob = BLOB;
++            return v;
++        };
++        // R8: the cache still lends 8192: borrowed, nothing owned
++        const EffectivePrefillPlan r8 = revalidate_prefill_after_cache(startup, view_of(760), opts, costs);
++        check(r8.borrowed && !r8.owned && r8.chunk == 8192 && r8.lend_slots == 455 && r8.owned_bytes == 0,
++              "R8: the borrowed fixed chunk stays borrowed");
++        // R9: after a shrink 8192 no longer lends (500 slots still lend 4096): owned AT 8192 - the runtime
++        // rejects a halved chunk as a loan - and the mismatch is reportable
++        const EffectivePrefillPlan r9 = revalidate_prefill_after_cache(startup, view_of(500), opts, costs);
++        check(r9.owned && !r9.borrowed && r9.chunk == 8192,
++              "R9: the non-lendable fixed chunk becomes owned at its original size");
++        check(r9.owned_bytes == fake_bytes(8192, -1) + MARGIN, "R9: the buffers are priced");
++        check(effective_post_cache_required(startup, r9) == (uint64_t) 700 * MIB + r9.owned_bytes,
++              "R9: the effective requirement carries the owned buffers");
++        // R10: auto re-runs the policy against the shrunken cache: a smaller BORROWED chunk, nothing owned
++        VramAdvisory auto_startup = startup;
++        auto_startup.prefill_auto = true;
++        const EffectivePrefillPlan r10 = revalidate_prefill_after_cache(auto_startup, view_of(460), opts, costs);
++        check(r10.borrowed && !r10.owned && r10.chunk == 4096 && r10.owned_bytes == 0,
++              "R10: auto falls to a smaller borrowed chunk, not owned buffers");
++        // R11: auto with nothing left to lend: the runtime's owned 1024 fallback, priced
++        const EffectivePrefillPlan r11 = revalidate_prefill_after_cache(auto_startup, view_of(100), opts, costs);
++        check(r11.owned && !r11.borrowed && r11.chunk == 1024 && r11.owned_bytes == fake_bytes(1024, -1) + MARGIN,
++              "R11: the auto fallback is owned at 1024 and priced");
++        // R15: a sized cache revalidates over its exact offsets: the uniform view lends this chunk, the real
++        // suffix does not (512 MiB needed; the top 272 real slots hold 369 MiB)
++        std::vector<int64_t> pairs;
++        for (int i = 0; i < 300; ++i) pairs.push_back(2 * MIB);
++        for (int i = 0; i < 100; ++i) pairs.push_back(256 * 1024);
++        std::vector<uint64_t> offs(pairs.size() + 1, 0);
++        for (size_t i = 0; i < pairs.size(); ++i)
++            offs[(size_t) i + 1] = offs[(size_t) i] + (uint64_t) ((pairs[(size_t) i] + 255) / 256 * 256);
++        CacheLendView sized;
++        sized.slots = (int64_t) pairs.size();
++        sized.bytes = (int64_t) offs.back();
++        sized.slot_offsets = offs.data();
++        sized.max_blob = BLOB;
++        VramAdvisory fixed1792 = startup;
++        fixed1792.selected_prefill = 1792;
++        const EffectivePrefillPlan r15 = revalidate_prefill_after_cache(fixed1792, sized, opts, costs);
++        check(r15.owned && r15.chunk == 1792, "R15: the sized cache revalidates over exact offsets - owned");
++        const EffectivePrefillPlan r15u = revalidate_prefill_after_cache(fixed1792, view_of(400), opts, costs);
++        check(r15u.borrowed && r15u.chunk == 1792,
++              "R15: the uniform view of the same slot count lends - the revalidation did not use it");
++    }
++
++    // ---- R12-R14: the post-touch verdict arithmetic (informational: the engine's own loop shrinks)
++    {
++        const PostTouchVerdict r12 =
++            post_touch_verdict((uint64_t) 1200 * MIB, (uint64_t) 1900 * MIB, 64ll << 20, true);
++        check(!r12.accept && r12.give_back_bytes >= (int64_t) 700 * MIB,
++              "R12: borrowed->owned reports a shortfall of ~700+ MiB");
++        const PostTouchVerdict r13 =
++            post_touch_verdict((uint64_t) 800 * MIB, (uint64_t) 1900 * MIB, 64ll << 20, false);
++        check(!r13.accept && r13.give_back_bytes == 0, "R13: the last cache reports the shortfall without a target");
++        const PostTouchVerdict r14 =
++            post_touch_verdict((uint64_t) 1900 * MIB, (uint64_t) 1900 * MIB, 64ll << 20, false);
++        check(r14.accept, "R14: the last cache that meets the budget is accepted");
++    }
++
++    // ---- R16-R18: the borrowing capability is ONE resolved flag; the advisory predicts owned whenever it is
++    // off, whatever the profile's presence would suggest
++    {
++        AdvisoryInput cap = plan_input((uint64_t) 760 * BLOB + 700 * MIB);
++        cap.prefill_borrow = true;              // R16: available (profile + not disabled)
++        cap.prefill_chunk = 4096;
++        const VramAdvisory on = advise_startup_vram(cap);
++        check_healthy(on, cap.free_bytes, "R16: the borrowing prediction is healthy");
++        check(!on.prefill_owned && on.selected_prefill == 4096 && on.lend_slots > 0,
++              "R16: with borrowing available the prediction lends the chunk");
++        // R17: the capability resolved off (no profile or --no-prefill-borrow) plans owned at the same chunk
++        AdvisoryInput off = cap;
++        off.prefill_borrow = false;
++        const VramAdvisory r17 = advise_startup_vram(off);
++        check(!r17.has_warning() && r17.prefill_owned && r17.selected_prefill == 4096 && r17.lend_slots == 0,
++              "R17: a resolved-off capability predicts owned buffers at the same chunk");
++        // R18: the disabled flag keeps both sides owned - the runtime reads the same flag
++        check(!off.prefill_borrow && r17.prefill_owned && !r17.prefill_borrow,
++              "R18: the disabled flag keeps both sides owned");
++    }
++
++    // ---- E1-E5: the fallbacks a WDDM driver used to paper over, predicted and said
++    {
++        // E1: auto with nothing to lend - the owned 1024 fallback is an explicit, priced, WARNED state
++        AdvisoryInput e1 = plan_input((uint64_t) 100 * BLOB + 700 * MIB);
++        e1.prefill_borrow = true;
++        e1.prefill_auto = true;
++        const VramAdvisory p1 = advise_startup_vram(e1);
++        check(p1.prefill_owned && p1.lend_slots == 0 && p1.selected_prefill > 0 && p1.selected_prefill <= 1024,
++              "E1: the auto->owned fallback is an explicit, priced prediction (the chunk itself may be reduced)");
++        // E2: the requested owned chunk does not fit, a smaller one does - the shortfall is WARNED with the knobs
++        AdvisoryInput e2 = plan_input((uint64_t) 700 * MIB + fake_bytes(6144, -1) + MARGIN + (uint64_t) 100 * MIB);
++        e2.prefill_borrow = true;               // lending is tried first and fails; the chunk is owned either way
++        e2.prefill_chunk = 24576;
++        const VramAdvisory p2 = advise_startup_vram(e2);
++        check(p2.has_warning() && p2.short_by_bytes > 0,
++              "E2: the over-budget chunk is a warning with a shortfall, not a stop");
++        check(p2.selected_prefill == 24576, "E2: the advisory does not invent a chunk - the engine's init may");
++        bool noted = false;
++        for (const std::string& w : p2.warnings) noted = noted || w.find("short by") != std::string::npos;
++        check(noted, "E2: the shortfall is said at planning, before Prefill::init() could hit it");
++        // E3: even 512 does not fit - warned; the caller prints it and the engine's own error path stays theirs
++        AdvisoryInput e3 = plan_input((uint64_t) 700 * MIB + fake_bytes(256, -1));
++        e3.prefill_chunk = 24576;
++        const VramAdvisory p3 = advise_startup_vram(e3);
++        check(p3.has_warning() && p3.short_by_bytes > 0,
++              "E3: nothing fits - the advisory WARNS instead of refusing startup");
++        check(p3.selected_prefill == 24576 && p3.expert_slots >= 0,
++              "E3: the numbers stay usable for the warning line");
++        // E5: the price is the injected exact bytes plus the margin, for the chunk the plan actually reports
++        check(p1.prefill_bytes == fake_bytes(p1.selected_prefill, -1) + MARGIN,
++              "E5: the fallback's price is bytes_owned(selected)");
++    }
++
++    // ---- R19-R28: the runtime-vs-prediction checker - a mismatch is REPORTABLE, and every rule is
++    // "less is allowed"; no result here is permission to stop
++    {
++        const auto use = [](bool borrowed, int64_t chunk) {
++            return RuntimePrefillUse{borrowed, chunk};
++        };
++        const auto mismatch_of = [](const EffectivePrefillPlan& e, const RuntimePrefillUse& u) {
++            return check_runtime_prefill_use(e, u).mismatch;
++        };
++        const EffectivePrefillPlan borrowed8192 = [] {
++            EffectivePrefillPlan e;
++            e.borrowed = true;
++            e.chunk = 8192;
++            e.lend_slots = 455;
++            return e;
++        }();
++        const EffectivePrefillPlan owned2048 = [] {
++            EffectivePrefillPlan e;
++            e.owned = true;
++            e.chunk = 2048;
++            return e;
++        }();
++        // R19: predicted borrowed, runtime owned - the late failure part B closes; the checker NAMES it
++        check(mismatch_of(borrowed8192, use(false, 8192)), "R19: borrowed predicted, owned runtime is a mismatch");
++        // R20: predicted borrowed, matching loan
++        check(!mismatch_of(borrowed8192, use(true, 8192)), "R20: borrowed predicted, borrowed runtime matches");
++        // R21: predicted owned, runtime borrowed
++        check(mismatch_of(owned2048, use(true, 2048)), "R21: owned predicted, borrowed runtime is a mismatch");
++        // R22 + R24: the auto owned fallback's chunk is the ceiling; a runtime above it is a mismatch
++        const EffectivePrefillPlan accepted768 = [] {
++            EffectivePrefillPlan e;
++            e.owned = true;
++            e.chunk = 768;
++            return e;
++        }();
++        check(!mismatch_of(accepted768, use(false, 768)), "R22: the runtime runs the predicted 768 for a long prompt");
++        check(mismatch_of(accepted768, use(false, 1024)), "R22: the runtime fallback restored to 1024 is reported");
++        // R23: a shorter prompt may run less
++        check(!mismatch_of(accepted768, use(false, 512)), "R23: owned 512 for a short prompt matches");
++        // R25: a borrowed auto chunk larger than predicted is reported
++        check(mismatch_of(
++                  [] { EffectivePrefillPlan e; e.borrowed = true; e.chunk = 4096; return e; }(),
++                  use(true, 8192)),
++              "R25: borrowed 8192 over predicted 4096 is a mismatch");
++        // R26: a shorter borrowed request is allowed
++        check(!mismatch_of(borrowed8192, use(true, 2048)), "R26: borrowed 2048 under predicted 8192 matches");
++        // the loan's BYTES are part of the comparison: a shorter chunk under a different ring rule could price
++        // a bigger loan than the predicted one, so the chunk alone does not prove safety
++        EffectivePrefillPlan loan_cap = borrowed8192;
++        loan_cap.lend_bytes = (uint64_t) 4 << 30;   // the predicted loan's bytes
++        check(!mismatch_of(loan_cap, RuntimePrefillUse{true, 4096, (uint64_t) 2 << 30}),
++              "R34: a shorter request's smaller loan matches the byte ceiling");
++        check(mismatch_of(loan_cap, RuntimePrefillUse{true, 512, (uint64_t) 5 << 30}),
++              "R34: a short chunk whose ring prices a bigger loan than predicted is reported");
++        // the `why` text is what the caller's warning line prints
++        const RuntimePlanCheck c = check_runtime_prefill_use(borrowed8192, use(false, 8192));
++        check(c.mismatch && c.why != nullptr && std::string(c.why).find("borrow") != std::string::npos,
++              "R19: the mismatch names the difference, for the caller's warning");
++    }
++
++    // ---- env flags: one parser, unset means the caller's default, =0 is off, anything else is on
++    {
++        check(env_enabled(nullptr, true) && env_enabled("", true), "env: unset/empty with default on is on");
++        check(!env_enabled(nullptr, false) && !env_enabled("", false), "env: unset/empty with default off is off");
++        check(!env_enabled("0", true), "env: =0 is off even with default on (STRATA_ADVISORY_PLAN=0)");
++        check(!env_enabled("0", false), "env: =0 is off (STRATA_POSTTOUCH=0)");
++        check(env_enabled("1", false) && env_enabled("true", false) && env_enabled("yes", false),
++              "env: any non-zero value is on");
++        check(!env_enabled("00", true), "env: a value starting with 0 is off");
++    }
++
++    if (fails == 0) std::fprintf(stderr, "vram_plan_test: all checks passed\n");
++    return fails == 0 ? 0 : 1;
++}

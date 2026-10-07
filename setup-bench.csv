@@ -1,0 +1,5 @@
+test,prompt_tokens,prefill_tok_s,decode_tokens,decode_tok_s,draft_n,draft_accepted,reasoning_effort,notes
+cold_first_answer,18,11.6,7,16.4,4,4,none,first request after model load
+code_answer,30,31.4,220,10.2,174,155,none,fibonacci function with docstring
+warm_chat_answer,36,17.5,197,15.3,191,101,none,explain why the sky is blue
+long_prompt_summary,2063,117.8,124,17.8,98,66,none,2063-token prompt + 3 bullets

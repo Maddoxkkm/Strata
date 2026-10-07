@@ -1,0 +1,1502 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cd60517799..f27d3d89da 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -527,6 +527,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_executable(tune_hipblaslt tools/hip/tune_hipblaslt.cpp)
+     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
+   endif()
++  if(STRATA_ENABLE_HIP AND STRATA_ROCBLAS_AVAILABLE)
++    # the prompt path's rocBLAS solution table (STRATA_ROCBLAS_TUNING; tools/hip/tune_rocblas makes one)
++    target_compile_definitions(strata_prefill PRIVATE STRATA_ROCBLAS_AVAILABLE=1)
++    target_link_libraries(strata_prefill PRIVATE roc::rocblas)
++
++    add_executable(tune_rocblas tools/hip/tune_rocblas.cpp)
++    target_link_libraries(tune_rocblas PRIVATE hip::host roc::rocblas)
++  endif()
+ 
+   add_executable(strata src/program/generate.cpp)
+   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
+@@ -620,6 +628,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+       set_tests_properties(hip_prefill_hipblaslt_gemm PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+       list(APPEND _strata_hip_tests hip_prefill_hipblaslt_gemm)
+     endif()
++    if(STRATA_ROCBLAS_AVAILABLE)
++      # the rocBLAS solution table of the FP16-out prompt GEMMs (gfx103x): opt-in, skips without STRATA_ROCBLAS_TUNING
++      add_executable(hip_prefill_rocblas_gemm tests/hip/prefill_rocblas_gemm.cpp)
++      target_include_directories(hip_prefill_rocblas_gemm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
++      target_link_libraries(hip_prefill_rocblas_gemm PRIVATE strata_prefill strata_hip_runtime roc::rocblas roc::hipblas)
++      add_test(NAME hip_prefill_rocblas_gemm COMMAND hip_prefill_rocblas_gemm)
++      set_tests_properties(hip_prefill_rocblas_gemm PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
++      list(APPEND _strata_hip_tests hip_prefill_rocblas_gemm)
++    endif()
+     if(_strata_hip_tests)
+       set_tests_properties(${_strata_hip_tests} PROPERTIES TIMEOUT 60)
+     endif()
+@@ -629,6 +646,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     if(TARGET hip_prefill_hipblaslt_gemm)
+       set_tests_properties(hip_prefill_hipblaslt_gemm PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+     endif()
++    if(TARGET hip_prefill_rocblas_gemm)
++      set_tests_properties(hip_prefill_rocblas_gemm PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
++    endif()
+   endif()
+ 
+   add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
+diff --git a/bench/results/2026-10-05-rdna2-rocblas-table/README.md b/bench/results/2026-10-05-rdna2-rocblas-table/README.md
+new file mode 100644
+index 0000000000..fb9e5e363d
+--- /dev/null
++++ b/bench/results/2026-10-05-rdna2-rocblas-table/README.md
+@@ -0,0 +1,80 @@
++# RX 6900 XT (gfx1030): rocBLAS's kernel choice for the FP16 prompt GEMMs, and a solution table (2026-10-05)
++
++On gfx103x the prompt path's dense GEMMs run through rocBLAS as FP16 in -> FP16 out (#835). rocBLAS picks the kernel
++for each product from its own table by shape, and for some shapes that pick is far from the best kernel the same library
++holds. The clearest case is the GDN input projection, N = 10240, K = 2560: below T = 1152 tokens rocBLAS's choice runs at
++5.2-5.3 TFLOPS (n = 682 ... 1120, measured with `rocblas_gemm_ex` on this card, 8.1 ms at n = 799), at T = 1152 it jumps
++to 38 TFLOPS (1.6 ms), and the best of the 237 solutions `rocblas_gemm_ex_get_solutions` lists for n = 799 runs it in
++1.36 ms. It is not an alignment effect (n = 800 is as slow as 799). In the engine's own phase timing this is why the
++"gdn" phase of a 799-token prompt (445 ms) was nearly as long as that of an 8,874-token one (1,345 ms).
++
++`tools/hip/tune_rocblas.cpp` enumerates rocBLAS's solutions per shape and token bucket, times them, checks the fastest
++against the default kernel's output and writes the winners as a table; `Gemm::f16_inplace` runs the table's solution for
++a shape in place of rocBLAS's choice (`STRATA_ROCBLAS_TUNING`; docs/AMD_HIP.md, "rocBLAS table"). The table shipped,
++`tools/hip/gfx1030-rocblas-5.6.0.8d1ae90e.txt`, is calibrated against rocBLAS 5.6.0.8d1ae90e (ROCm 10.0.0,
++`/opt/rocm/lib`); its indices are valid for that build only, and the engine refuses any other.
++
++## Rig
++
++- AMD Radeon RX 6900 XT 16 GB (gfx1030), PCIe 4.0 x8, one card of two (`HIP_VISIBLE_DEVICES` as setup sets it); AMD
++  Ryzen 5 5600X (6 cores, AVX2), 128 GB DDR4-3200; Ubuntu 26.04, kernel 7.0.0-38-generic, ROCm 10.0.0 (HIP 7.15.26333).
++  Note that a HIP build on this Ubuntu links Ubuntu's own `librocblas5` (a 5.1 build, package 7.1.0-1ubuntu4) unless
++  `lib_dirs` (`/opt/rocm/lib`) puts ROCm's first: the engine runs below had `lib_dirs` set, as setup's configuration does.
++  rocBLAS 5.1's default kernel for the shape above is as slow (8.1 ms at n = 799, measured too); its solution indices
++  differ, so it would need its own table.
++- Model: Qwen3.8-Flash-Next GSQ-RCO IQ3_S (2 shards, `--native`), MTP draft, `--kv int8 --kv-resident 32768
++  --max-context 131072 --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --adapt-every 100000` (the last the
++  #884 workaround; it does not touch the prompt path).
++- Engine: `6f32ec0` (0.1.39) + #835 + this change, `-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1030
++  -DSTRATA_PREFILL_MMQ=ON`. #849 is not in this build, so the `qsa attn` phase is the slow pre-#849 kernel here (the same
++  in both arms).
++
++## Table
++
++`tune_rocblas --tuning-out ...` with the defaults: the engine's 14 FP16 dense shapes (ldy = N) at T = 256, 512, 768,
++1024, 1536, 2048, 4096, 8192; 112 rows, 76 with a solution that beat the default by at least 5% and also ran at T-1,
++T-37, T-63 and T/2+1 (a kernel can refuse a token count it was not measured at), `default` for the other 36.
++[tune-summary.txt](tune-summary.txt) is the tool's per-case output (default ms, best solution, gain). The large gains
++are at small T: N = 10240 K = 2560 at T = 256 ... 1024, 7.0-7.8x; N = 12288 K = 2560 at T = 256, 5.8x; N = 6144 K =
++2560 at T = 256 / 512, 3.6-3.8x; N = 2560 K = 6144 at T = 256, 4.5x; N = 320 K = 10240 (`hc read`), 2.5-8.7x across the
++buckets. At T >= 2048 most shapes keep the default (1.0-1.2x where a solution still wins).
++
++## Method
++
++One server per arm, the same binary; `STRATA_PREFILL_TIMING=1` (the engine's prompt-phase timing),
++`STRATA_ROCBLAS_VERBOSE=1`; the on arm with `STRATA_ROCBLAS_TUNING` pointing at the directory holding the table. Four
++prompts from four different offsets of one text (no prefix reuse between them), "Reply with one word", `max_tokens` 8,
++temperature 0; the answer text compared between arms. The GPU timeline is the engine's `strata prefill timing` line; the
++per-phase numbers are its phases ([timing-off.txt](timing-off.txt), [timing-on.txt](timing-on.txt)). One run per arm; the off
++arm repeated an earlier run of the same prompts the same day (with the table's first version) to within 10 ms on every
++prompt, and the on arm's gains repeated within 100 ms.
++
++## Results
++
++| prompt tokens (read) | arm | GPU timeline ms | gdn | hc read | wait copy | answer |
++| ---: | --- | ---: | ---: | ---: | ---: | --- |
++| 806 (799) | default | 3,329 | 443 | 270 | 1,376 | Estimated |
++| 806 (799) | **table** | **2,985** | 177 | 77 | 1,384 | Estimated |
++| 502 (495) | default | 2,477 | 365 | 81 | 1,077 | Incomplete |
++| 502 (495) | **table** | **2,139** | 146 | 52 | 1,075 | Incomplete |
++| 1,115 (1,108) | default | 3,391 | 598 | 158 | 1,144 | Incomplete |
++| 1,115 (1,108) | table | 3,395 | 201 | 99 | 1,637 | Incomplete |
++| 8,881 (8,874) | default | 11,978 | 1,346 | 1,200 | 1,683 | Strata |
++| 8,881 (8,874) | **table** | **11,459** | 1,128 | 898 | 1,670 | Strata |
++
++- 799 tokens: -10.3%; 495 tokens: -13.6%; 8,874 tokens: -4.3% (the 682-token tail chunk's projections, and `hc read`
++  at both chunks).
++- 1,108 tokens: no change. Its GDN time fell by 397 ms and `wait copy` rose by 493 ms: that prompt is bound by the
++  experts' PCIe transfer, and a faster GEMM only brings the GPU to the wait sooner. Which prompts are copy-bound depends
++  on how many distinct experts they touch, not on their length alone.
++- The answers are the same in all four pairs. The tuner checked each solution it kept against the default kernel's FP16
++  output (relative L2 within 2e-3, no element beyond 4 FP16 ulps of the largest output, nothing written outside the
++  N x T result); in the engine's run no solution was refused (0 fallbacks over 52 shape-and-T combinations served).
++- Decode does not use these GEMMs; not measured here.
++
++## Limits
++
++One machine, one card, one model; one run per arm, four prompts. The table is for one rocBLAS build; another build (or
++ROCm's 5.1 packaged by Ubuntu) needs `tune_rocblas` run against it. Prompts above ~1,150 tokens gain only through their
++tail chunk and `hc read`, and copy-bound prompts gain nothing. Whether other gfx103x cards (gfx1031 / gfx1032) share
++rocBLAS's gfx1030 kernel table was not checked; the engine's architecture check would refuse this table on them.
+diff --git a/bench/results/2026-10-05-rdna2-rocblas-table/timing-off.txt b/bench/results/2026-10-05-rdna2-rocblas-table/timing-off.txt
+new file mode 100644
+index 0000000000..8d3a86c041
+--- /dev/null
++++ b/bench/results/2026-10-05-rdna2-rocblas-table/timing-off.txt
+@@ -0,0 +1,9 @@
++strata serve: prompt chunk auto: 8192 tokens, a 384-slot ring
++strata prefill timing: 799 tokens, GPU timeline 3329 ms, wall 3339 ms, host staging 55 ms: embed+steps 5 (0.2%) hc read 270 (8.1%) gdn 443 (13.3%) qsa proj 91 (2.7%) qsa indexer 0 (0.0%) qsa select 1 (0.0%) qsa attn 50 (1.5%) router+shared 44 (1.3%) host grouping 12 (0.3%) gather 11 (0.3%) wait copy 1376 (41.3%) dequant 415 (12.5%) gemm gate/up 311 (9.3%) gemm down 155 (4.6%) combine 18 (0.5%) ple 10 (0.3%) kv stage 0 (0.0%) gdn conv+gates 5 (0.1%) gdn recurrence 35 (1.0%) gdn out proj 78 (2.3%)
++strata serve: prompt 806 tokens = 0 reused + 806 read in 3635 ms (221.7 tok/s), 2 generated in 140 ms (14.3 tok/s), drafts accepted 3 of 3, 1 checkpoints
++strata prefill timing: 495 tokens, GPU timeline 2477 ms, wall 2479 ms, host staging 107 ms: embed+steps 0 (0.0%) hc read 81 (3.3%) gdn 365 (14.7%) qsa proj 83 (3.4%) qsa indexer 0 (0.0%) qsa select 0 (0.0%) qsa attn 24 (1.0%) router+shared 77 (3.1%) host grouping 15 (0.6%) gather 3 (0.1%) wait copy 1077 (43.5%) dequant 319 (12.9%) gemm gate/up 223 (9.0%) gemm down 109 (4.4%) combine 10 (0.4%) ple 6 (0.2%) kv stage 0 (0.0%) gdn conv+gates 3 (0.1%) gdn recurrence 20 (0.8%) gdn out proj 61 (2.5%)
++strata serve: prompt 502 tokens = 0 reused + 502 read in 2667 ms (188.2 tok/s), 2 generated in 114 ms (17.5 tok/s), drafts accepted 3 of 3, 1 checkpoints
++strata prefill timing: 1108 tokens, GPU timeline 3391 ms, wall 3396 ms, host staging 184 ms: embed+steps 3 (0.1%) hc read 158 (4.7%) gdn 598 (17.6%) qsa proj 117 (3.5%) qsa indexer 0 (0.0%) qsa select 2 (0.0%) qsa attn 88 (2.6%) router+shared 53 (1.6%) host grouping 14 (0.4%) gather 7 (0.2%) wait copy 1144 (33.7%) dequant 454 (13.4%) gemm gate/up 358 (10.6%) gemm down 179 (5.3%) combine 26 (0.8%) ple 14 (0.4%) kv stage 0 (0.0%) gdn conv+gates 12 (0.3%) gdn recurrence 55 (1.6%) gdn out proj 109 (3.2%)
++strata serve: prompt 1115 tokens = 0 reused + 1115 read in 3676 ms (303.3 tok/s), 2 generated in 115 ms (17.4 tok/s), drafts accepted 3 of 3, 1 checkpoints
++strata prefill timing: 8874 tokens, GPU timeline 11978 ms, wall 11981 ms, host staging 336 ms: embed+steps 38 (0.3%) hc read 1200 (10.0%) gdn 1346 (11.2%) qsa proj 597 (5.0%) qsa indexer 1 (0.0%) qsa select 62 (0.5%) qsa attn 1897 (15.8%) router+shared 228 (1.9%) host grouping 42 (0.3%) gather 56 (0.5%) wait copy 1683 (14.1%) dequant 854 (7.1%) gemm gate/up 1428 (11.9%) gemm down 706 (5.9%) combine 768 (6.4%) ple 34 (0.3%) kv stage 8 (0.1%) gdn conv+gates 92 (0.8%) gdn recurrence 491 (4.1%) gdn out proj 447 (3.7%)
++strata serve: prompt 8881 tokens = 0 reused + 8881 read in 12470 ms (712.2 tok/s), 3 generated in 117 ms (25.7 tok/s), drafts accepted 3 of 3, 1 checkpoints
+diff --git a/bench/results/2026-10-05-rdna2-rocblas-table/timing-on.txt b/bench/results/2026-10-05-rdna2-rocblas-table/timing-on.txt
+new file mode 100644
+index 0000000000..4580cfbcde
+--- /dev/null
++++ b/bench/results/2026-10-05-rdna2-rocblas-table/timing-on.txt
+@@ -0,0 +1,9 @@
++strata serve: prompt chunk auto: 8192 tokens, a 384-slot ring
++strata prefill timing: 799 tokens, GPU timeline 2985 ms, wall 2994 ms, host staging 58 ms: embed+steps 5 (0.2%) hc read 77 (2.6%) gdn 177 (5.9%) qsa proj 89 (3.0%) qsa indexer 0 (0.0%) qsa select 1 (0.0%) qsa attn 51 (1.7%) router+shared 156 (5.2%) host grouping 12 (0.4%) gather 14 (0.5%) wait copy 1384 (46.4%) dequant 414 (13.9%) gemm gate/up 313 (10.5%) gemm down 154 (5.2%) combine 18 (0.6%) ple 3 (0.1%) kv stage 0 (0.0%) gdn conv+gates 5 (0.2%) gdn recurrence 35 (1.2%) gdn out proj 78 (2.6%)
++strata serve: prompt 806 tokens = 0 reused + 806 read in 3296 ms (244.5 tok/s), 2 generated in 140 ms (14.3 tok/s), drafts accepted 3 of 3, 1 checkpoints
++strata prefill timing: 495 tokens, GPU timeline 2139 ms, wall 2142 ms, host staging 98 ms: embed+steps 0 (0.0%) hc read 52 (2.5%) gdn 146 (6.8%) qsa proj 66 (3.1%) qsa indexer 0 (0.0%) qsa select 0 (0.0%) qsa attn 24 (1.1%) router+shared 29 (1.3%) host grouping 10 (0.5%) gather 3 (0.2%) wait copy 1075 (50.3%) dequant 318 (14.9%) gemm gate/up 222 (10.4%) gemm down 109 (5.1%) combine 10 (0.5%) ple 2 (0.1%) kv stage 0 (0.0%) gdn conv+gates 3 (0.1%) gdn recurrence 20 (0.9%) gdn out proj 50 (2.3%)
++strata serve: prompt 502 tokens = 0 reused + 502 read in 2336 ms (214.9 tok/s), 2 generated in 124 ms (16.1 tok/s), drafts accepted 3 of 3, 1 checkpoints
++strata prefill timing: 1108 tokens, GPU timeline 3395 ms, wall 3399 ms, host staging 176 ms: embed+steps 3 (0.1%) hc read 99 (2.9%) gdn 201 (5.9%) qsa proj 109 (3.2%) qsa indexer 0 (0.0%) qsa select 2 (0.0%) qsa attn 88 (2.6%) router+shared 51 (1.5%) host grouping 12 (0.4%) gather 7 (0.2%) wait copy 1637 (48.2%) dequant 448 (13.2%) gemm gate/up 360 (10.6%) gemm down 179 (5.3%) combine 26 (0.8%) ple 3 (0.1%) kv stage 0 (0.0%) gdn conv+gates 11 (0.3%) gdn recurrence 54 (1.6%) gdn out proj 102 (3.0%)
++strata serve: prompt 1115 tokens = 0 reused + 1115 read in 3685 ms (302.6 tok/s), 2 generated in 115 ms (17.4 tok/s), drafts accepted 3 of 3, 1 checkpoints
++strata prefill timing: 8874 tokens, GPU timeline 11459 ms, wall 11461 ms, host staging 329 ms: embed+steps 39 (0.3%) hc read 898 (7.8%) gdn 1128 (9.8%) qsa proj 595 (5.2%) qsa indexer 1 (0.0%) qsa select 62 (0.5%) qsa attn 1901 (16.6%) router+shared 214 (1.9%) host grouping 41 (0.4%) gather 56 (0.5%) wait copy 1670 (14.6%) dequant 860 (7.5%) gemm gate/up 1434 (12.5%) gemm down 710 (6.2%) combine 783 (6.8%) ple 28 (0.2%) kv stage 8 (0.1%) gdn conv+gates 92 (0.8%) gdn recurrence 492 (4.3%) gdn out proj 447 (3.9%)
++strata serve: prompt 8881 tokens = 0 reused + 8881 read in 11952 ms (743.0 tok/s), 3 generated in 155 ms (19.3 tok/s), drafts accepted 3 of 3, 1 checkpoints
+diff --git a/bench/results/2026-10-05-rdna2-rocblas-table/tune-summary.txt b/bench/results/2026-10-05-rdna2-rocblas-table/tune-summary.txt
+new file mode 100644
+index 0000000000..e82205bbca
+--- /dev/null
++++ b/bench/results/2026-10-05-rdna2-rocblas-table/tune-summary.txt
+@@ -0,0 +1,226 @@
++meta device_arch=gfx1030 rocblas_version=5.6.0.8d1ae90e shapes=112 min_gain=1.050
++case T=256 N=10240 K=2560 ldy=10240 default_ms=2.3582 default_padding_writes=0
++best T=256 N=10240 K=2560 ldy=10240 solution=-1086327703 ms=0.3478 default_ms=2.3582 gain=6.78
++case T=512 N=10240 K=2560 ldy=10240 default_ms=4.9305 default_padding_writes=0
++best T=512 N=10240 K=2560 ldy=10240 solution=-1086327703 ms=0.6744 default_ms=4.9305 gain=7.31
++case T=768 N=10240 K=2560 ldy=10240 default_ms=7.5687 default_padding_writes=0
++best T=768 N=10240 K=2560 ldy=10240 solution=-1086327719 ms=1.0134 default_ms=7.5687 gain=7.47
++case T=1024 N=10240 K=2560 ldy=10240 default_ms=10.1879 default_padding_writes=0
++best T=1024 N=10240 K=2560 ldy=10240 solution=-1086327687 ms=1.4093 default_ms=10.1879 gain=7.23
++case T=1536 N=10240 K=2560 ldy=10240 default_ms=1.9304 default_padding_writes=0
++keep_default T=1536 N=10240 K=2560 ldy=10240 (237 solutions; best 1.9404 ms vs default 1.9304)
++case T=2048 N=10240 K=2560 ldy=10240 default_ms=2.5629 default_padding_writes=0
++keep_default T=2048 N=10240 K=2560 ldy=10240 (237 solutions; best 2.5848 ms vs default 2.5629)
++case T=4096 N=10240 K=2560 ldy=10240 default_ms=5.2270 default_padding_writes=0
++keep_default T=4096 N=10240 K=2560 ldy=10240 (237 solutions; best 5.5127 ms vs default 5.2270)
++case T=8192 N=10240 K=2560 ldy=10240 default_ms=12.2560 default_padding_writes=0
++keep_default T=8192 N=10240 K=2560 ldy=10240 (237 solutions; best 12.1342 ms vs default 12.2560)
++case T=256 N=12288 K=2560 ldy=12288 default_ms=3.0070 default_padding_writes=0
++best T=256 N=12288 K=2560 ldy=12288 solution=-1086327718 ms=0.5044 default_ms=3.0070 gain=5.96
++case T=512 N=12288 K=2560 ldy=12288 default_ms=1.0101 default_padding_writes=0
++best T=512 N=12288 K=2560 ldy=12288 solution=-1086327703 ms=0.8314 default_ms=1.0101 gain=1.21
++case T=768 N=12288 K=2560 ldy=12288 default_ms=1.5441 default_padding_writes=0
++best T=768 N=12288 K=2560 ldy=12288 solution=-1086327703 ms=1.3048 default_ms=1.5441 gain=1.18
++case T=1024 N=12288 K=2560 ldy=12288 default_ms=1.8461 default_padding_writes=0
++best T=1024 N=12288 K=2560 ldy=12288 solution=-1086327687 ms=1.6263 default_ms=1.8461 gain=1.14
++case T=1536 N=12288 K=2560 ldy=12288 default_ms=2.6097 default_padding_writes=0
++best T=1536 N=12288 K=2560 ldy=12288 solution=-1086327687 ms=2.4141 default_ms=2.6097 gain=1.08
++case T=2048 N=12288 K=2560 ldy=12288 default_ms=3.3976 default_padding_writes=0
++best T=2048 N=12288 K=2560 ldy=12288 solution=-1086327687 ms=3.2127 default_ms=3.3976 gain=1.06
++case T=4096 N=12288 K=2560 ldy=12288 default_ms=6.8017 default_padding_writes=0
++keep_default T=4096 N=12288 K=2560 ldy=12288 (237 solutions; best 6.8216 ms vs default 6.8017)
++case T=8192 N=12288 K=2560 ldy=12288 default_ms=14.3542 default_padding_writes=0
++keep_default T=8192 N=12288 K=2560 ldy=12288 (237 solutions; best 14.9711 ms vs default 14.3542)
++case T=256 N=6144 K=2560 ldy=6144 default_ms=0.9801 default_padding_writes=0
++best T=256 N=6144 K=2560 ldy=6144 solution=-1086327717 ms=0.2813 default_ms=0.9801 gain=3.48
++case T=512 N=6144 K=2560 ldy=6144 default_ms=1.8331 default_padding_writes=0
++best T=512 N=6144 K=2560 ldy=6144 solution=-1086327703 ms=0.5097 default_ms=1.8331 gain=3.60
++case T=768 N=6144 K=2560 ldy=6144 default_ms=0.6667 default_padding_writes=0
++keep_default T=768 N=6144 K=2560 ldy=6144 (237 solutions; best 0.6687 ms vs default 0.6667)
++case T=1024 N=6144 K=2560 ldy=6144 default_ms=0.8296 default_padding_writes=0
++keep_default T=1024 N=6144 K=2560 ldy=6144 (237 solutions; best 0.8873 ms vs default 0.8296)
++case T=1536 N=6144 K=2560 ldy=6144 default_ms=1.2994 default_padding_writes=0
++keep_default T=1536 N=6144 K=2560 ldy=6144 (237 solutions; best 1.3967 ms vs default 1.2994)
++case T=2048 N=6144 K=2560 ldy=6144 default_ms=2.4454 default_padding_writes=0
++best T=2048 N=6144 K=2560 ldy=6144 solution=-1086327687 ms=1.6310 default_ms=2.4454 gain=1.50
++case T=4096 N=6144 K=2560 ldy=6144 default_ms=3.2071 default_padding_writes=0
++keep_default T=4096 N=6144 K=2560 ldy=6144 (237 solutions; best 3.2142 ms vs default 3.2071)
++case T=8192 N=6144 K=2560 ldy=6144 default_ms=6.3302 default_padding_writes=0
++keep_default T=8192 N=6144 K=2560 ldy=6144 (237 solutions; best 6.7397 ms vs default 6.3302)
++case T=256 N=2560 K=6144 ldy=2560 default_ms=1.3017 default_padding_writes=0
++best T=256 N=2560 K=6144 ldy=2560 solution=-1086327764 ms=0.2927 default_ms=1.3017 gain=4.45
++case T=512 N=2560 K=6144 ldy=2560 default_ms=1.2293 default_padding_writes=0
++best T=512 N=2560 K=6144 ldy=2560 solution=-1086327719 ms=0.4751 default_ms=1.2293 gain=2.59
++case T=768 N=2560 K=6144 ldy=2560 default_ms=0.7950 default_padding_writes=0
++keep_default T=768 N=2560 K=6144 ldy=2560 (275 solutions; best 0.7770 ms vs default 0.7950)
++case T=1024 N=2560 K=6144 ldy=2560 default_ms=1.0164 default_padding_writes=0
++best T=1024 N=2560 K=6144 ldy=2560 solution=-1086327719 ms=0.8868 default_ms=1.0164 gain=1.15
++case T=1536 N=2560 K=6144 ldy=2560 default_ms=1.5987 default_padding_writes=0
++best T=1536 N=2560 K=6144 ldy=2560 solution=-1086327703 ms=1.4385 default_ms=1.5987 gain=1.11
++case T=2048 N=2560 K=6144 ldy=2560 default_ms=1.8388 default_padding_writes=0
++keep_default T=2048 N=2560 K=6144 ldy=2560 (237 solutions; best 1.8535 ms vs default 1.8388)
++case T=4096 N=2560 K=6144 ldy=2560 default_ms=3.4526 default_padding_writes=0
++keep_default T=4096 N=2560 K=6144 ldy=2560 (237 solutions; best 3.7885 ms vs default 3.4526)
++case T=8192 N=2560 K=6144 ldy=2560 default_ms=7.1451 default_padding_writes=0
++keep_default T=8192 N=2560 K=6144 ldy=2560 (237 solutions; best 8.2445 ms vs default 7.1451)
++case T=256 N=2560 K=640 ldy=2560 default_ms=0.0435 default_padding_writes=0
++best T=256 N=2560 K=640 ldy=2560 solution=-1086327695 ms=0.0385 default_ms=0.0435 gain=1.13
++case T=512 N=2560 K=640 ldy=2560 default_ms=0.0729 default_padding_writes=0
++best T=512 N=2560 K=640 ldy=2560 solution=-1086327711 ms=0.0594 default_ms=0.0729 gain=1.23
++case T=768 N=2560 K=640 ldy=2560 default_ms=0.0965 default_padding_writes=0
++best T=768 N=2560 K=640 ldy=2560 solution=-1086327694 ms=0.0798 default_ms=0.0965 gain=1.21
++case T=1024 N=2560 K=640 ldy=2560 default_ms=0.1084 default_padding_writes=0
++best T=1024 N=2560 K=640 ldy=2560 solution=-1086327709 ms=0.0945 default_ms=0.1084 gain=1.15
++case T=1536 N=2560 K=640 ldy=2560 default_ms=0.1569 default_padding_writes=0
++best T=1536 N=2560 K=640 ldy=2560 solution=-1086327713 ms=0.1383 default_ms=0.1569 gain=1.13
++case T=2048 N=2560 K=640 ldy=2560 default_ms=0.1833 default_padding_writes=0
++keep_default T=2048 N=2560 K=640 ldy=2560 (237 solutions; best 0.1776 ms vs default 0.1833)
++case T=4096 N=2560 K=640 ldy=2560 default_ms=0.3481 default_padding_writes=0
++keep_default T=4096 N=2560 K=640 ldy=2560 (237 solutions; best 0.3392 ms vs default 0.3481)
++case T=8192 N=2560 K=640 ldy=2560 default_ms=0.6858 default_padding_writes=0
++keep_default T=8192 N=2560 K=640 ldy=2560 (237 solutions; best 0.6570 ms vs default 0.6858)
++case T=256 N=2560 K=2560 ldy=2560 default_ms=0.1292 default_padding_writes=0
++keep_default T=256 N=2560 K=2560 ldy=2560 (275 solutions; best 0.1254 ms vs default 0.1292)
++case T=512 N=2560 K=2560 ldy=2560 default_ms=0.2150 default_padding_writes=0
++best T=512 N=2560 K=2560 ldy=2560 solution=-1086327719 ms=0.2046 default_ms=0.2150 gain=1.05
++case T=768 N=2560 K=2560 ldy=2560 default_ms=0.3035 default_padding_writes=0
++keep_default T=768 N=2560 K=2560 ldy=2560 (275 solutions; best 0.3088 ms vs default 0.3035)
++case T=1024 N=2560 K=2560 ldy=2560 default_ms=0.4164 default_padding_writes=0
++best T=1024 N=2560 K=2560 ldy=2560 solution=-1086327719 ms=0.3567 default_ms=0.4164 gain=1.17
++case T=1536 N=2560 K=2560 ldy=2560 default_ms=0.5242 default_padding_writes=0
++keep_default T=1536 N=2560 K=2560 ldy=2560 (237 solutions; best 0.5240 ms vs default 0.5242)
++case T=2048 N=2560 K=2560 ldy=2560 default_ms=0.6880 default_padding_writes=0
++keep_default T=2048 N=2560 K=2560 ldy=2560 (237 solutions; best 0.6871 ms vs default 0.6880)
++case T=4096 N=2560 K=2560 ldy=2560 default_ms=1.5527 default_padding_writes=0
++best T=4096 N=2560 K=2560 ldy=2560 solution=-1086327703 ms=1.3273 default_ms=1.5527 gain=1.17
++case T=8192 N=2560 K=2560 ldy=2560 default_ms=2.8199 default_padding_writes=0
++best T=8192 N=2560 K=2560 ldy=2560 solution=-1086327703 ms=2.6153 default_ms=2.8199 gain=1.08
++case T=256 N=640 K=2560 ldy=640 default_ms=0.1526 default_padding_writes=0
++best T=256 N=640 K=2560 ldy=640 solution=-1086327725 ms=0.0563 default_ms=0.1526 gain=2.71
++case T=512 N=640 K=2560 ldy=640 default_ms=0.2008 default_padding_writes=0
++best T=512 N=640 K=2560 ldy=640 solution=-1086327724 ms=0.0830 default_ms=0.2008 gain=2.42
++case T=768 N=640 K=2560 ldy=640 default_ms=0.1659 default_padding_writes=0
++best T=768 N=640 K=2560 ldy=640 solution=-1086327723 ms=0.1138 default_ms=0.1659 gain=1.46
++case T=1024 N=640 K=2560 ldy=640 default_ms=0.2067 default_padding_writes=0
++best T=1024 N=640 K=2560 ldy=640 solution=-1086327764 ms=0.1255 default_ms=0.2067 gain=1.65
++case T=1536 N=640 K=2560 ldy=640 default_ms=0.2841 default_padding_writes=0
++best T=1536 N=640 K=2560 ldy=640 solution=-1086327719 ms=0.2013 default_ms=0.2841 gain=1.41
++case T=2048 N=640 K=2560 ldy=640 default_ms=0.2173 default_padding_writes=0
++best T=2048 N=640 K=2560 ldy=640 solution=-1086327703 ms=0.2062 default_ms=0.2173 gain=1.05
++case T=4096 N=640 K=2560 ldy=640 default_ms=0.3467 default_padding_writes=0
++keep_default T=4096 N=640 K=2560 ldy=640 (237 solutions; best 0.3515 ms vs default 0.3467)
++case T=8192 N=640 K=2560 ldy=640 default_ms=0.6892 default_padding_writes=0
++keep_default T=8192 N=640 K=2560 ldy=640 (237 solutions; best 0.6712 ms vs default 0.6892)
++case T=256 N=512 K=2560 ldy=512 default_ms=0.1569 default_padding_writes=0
++best T=256 N=512 K=2560 ldy=512 solution=-1086327769 ms=0.0474 default_ms=0.1569 gain=3.31
++case T=512 N=512 K=2560 ldy=512 default_ms=0.2025 default_padding_writes=0
++best T=512 N=512 K=2560 ldy=512 solution=-1086327722 ms=0.0734 default_ms=0.2025 gain=2.76
++case T=768 N=512 K=2560 ldy=512 default_ms=0.1474 default_padding_writes=0
++best T=768 N=512 K=2560 ldy=512 solution=-1086327774 ms=0.0978 default_ms=0.1474 gain=1.51
++case T=1024 N=512 K=2560 ldy=512 default_ms=0.1552 default_padding_writes=0
++best T=1024 N=512 K=2560 ldy=512 solution=-1086327722 ms=0.1194 default_ms=0.1552 gain=1.30
++case T=1536 N=512 K=2560 ldy=512 default_ms=0.2222 default_padding_writes=0
++best T=1536 N=512 K=2560 ldy=512 solution=-1086327768 ms=0.1703 default_ms=0.2222 gain=1.30
++case T=2048 N=512 K=2560 ldy=512 default_ms=0.2122 default_padding_writes=0
++keep_default T=2048 N=512 K=2560 ldy=512 (275 solutions; best 0.2031 ms vs default 0.2122)
++case T=4096 N=512 K=2560 ldy=512 default_ms=0.3443 default_padding_writes=0
++keep_default T=4096 N=512 K=2560 ldy=512 (275 solutions; best 0.3530 ms vs default 0.3443)
++case T=8192 N=512 K=2560 ldy=512 default_ms=0.6643 default_padding_writes=0
++keep_default T=8192 N=512 K=2560 ldy=512 (237 solutions; best 0.6684 ms vs default 0.6643)
++case T=256 N=128 K=2560 ldy=128 default_ms=0.0608 default_padding_writes=0
++best T=256 N=128 K=2560 ldy=128 solution=-1086327780 ms=0.0371 default_ms=0.0608 gain=1.64
++case T=512 N=128 K=2560 ldy=128 default_ms=0.1992 default_padding_writes=0
++best T=512 N=128 K=2560 ldy=128 solution=-1086327780 ms=0.0377 default_ms=0.1992 gain=5.28
++case T=768 N=128 K=2560 ldy=128 default_ms=0.1137 default_padding_writes=0
++best T=768 N=128 K=2560 ldy=128 solution=-1086327780 ms=0.0452 default_ms=0.1137 gain=2.52
++case T=1024 N=128 K=2560 ldy=128 default_ms=0.1180 default_padding_writes=0
++best T=1024 N=128 K=2560 ldy=128 solution=-1086327774 ms=0.0493 default_ms=0.1180 gain=2.40
++case T=1536 N=128 K=2560 ldy=128 default_ms=0.1520 default_padding_writes=0
++best T=1536 N=128 K=2560 ldy=128 solution=-1086327772 ms=0.0664 default_ms=0.1520 gain=2.29
++case T=2048 N=128 K=2560 ldy=128 default_ms=0.1242 default_padding_writes=0
++best T=2048 N=128 K=2560 ldy=128 solution=-1086327768 ms=0.0753 default_ms=0.1242 gain=1.65
++case T=4096 N=128 K=2560 ldy=128 default_ms=0.1512 default_padding_writes=0
++best T=4096 N=128 K=2560 ldy=128 solution=-1086327764 ms=0.1248 default_ms=0.1512 gain=1.21
++case T=8192 N=128 K=2560 ldy=128 default_ms=0.2066 default_padding_writes=0
++keep_default T=8192 N=128 K=2560 ldy=128 (275 solutions; best 0.2036 ms vs default 0.2066)
++case T=256 N=48 K=2560 ldy=48 default_ms=0.0456 default_padding_writes=0
++best T=256 N=48 K=2560 ldy=48 solution=-1086327840 ms=0.0208 default_ms=0.0456 gain=2.19
++case T=512 N=48 K=2560 ldy=48 default_ms=0.2023 default_padding_writes=0
++best T=512 N=48 K=2560 ldy=48 solution=-1086327781 ms=0.0387 default_ms=0.2023 gain=5.23
++case T=768 N=48 K=2560 ldy=48 default_ms=0.1029 default_padding_writes=0
++best T=768 N=48 K=2560 ldy=48 solution=-1086327779 ms=0.0418 default_ms=0.1029 gain=2.47
++case T=1024 N=48 K=2560 ldy=48 default_ms=0.1078 default_padding_writes=0
++best T=1024 N=48 K=2560 ldy=48 solution=-1086327779 ms=0.0439 default_ms=0.1078 gain=2.46
++case T=1536 N=48 K=2560 ldy=48 default_ms=0.1125 default_padding_writes=0
++best T=1536 N=48 K=2560 ldy=48 solution=-1086327776 ms=0.0512 default_ms=0.1125 gain=2.20
++case T=2048 N=48 K=2560 ldy=48 default_ms=0.1210 default_padding_writes=0
++best T=2048 N=48 K=2560 ldy=48 solution=-1086327779 ms=0.0565 default_ms=0.1210 gain=2.14
++case T=4096 N=48 K=2560 ldy=48 default_ms=0.1865 default_padding_writes=0
++best T=4096 N=48 K=2560 ldy=48 solution=-1086327736 ms=0.0972 default_ms=0.1865 gain=1.92
++case T=8192 N=48 K=2560 ldy=48 default_ms=0.2047 default_padding_writes=0
++best T=8192 N=48 K=2560 ldy=48 solution=-1086327762 ms=0.1489 default_ms=0.2047 gain=1.37
++case T=256 N=320 K=10240 ldy=320 default_ms=0.4283 default_padding_writes=0
++best T=256 N=320 K=10240 ldy=320 solution=-1086327781 ms=0.1325 default_ms=0.4283 gain=3.23
++case T=512 N=320 K=10240 ldy=320 default_ms=0.4971 default_padding_writes=0
++best T=512 N=320 K=10240 ldy=320 solution=-1086327769 ms=0.2001 default_ms=0.4971 gain=2.48
++case T=768 N=320 K=10240 ldy=320 default_ms=0.8265 default_padding_writes=0
++best T=768 N=320 K=10240 ldy=320 solution=-1086327722 ms=0.2416 default_ms=0.8265 gain=3.42
++case T=1024 N=320 K=10240 ldy=320 default_ms=1.1697 default_padding_writes=0
++best T=1024 N=320 K=10240 ldy=320 solution=-1086327773 ms=0.3623 default_ms=1.1697 gain=3.23
++case T=1536 N=320 K=10240 ldy=320 default_ms=1.6087 default_padding_writes=0
++best T=1536 N=320 K=10240 ldy=320 solution=-1086327738 ms=0.4669 default_ms=1.6087 gain=3.45
++case T=2048 N=320 K=10240 ldy=320 default_ms=2.1792 default_padding_writes=0
++best T=2048 N=320 K=10240 ldy=320 solution=-1086327724 ms=0.6335 default_ms=2.1792 gain=3.44
++case T=4096 N=320 K=10240 ldy=320 default_ms=9.6169 default_padding_writes=0
++best T=4096 N=320 K=10240 ldy=320 solution=-1086327717 ms=1.1841 default_ms=9.6169 gain=8.12
++case T=8192 N=320 K=10240 ldy=320 default_ms=2.2651 default_padding_writes=0
++keep_default T=8192 N=320 K=10240 ldy=320 (237 solutions; best 2.3719 ms vs default 2.2651)
++case T=256 N=10240 K=320 ldy=10240 default_ms=0.0584 default_padding_writes=0
++best T=256 N=10240 K=320 ldy=10240 solution=-1086327694 ms=0.0556 default_ms=0.0584 gain=1.05
++case T=512 N=10240 K=320 ldy=10240 default_ms=0.0980 default_padding_writes=0
++keep_default T=512 N=10240 K=320 ldy=10240 (237 solutions; best 0.0964 ms vs default 0.0980)
++case T=768 N=10240 K=320 ldy=10240 default_ms=0.1398 default_padding_writes=0
++keep_default T=768 N=10240 K=320 ldy=10240 (237 solutions; best 0.1377 ms vs default 0.1398)
++case T=1024 N=10240 K=320 ldy=10240 default_ms=0.1815 default_padding_writes=0
++keep_default T=1024 N=10240 K=320 ldy=10240 (237 solutions; best 0.1806 ms vs default 0.1815)
++case T=1536 N=10240 K=320 ldy=10240 default_ms=0.2626 default_padding_writes=0
++keep_default T=1536 N=10240 K=320 ldy=10240 (237 solutions; best 0.2625 ms vs default 0.2626)
++case T=2048 N=10240 K=320 ldy=10240 default_ms=0.3437 default_padding_writes=0
++keep_default T=2048 N=10240 K=320 ldy=10240 (237 solutions; best 0.3432 ms vs default 0.3437)
++case T=4096 N=10240 K=320 ldy=10240 default_ms=0.6693 default_padding_writes=0
++keep_default T=4096 N=10240 K=320 ldy=10240 (237 solutions; best 0.6686 ms vs default 0.6693)
++case T=8192 N=10240 K=320 ldy=10240 default_ms=1.3531 default_padding_writes=0
++keep_default T=8192 N=10240 K=320 ldy=10240 (237 solutions; best 1.3274 ms vs default 1.3531)
++case T=256 N=4 K=10240 ldy=4 default_ms=0.1050 default_padding_writes=0
++best T=256 N=4 K=10240 ldy=4 solution=-1086327846 ms=0.0503 default_ms=0.1050 gain=2.09
++case T=512 N=4 K=10240 ldy=4 default_ms=0.2470 default_padding_writes=0
++best T=512 N=4 K=10240 ldy=4 solution=-1086327840 ms=0.0544 default_ms=0.2470 gain=4.54
++case T=768 N=4 K=10240 ldy=4 default_ms=0.2539 default_padding_writes=0
++best T=768 N=4 K=10240 ldy=4 solution=-1086327840 ms=0.0610 default_ms=0.2539 gain=4.16
++case T=1024 N=4 K=10240 ldy=4 default_ms=0.2553 default_padding_writes=0
++best T=1024 N=4 K=10240 ldy=4 solution=-1086327850 ms=0.0801 default_ms=0.2553 gain=3.19
++case T=1536 N=4 K=10240 ldy=4 default_ms=0.2556 default_padding_writes=0
++best T=1536 N=4 K=10240 ldy=4 solution=-1086327840 ms=0.1116 default_ms=0.2556 gain=2.29
++case T=2048 N=4 K=10240 ldy=4 default_ms=0.3051 default_padding_writes=0
++best T=2048 N=4 K=10240 ldy=4 solution=-1086327815 ms=0.1429 default_ms=0.3051 gain=2.14
++case T=4096 N=4 K=10240 ldy=4 default_ms=0.4891 default_padding_writes=0
++best T=4096 N=4 K=10240 ldy=4 solution=-1086327922 ms=0.2538 default_ms=0.4891 gain=1.93
++case T=8192 N=4 K=10240 ldy=4 default_ms=1.1681 default_padding_writes=0
++best T=8192 N=4 K=10240 ldy=4 solution=-1086327922 ms=0.4845 default_ms=1.1681 gain=2.41
++case T=256 N=1 K=2560 ldy=1 default_ms=0.0433 default_padding_writes=0
++best T=256 N=1 K=2560 ldy=1 solution=-9 ms=0.0081 default_ms=0.0433 gain=5.33
++case T=512 N=1 K=2560 ldy=1 default_ms=0.2000 default_padding_writes=0
++best T=512 N=1 K=2560 ldy=1 solution=-9 ms=0.0107 default_ms=0.2000 gain=18.63
++case T=768 N=1 K=2560 ldy=1 default_ms=0.0865 default_padding_writes=0
++best T=768 N=1 K=2560 ldy=1 solution=-9 ms=0.0125 default_ms=0.0865 gain=6.90
++case T=1024 N=1 K=2560 ldy=1 default_ms=0.0914 default_padding_writes=0
++best T=1024 N=1 K=2560 ldy=1 solution=-9 ms=0.0167 default_ms=0.0914 gain=5.49
++case T=1536 N=1 K=2560 ldy=1 default_ms=0.0931 default_padding_writes=0
++best T=1536 N=1 K=2560 ldy=1 solution=-9 ms=0.0197 default_ms=0.0931 gain=4.72
++case T=2048 N=1 K=2560 ldy=1 default_ms=0.1200 default_padding_writes=0
++best T=2048 N=1 K=2560 ldy=1 solution=-9 ms=0.0307 default_ms=0.1200 gain=3.92
++case T=4096 N=1 K=2560 ldy=1 default_ms=0.0734 default_padding_writes=0
++best T=4096 N=1 K=2560 ldy=1 solution=-9 ms=0.0415 default_ms=0.0734 gain=1.77
++case T=8192 N=1 K=2560 ldy=1 default_ms=0.2007 default_padding_writes=0
++best T=8192 N=1 K=2560 ldy=1 solution=-9 ms=0.0728 default_ms=0.2007 gain=2.76
++wrote 112 rows (76 with a solution) to table-5.6-v2.txt
+diff --git a/cmake/hip_backend.cmake b/cmake/hip_backend.cmake
+index 0697f82ac5..8ec06c781c 100644
+--- a/cmake/hip_backend.cmake
++++ b/cmake/hip_backend.cmake
+@@ -51,6 +51,9 @@ set(STRATA_HIP_BLAS_TARGETS roc::hipblas)
+ if(hipblas_VERSION VERSION_LESS "1.0")
+   find_package(rocblas CONFIG REQUIRED)
+   list(APPEND STRATA_HIP_BLAS_TARGETS roc::rocblas)
++else()
++  # the prompt path's rocBLAS solution table (STRATA_ROCBLAS_TUNING, gfx103x) calls rocBLAS by name
++  find_package(rocblas CONFIG QUIET)
+ endif()
+ find_package(hipblaslt CONFIG QUIET)
+ 
+@@ -66,6 +69,12 @@ else()
+   set(STRATA_HIPBLASLT_AVAILABLE OFF)
+   message(STATUS "Strata: hipBLASLt not found; solution-table dispatch is unavailable")
+ endif()
++if(TARGET roc::rocblas)
++  set(STRATA_ROCBLAS_AVAILABLE ON)
++else()
++  set(STRATA_ROCBLAS_AVAILABLE OFF)
++  message(STATUS "Strata: rocBLAS CMake package not found; the rocBLAS solution table (gfx103x) is unavailable")
++endif()
+ 
+ # HIP's link step produces a PIE; make Strata and ggml objects PIC for the ROCm linker.
+ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+diff --git a/docs/AMD_HIP.md b/docs/AMD_HIP.md
+index 5996177e1e..fb7ad741cc 100644
+--- a/docs/AMD_HIP.md
++++ b/docs/AMD_HIP.md
+@@ -40,7 +40,9 @@ the kernel's amdgpu driver (no ROCm install needed):
+ - **hipBLASLt tuning table:** setup uses `tools/hip/<arch>-hipblaslt-<version>.txt` only when it matches both the
+   card's architecture and the installed hipBLASLt version (read from `hipblaslt-version.h`; 1.2.0 is `100200`).
+   Otherwise it says so and the prompt's dense matrix products use plain hipBLAS (slower prompts, same answers).
+-  A table's solution ids are valid only for that pair, and the engine refuses any other table.
++  A table's solution ids are valid only for that pair, and the engine refuses any other table. On gfx103x (RDNA2,
++  no hipBLASLt kernels) the same role falls to a rocBLAS table, `tools/hip/<arch>-rocblas-<version>.txt`, which the
++  engine picks for its own rocBLAS build when setup points it at the directory ([RDNA2](#rdna2-gfx1030)).
+ - **Several cards:** setup takes one card (the one with the most VRAM, or `--gpu N`) unless you name more:
+   `./setup.sh --backend hip --gpus 1,0` splits the model's layers across them, the first one the main card (numbers
+   as setup lists them; `--gpus all` = every supported card, the most VRAM first). Every chosen card must be one of the
+@@ -368,6 +370,26 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
+   matrix cores; `hip_prefill_hipblaslt_gemm`, no hipBLASLt table) and 3 that fail for reasons outside the engine
+   (`ple_parity` needs a Q2_0 PLE file that is not on that machine, `expert_multi_test` refuses the CPU without AVX-512,
+   `platform_memory_test` cannot `mlock` at the shell's default `ulimit -l`).
++- **rocBLAS solution table** (for the `STRATA_HIP_PROMPT_F16=1` route above; with it off, nothing runs through the
++  table): rocBLAS picks the kernel for each of those FP16 GEMMs from its own table by shape, and
++  on gfx1030 that pick is far from the best kernel the library holds for some shapes: the GDN input projection
++  (N = 10240, K = 2560) below about 1,150 tokens runs at 5 TFLOPS where the best of rocBLAS's own 237 solutions for the
++  same shape runs at 32-38 (7x; the kernel choice flips at T = 1152). `tools/hip/tune_rocblas` enumerates the library's
++  solutions per shape and token bucket, checks each against the default kernel's output and writes the winners as
++  `tools/hip/<arch>-rocblas-<version>.txt`; the engine reads the table through `STRATA_ROCBLAS_TUNING` (a file, or
++  the directory, from which it takes the file of its own rocBLAS build) and runs those solutions in place of rocBLAS's
++  choice, the default kernel for every shape without a row. Solution indices are valid for one architecture and one
++  rocBLAS build (the full version string, `5.6.0.8d1ae90e` for ROCm 10.0.0's), and the engine refuses any other
++  table. Shipped: `gfx1030-rocblas-5.6.0.8d1ae90e.txt` (ROCm 10.0.0, the `/opt/rocm` setup installs on Ubuntu); setup
++  points the engine at the directory when a table for the card's architecture exists, and the engine's log says
++  `rocBLAS tuning enabled (... rows ...)` or why not. Measured on the 2x RX 6900 XT machine above (one card, #835 +
++  this, `STRATA_PREFILL_TIMING=1`, temperature 0, the same answers with and without): a 799-token prompt's GPU time
++  3,329 -> 2,985 ms (the GDN projections 443 -> 177 ms, `hc read` 270 -> 77), 495 tokens 2,477 -> 2,139 ms (365 ->
++  146), 8,874 tokens 11,978 -> 11,459 ms (the 682-token tail chunk's projections, `hc read` 1,200 -> 898); a
++  1,108-token prompt did not change (3,391 -> 3,395 ms): its GDN time fell 598 -> 201 ms and the whole saving
++  reappeared as `wait copy`, the experts' PCIe transfer, which bounds that prompt. Per-run lines and the tuner's
++  summary: [bench/results/2026-10-05-rdna2-rocblas-table](../bench/results/2026-10-05-rdna2-rocblas-table/README.md). Decode does not use these GEMMs and is unchanged. See [Tuning
++  table](#tuning-table) for making a table for another rocBLAS build.
+ - **gfx1031** (RX 6700 XT, #524): setup knows it (the `gfx103X-all` wheels, unvalidated); its reporter runs it daily
+   on one card.
+ - **Not validated:** gfx1032 (the same `dp4a` path, no hardware report), setup's own build path and the
+@@ -477,6 +499,33 @@ Shipped tables:
+   `STRATA_HIPBLASLT_VERBOSE=1` and look for `fallbacks=0` in its summary line, and recalibrate with
+   `tune_hipblaslt` before using this table with a different 1.5.0 build.
+ 
++### rocBLAS table (gfx103x)
++
++On RDNA2 the prompt GEMMs run through rocBLAS in FP16 (#835), and hipBLASLt has no gfx1030 kernels; the rocBLAS table
++does for rocBLAS what the one above does for hipBLASLt (the [RDNA2 section](#rdna2-gfx1030) has the measurements). A
++table is valid for one architecture and one rocBLAS build - the full version string, tweak hash included - so it is
++calibrated on the card with the rocBLAS the engine loads (`lib_dirs` in the run configuration; `/opt/rocm/lib` is
++rocBLAS 5.6.0.8d1ae90e on ROCm 10.0.0, while Ubuntu's own `librocblas5` package is a 5.1 build):
++
++```sh
++cmake --build build-hip --target tune_rocblas
++LD_LIBRARY_PATH=/opt/rocm/lib ./build-hip/tune_rocblas --tuning-out table.txt   # 14 shapes x 8 token buckets, ~5 min
++```
++
++The tool times rocBLAS's default kernel and every solution the library lists for each shape at T = 256 ... 8192 (the
++engine's dense GEMM shapes; `--case T,N,K,ldy` adds one, `--tokens` changes the buckets), checks the fastest ones
++against the default kernel's output (within FP16 rounding, no write outside the N x T result) and that they also run at
++smaller, odd token counts, and writes one row per shape and bucket: the winning solution index where it beats the
++default by `--min-gain` (1.05), `default` otherwise - a `default` row is what keeps a neighbouring bucket's solution from
++reaching token counts where rocBLAS's own choice measured best. The file's header names the architecture and version
++(`STRATA_ROCBLAS_TUNING_V1 gfx1030 5.6.0.8d1ae90e`); save it as `tools/hip/<arch>-rocblas-<version>.txt` (the version
++with trailing dots dropped) for setup, or point `STRATA_ROCBLAS_TUNING` at the file. `STRATA_ROCBLAS_VERBOSE=1` prints
++the solution picked for each shape and a `tuned_launches=... fallbacks=...` summary at exit; a solution rocBLAS refuses
++at run time (status 11 once while it sets up its workspace is normal) falls back to the default kernel for that call, and
++after three refusals for good. `hip_prefill_rocblas_gemm` (with `STRATA_ROCBLAS_TUNING` set; skips otherwise) is the
++smoke test: it refuses a table for another architecture or build and checks Gemm's FP16 route against hipBLASEx on the
++table's first two shapes.
++
+ ## Original backend validation (PR #94)
+ 
+ The following is historical validation of the original backend, not a fresh
+diff --git a/include/strata/prefill/gemm.hpp b/include/strata/prefill/gemm.hpp
+index 1eae68b45b..84f8f1b27e 100644
+--- a/include/strata/prefill/gemm.hpp
++++ b/include/strata/prefill/gemm.hpp
+@@ -67,6 +67,7 @@ class Gemm {
+     void* workspace_ = nullptr;
+     bool external_ = false;
+     void* hipblaslt_state_ = nullptr;
++    void* rocblas_state_ = nullptr;   // HIP: the rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING)
+     bool f16_io_ = false;
+     // below sm_80: FP16 (Pascal: fp32) copies of a BF16 product's weight and activation slice (Gemm::bf16)
+     uint16_t* tc_w_ = nullptr;
+diff --git a/setup.py b/setup.py
+index ee657ce7d2..1893b775e2 100644
+--- a/setup.py
++++ b/setup.py
+@@ -3109,7 +3109,7 @@ def write_config(path: Path, cfg: dict):
+ # "sampling" or "mcp_servers" block, "allowed_hosts", "cors_origins", "open_browser" - and is kept when setup runs again
+ SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
+                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
+-SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_RESIDENT_PIN"})   # the "env" entries setup writes
++SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN"})   # the "env" entries setup writes
+ SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
+ 
+ 
+@@ -4879,6 +4879,14 @@ def main() -> int:
+         table = hipblaslt_table(gpu["arch"], lib_dirs, meta.get("hipblaslt_version"))
+         if table:
+             cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
++        # RDNA2 (gfx103x): the prompt's FP16 GEMMs through rocBLAS's best kernel per shape (tools/hip/tune_rocblas;
++        # the GDN input projection 6x faster below 1,152 tokens on a 6900 XT).  The ids are valid for one rocBLAS
++        # build, which only the engine can read, so setup points it at the directory and the engine picks the file
++        # <arch>-rocblas-<version>.txt for its own library, or runs the default kernels and says so in its log.
++        rocblas_tables = sorted(p.name for p in (ROOT / "tools" / "hip").glob(f"{gpu['arch']}-rocblas-*.txt"))
++        if rocblas_tables:
++            cfg.setdefault("env", {})["STRATA_ROCBLAS_TUNING"] = str(ROOT / "tools" / "hip")
++            ok(f"rocBLAS tuning tables for {gpu['arch']}: {', '.join(rocblas_tables)} (the engine takes the one of its rocBLAS build)")
+         if resident:   # ROCm: large page-locked host allocations can fail or be slow for the CPU; keep the copy pageable
+             cfg.setdefault("env", {})["STRATA_RESIDENT_PIN"] = "0"
+     if gpu["count"] > 1 or a.gpu is not None:
+diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
+index 2c1db6de28..5b49f188ec 100644
+--- a/src/prefill/gemm.cu
++++ b/src/prefill/gemm.cu
+@@ -43,6 +43,16 @@
+ #include <set>
+ #include <tuple>
+ #endif
++#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
++#include "rocblas_tuning.hpp"
++#include <hip/hip_runtime_api.h>
++#include <rocblas/rocblas.h>
++#include <filesystem>
++#include <map>
++#include <string>
++#include <system_error>
++#include <tuple>
++#endif
+ 
+ #if defined(__HIPCC__)
+ #include <hip/hip_fp16.h>
+@@ -345,6 +355,137 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
+ }
+ #endif
+ 
++#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
++// The rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING: a table file, or a directory holding
++// <arch>-rocblas-<version>.txt for this card and rocBLAS build; src/prefill/rocblas_tuning.hpp).  rocBLAS's own
++// pick for some shapes is up to 6x slower than the best kernel it holds for them (gfx1030: tools/hip/tune_rocblas.cpp).
++struct RocBlasState {
++    rocblas_handle handle = nullptr;
++    strata::prefill::rocblas_tuning::Table table;
++    struct Pick { bool tuned = false; int solution = 0; int refusals = 0; };
++    std::map<std::tuple<int, int, int, int>, Pick> cache;   // (T, N, K, ldy) -> the solution to run, or the default
++    uint64_t tuned_launches = 0;
++    uint64_t fallbacks = 0;
++
++    ~RocBlasState() {
++        if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
++            std::fprintf(stderr, "prefill gemm: rocBLAS tuning summary tuned_launches=%llu fallbacks=%llu\n",
++                         (unsigned long long) tuned_launches, (unsigned long long) fallbacks);
++        }
++        if (handle) rocblas_destroy_handle(handle);
++    }
++};
++
++std::unique_ptr<RocBlasState> create_rocblas_state(void* stream) {
++    const char* path = std::getenv("STRATA_ROCBLAS_TUNING");
++    if (!path || !*path) return nullptr;
++    auto state = std::make_unique<RocBlasState>();
++    if (rocblas_create_handle(&state->handle) != rocblas_status_success) {
++        std::fprintf(stderr, "prefill gemm: rocBLAS handle creation failed; its default kernels run\n");
++        return nullptr;
++    }
++    rocblas_set_stream(state->handle, (hipStream_t) stream);
++    char version[128] = {0};
++    if (rocblas_get_version_string(version, sizeof version) != rocblas_status_success) {
++        std::fprintf(stderr, "prefill gemm: rocBLAS version query failed; its default kernels run\n");
++        return nullptr;
++    }
++    int device = 0;
++    hipDeviceProp_t properties{};
++    if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess) {
++        std::fprintf(stderr, "prefill gemm: HIP device query failed; rocBLAS's default kernels run\n");
++        return nullptr;
++    }
++    std::string arch(properties.gcnArchName);
++    if (const auto suffix = arch.find(':'); suffix != std::string::npos) arch.resize(suffix);
++    std::filesystem::path file(path);
++    std::error_code ec;
++    if (std::filesystem::is_directory(file, ec)) {
++        // the table of this card and this rocBLAS build (its version string, trailing dots dropped)
++        std::string tag(version);
++        while (!tag.empty() && tag.back() == '.') tag.pop_back();
++        file /= arch + "-rocblas-" + tag + ".txt";
++    }
++    std::string error;
++    if (!state->table.load(file.string(), arch, version, error)) {
++        std::fprintf(stderr, "prefill gemm: %s (%s); rocBLAS's default kernels run\n", error.c_str(),
++                     file.string().c_str());
++        return nullptr;
++    }
++    // rocBLAS loads its kernel library on the first product through a handle; a solution-index call before that
++    // fails (rocblas_status_internal_error) although the index is valid.  One tiny default product opens it.
++    {
++        uint16_t* tiny = nullptr;
++        if (hipMalloc(&tiny, 4 * 64 * 64 * 2) == hipSuccess) {
++            const float one = 1.0f, zero = 0.0f;
++            (void) rocblas_gemm_ex(state->handle, rocblas_operation_transpose, rocblas_operation_none, 64, 64, 64, &one,
++                                   tiny, rocblas_datatype_f16_r, 64, tiny + 64 * 64, rocblas_datatype_f16_r, 64, &zero,
++                                   tiny + 2 * 64 * 64, rocblas_datatype_f16_r, 128, tiny + 2 * 64 * 64,
++                                   rocblas_datatype_f16_r, 128, rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
++            (void) hipStreamSynchronize((hipStream_t) stream);
++            (void) hipFree(tiny);
++        }
++    }
++    size_t tuned_rows = 0;
++    for (const auto& row : state->table.rows()) tuned_rows += row.tuned ? 1 : 0;
++    std::fprintf(stderr, "prefill gemm: rocBLAS tuning enabled (%zu rows, %zu with a solution, %s, rocBLAS %s)\n",
++                 state->table.rows().size(), tuned_rows, arch.c_str(), version);
++    return state;
++}
++
++// Gemm::f16_inplace's product through the table's solution for its shape.  False when the shape has no row, or the
++// launch was refused (then the default kernel runs, and for that shape from now on).
++bool try_rocblas_f16o(void* opaque_state, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
++                      int64_t K, int64_t ldy) {
++    auto* state = static_cast<RocBlasState*>(opaque_state);
++    if (!state || T <= 0 || N <= 0 || K <= 0 || T > INT_MAX || N > INT_MAX || K > INT_MAX || ldy > INT_MAX / 2) return false;
++    const auto key = std::make_tuple((int) T, (int) N, (int) K, (int) ldy);
++    auto it = state->cache.find(key);
++    if (it == state->cache.end()) {
++        RocBlasState::Pick pick;
++        if (const auto* row = state->table.closest((int) N, (int) K, (int) ldy, (int) T); row && row->tuned) {
++            pick.tuned = true;
++            pick.solution = row->solution;
++        }
++        if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
++            if (pick.tuned)
++                std::fprintf(stderr, "prefill gemm: rocBLAS solution %d for T=%lld N=%lld K=%lld ldy=%lld\n",
++                             pick.solution, (long long) T, (long long) N, (long long) K, (long long) ldy);
++            else
++                std::fprintf(stderr, "prefill gemm: rocBLAS default kernel; no row for T=%lld N=%lld K=%lld ldy=%lld\n",
++                             (long long) T, (long long) N, (long long) K, (long long) ldy);
++        }
++        it = state->cache.emplace(key, pick).first;
++    }
++    if (!it->second.tuned) return false;
++    const float one = 1.0f, zero = 0.0f;
++    const rocblas_status status = rocblas_gemm_ex(
++        state->handle, rocblas_operation_transpose, rocblas_operation_none, (int) N, (int) T, (int) K, &one, W,
++        rocblas_datatype_f16_r, (int) K, X, rocblas_datatype_f16_r, (int) K, &zero, Y, rocblas_datatype_f16_r,
++        (int) (2 * ldy), Y, rocblas_datatype_f16_r, (int) (2 * ldy), rocblas_datatype_f32_r,
++        rocblas_gemm_algo_solution_index, it->second.solution, 0);
++    if (status == rocblas_status_success) {
++        ++state->tuned_launches;
++        return true;
++    }
++    // A refusal writes nothing (the default kernel runs now).  The first one can be rocBLAS still setting up for the
++    // kernel (its device workspace: seen as invalid_value once, success after); a solution refused three times is
++    // dropped for this shape.
++    ++state->fallbacks;
++    if (++it->second.refusals >= 3) {
++        std::fprintf(stderr, "prefill gemm: rocBLAS solution %d refused (status %d) for T=%lld N=%lld K=%lld ldy=%lld "
++                             "three times; the default kernel runs for this shape\n", it->second.solution, (int) status,
++                     (long long) T, (long long) N, (long long) K, (long long) ldy);
++        it->second.tuned = false;
++    } else if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
++        std::fprintf(stderr, "prefill gemm: rocBLAS solution %d refused (status %d) for T=%lld N=%lld K=%lld ldy=%lld; "
++                             "the default kernel this time\n", it->second.solution, (int) status, (long long) T,
++                     (long long) N, (long long) K, (long long) ldy);
++    }
++    return false;
++}
++#endif
++
+ }  // namespace
+ 
+ bool prompt_f16() {
+@@ -381,6 +522,9 @@ Gemm::~Gemm() {
+ #endif
+ #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+     delete static_cast<HipLtState*>(hipblaslt_state_);
++#endif
++#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
++    delete static_cast<RocBlasState*>(rocblas_state_);
+ #endif
+     if (handle_) cublasDestroy((cublasHandle_t) handle_);
+     if (tc_w_) cudaFree(tc_w_);
+@@ -409,6 +553,9 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
+     scratch_elems_ = scratch_elems;
+ #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws_bytes).release();
++#endif
++#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
++    rocblas_state_ = create_rocblas_state(stream).release();
+ #endif
+     return true;
+ }
+@@ -447,6 +594,9 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
+     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
+ #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws).release();
++#endif
++#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
++    rocblas_state_ = create_rocblas_state(stream).release();
+ #endif
+     if (scratch_elems > 0) {
+         if (const cudaError_t e = cudaMalloc((void**) &scratch_, (size_t) scratch_elems * 2); e != cudaSuccess) {
+@@ -750,10 +900,16 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
+ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
+ #if defined(__HIPCC__)
+     const float one = 1.0f, zero = 0.0f;
+-    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, W, CUDA_R_16F,
+-                    (int) K, X, CUDA_R_16F, (int) K, &zero, Y, CUDA_R_16F, (int) (2 * ldy), CUBLAS_COMPUTE_32F,
+-                    CUBLAS_GEMM_DEFAULT),
+-       "cublasGemmEx f16 out");
++    bool done = false;
++#if defined(STRATA_ROCBLAS_AVAILABLE)
++    done = try_rocblas_f16o(rocblas_state_, X, W, Y, T, N, K, ldy);   // the table's kernel for this shape, if any
++#endif
++    if (!done) {
++        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, W,
++                        CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &zero, Y, CUDA_R_16F, (int) (2 * ldy),
++                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
++           "cublasGemmEx f16 out");
++    }
+     static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
+     widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
+     if (dbg_nan) {   // debug only: a sync per GEMM
+diff --git a/src/prefill/rocblas_tuning.hpp b/src/prefill/rocblas_tuning.hpp
+new file mode 100644
+index 0000000000..99bf54143b
+--- /dev/null
++++ b/src/prefill/rocblas_tuning.hpp
+@@ -0,0 +1,129 @@
++// src/prefill/rocblas_tuning.hpp - the rocBLAS solution table of the prompt path's FP16-out GEMMs (HIP, gfx103x).
++//
++// rocBLAS picks a kernel per GEMM shape from its own table, and on gfx1030 that pick is up to 6x slower than the best
++// kernel the library holds for the same shape (N=10240 K=2560 below T=1152: tools/hip/tune_rocblas.cpp).  A table
++// made by that tool names, per shape and token bucket, the solution index to run instead; Gemm::f16_inplace reads it
++// through STRATA_ROCBLAS_TUNING.  Indices are valid for one architecture and one rocBLAS build (its full version
++// string), and the table carries both; any other pair is refused and the default kernels run.
++#pragma once
++
++#include <climits>
++#include <cstdint>
++#include <cstdlib>
++#include <fstream>
++#include <limits>
++#include <sstream>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace strata::prefill::rocblas_tuning {
++
++struct Row {
++    int n = 0;
++    int k = 0;
++    int ldy = 0;
++    int t_bucket = 0;
++    bool tuned = false;   // false: the default kernel measured best at this bucket (the row bounds its neighbours' reach)
++    int solution = 0;     // rocBLAS solution indices can be negative
++};
++
++class Table {
++public:
++    /// `expected_version`: rocblas_get_version_string() of the library the engine runs with.
++    bool load(const std::string& path, const std::string& expected_arch, const std::string& expected_version,
++              std::string& err) {
++        std::ifstream input(path);
++        if (!input) {
++            err = "cannot open rocBLAS tuning file";
++            return false;
++        }
++        bool saw_header = false;
++        std::string line;
++        size_t line_number = 0;
++        while (std::getline(input, line)) {
++            ++line_number;
++            if (const auto hash = line.find('#'); hash != std::string::npos) line.resize(hash);
++            const auto first = line.find_first_not_of(" \t\r\n");
++            if (first == std::string::npos) continue;
++            std::istringstream row(line.substr(first));
++            if (!saw_header) {
++                std::string magic, arch, version, extra;
++                if (!(row >> magic >> arch >> version) || (row >> extra) || magic != "STRATA_ROCBLAS_TUNING_V1") {
++                    err = "invalid rocBLAS tuning header at line " + std::to_string(line_number);
++                    return false;
++                }
++                if (arch != expected_arch) {
++                    err = "rocBLAS tuning architecture mismatch: file=" + arch + " runtime=" + expected_arch;
++                    return false;
++                }
++                if (version != expected_version) {
++                    err = "rocBLAS version mismatch: file=" + version + " runtime=" + expected_version;
++                    return false;
++                }
++                arch_ = std::move(arch);
++                version_ = std::move(version);
++                saw_header = true;
++                continue;
++            }
++            std::string type, solution, extra;
++            Row parsed;
++            if (!(row >> type >> parsed.n >> parsed.k >> parsed.ldy >> parsed.t_bucket >> solution) || (row >> extra) ||
++                type != "f16o" || parsed.n <= 0 || parsed.k <= 0 || parsed.ldy < parsed.n || parsed.t_bucket <= 0) {
++                err = "invalid rocBLAS tuning row at line " + std::to_string(line_number);
++                return false;
++            }
++            if (solution != "default") {
++                char* end = nullptr;
++                const long value = std::strtol(solution.c_str(), &end, 10);
++                if (!end || *end || value < INT_MIN || value > INT_MAX) {
++                    err = "invalid rocBLAS solution index at line " + std::to_string(line_number);
++                    return false;
++                }
++                parsed.tuned = true;
++                parsed.solution = (int) value;
++            }
++            for (const auto& existing : rows_) {
++                if (existing.n == parsed.n && existing.k == parsed.k && existing.ldy == parsed.ldy &&
++                    existing.t_bucket == parsed.t_bucket) {
++                    err = "duplicate rocBLAS tuning key at line " + std::to_string(line_number);
++                    return false;
++                }
++            }
++            rows_.push_back(parsed);
++        }
++        if (!saw_header) {
++            err = "rocBLAS tuning file has no header";
++            return false;
++        }
++        return true;
++    }
++
++    /// The row of this shape whose token bucket is nearest to t (the smaller bucket on a tie); null when the shape
++    /// has no row at all (never measured).  A `default` row says the default kernel measured best there, so a tuned
++    /// neighbour's solution reaches no further than halfway to it.
++    const Row* closest(int n, int k, int ldy, int t) const {
++        const Row* best = nullptr;
++        int64_t best_distance = std::numeric_limits<int64_t>::max();
++        for (const auto& row : rows_) {
++            if (row.n != n || row.k != k || row.ldy != ldy) continue;
++            const int64_t distance = row.t_bucket >= t ? int64_t(row.t_bucket) - t : int64_t(t) - row.t_bucket;
++            if (distance < best_distance || (distance == best_distance && row.t_bucket < best->t_bucket)) {
++                best = &row;
++                best_distance = distance;
++            }
++        }
++        return best;
++    }
++
++    const std::vector<Row>& rows() const { return rows_; }
++    const std::string& arch() const { return arch_; }
++    const std::string& version() const { return version_; }
++
++private:
++    std::string arch_;
++    std::string version_;
++    std::vector<Row> rows_;
++};
++
++}  // namespace strata::prefill::rocblas_tuning
+diff --git a/tests/hip/prefill_rocblas_gemm.cpp b/tests/hip/prefill_rocblas_gemm.cpp
+new file mode 100644
+index 0000000000..6433db5bac
+--- /dev/null
++++ b/tests/hip/prefill_rocblas_gemm.cpp
+@@ -0,0 +1,206 @@
++// Opt-in HIP smoke test for the rocBLAS solution table of the prompt path's FP16-out GEMMs (gfx103x); it needs
++// STRATA_ROCBLAS_TUNING (SKIP otherwise).  It checks that the table loads for this device and rocBLAS build, and that
++// Gemm's FP16 path (set_f16_io, the route the table serves) matches an FP32-out hipBLASEx reference on the table's
++// first two shapes, at their token bucket and at a smaller odd T that resolves to the same row.  Like the hipBLASLt
++// test it does not check that rocBLAS ran the table's solution: an id the library refuses falls back to the default
++// kernel and the test still passes; STRATA_ROCBLAS_VERBOSE=1 prints the "tuned_launches=... fallbacks=..." summary.
++#include <cuda_runtime.h>
++#include <hip/hip_fp16.h>
++#include <hipblas/hipblas.h>
++#include <rocblas/rocblas.h>
++
++#include "strata/prefill/gemm.hpp"
++#include "rocblas_tuning.hpp"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <random>
++#include <string>
++#include <vector>
++
++#define HIP_CHECK(call) do { \
++    const hipError_t status_ = (call); \
++    if (status_ != hipSuccess) { \
++        std::fprintf(stderr, "HIP failure at %s:%d: %s: %s\n", __FILE__, __LINE__, #call, hipGetErrorString(status_)); \
++        std::exit(2); \
++    } \
++} while (0)
++
++#define HIPBLAS_CHECK(call) do { \
++    const hipblasStatus_t status_ = (call); \
++    if (status_ != HIPBLAS_STATUS_SUCCESS) { \
++        std::fprintf(stderr, "hipBLAS failure at %s:%d: %s: %d\n", __FILE__, __LINE__, #call, (int) status_); \
++        std::exit(2); \
++    } \
++} while (0)
++
++namespace {
++
++struct DeviceBuffer {
++    void* p = nullptr;
++    explicit DeviceBuffer(size_t bytes) { if (bytes) HIP_CHECK(hipMalloc(&p, bytes)); }
++    ~DeviceBuffer() { if (p) (void) hipFree(p); }
++    DeviceBuffer(const DeviceBuffer&) = delete;
++    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
++};
++
++uint16_t f16_bits(float value) {
++    const __half half = __float2half_rn(value);
++    uint16_t bits = 0;
++    std::memcpy(&bits, &half, sizeof(bits));
++    return bits;
++}
++
++// Y[T, N] (fp32, row stride ldy, at output_offset floats into the buffer) = X[T, K] . W[N, K]^T, Gemm's FP16 route
++// against hipBLASEx with FP32 out.  The FP16 route rounds its outputs to FP16 (that is the measured, accepted cost of
++// prompt_f16(), docs/AMD_HIP.md): the tolerance is a few FP16 ulps of the largest output.
++bool run_case(strata::prefill::Gemm& gemm, hipblasHandle_t blas, hipStream_t stream, int t, int n, int k, int ldy,
++              int output_offset, uint32_t seed) {
++    std::mt19937 rng(seed);
++    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
++    const size_t x_count = (size_t) t * k, w_count = (size_t) n * k;
++    std::vector<uint16_t> x(x_count), w(w_count);
++    for (auto& value : x) value = f16_bits(dist(rng));
++    for (auto& value : w) value = f16_bits(dist(rng));
++    const size_t output_count = (size_t) output_offset + (size_t) t * ldy + 8;
++    std::vector<float> initial(output_count, -777.25f);
++
++    DeviceBuffer dx(x_count * 2), dw(w_count * 2), dy(output_count * 4), dref(output_count * 4);
++    HIP_CHECK(hipMemcpyAsync(dx.p, x.data(), x_count * 2, hipMemcpyHostToDevice, stream));
++    HIP_CHECK(hipMemcpyAsync(dw.p, w.data(), w_count * 2, hipMemcpyHostToDevice, stream));
++    HIP_CHECK(hipMemcpyAsync(dy.p, initial.data(), output_count * 4, hipMemcpyHostToDevice, stream));
++    HIP_CHECK(hipMemcpyAsync(dref.p, initial.data(), output_count * 4, hipMemcpyHostToDevice, stream));
++    HIP_CHECK(hipStreamSynchronize(stream));
++
++    const float alpha = 1.0f, beta = 0.0f;
++    HIPBLAS_CHECK(hipblasGemmEx(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, n, t, k, &alpha, dw.p, HIP_R_16F, k, dx.p, HIP_R_16F,
++                                k, &beta, (float*) dref.p + output_offset, HIP_R_32F, ldy, HIPBLAS_COMPUTE_32F,
++                                HIPBLAS_GEMM_DEFAULT));
++    gemm.f16((const uint16_t*) dx.p, (const uint16_t*) dw.p, (float*) dy.p + output_offset, t, n, k, ldy, beta);
++    HIP_CHECK(hipStreamSynchronize(stream));
++
++    std::vector<float> got(output_count), ref(output_count);
++    HIP_CHECK(hipMemcpy(got.data(), dy.p, output_count * 4, hipMemcpyDeviceToHost));
++    HIP_CHECK(hipMemcpy(ref.data(), dref.p, output_count * 4, hipMemcpyDeviceToHost));
++
++    std::vector<uint8_t> active(output_count, 0);
++    double diff2 = 0.0, ref2 = 0.0, max_abs = 0.0, max_ref = 0.0;
++    for (int row = 0; row < t; ++row) {
++        for (int col = 0; col < n; ++col) {
++            const size_t index = (size_t) output_offset + (size_t) row * ldy + col;
++            active[index] = 1;
++            if (!std::isfinite(got[index]) || !std::isfinite(ref[index])) {
++                std::fprintf(stderr, "non-finite output T=%d N=%d K=%d index=%zu\n", t, n, k, index);
++                return false;
++            }
++            const double delta = (double) got[index] - ref[index];
++            diff2 += delta * delta;
++            ref2 += (double) ref[index] * ref[index];
++            max_abs = std::max(max_abs, std::abs(delta));
++            max_ref = std::max(max_ref, (double) std::abs(ref[index]));
++        }
++    }
++    for (size_t i = 0; i < output_count; ++i) {
++        if (!active[i] && (got[i] != initial[i] || ref[i] != initial[i])) {
++            std::fprintf(stderr, "output touched padding/guard T=%d N=%d K=%d ldy=%d index=%zu got=%.9g\n", t, n, k, ldy,
++                         i, got[i]);
++            return false;
++        }
++    }
++    const double relative_l2 = std::sqrt(diff2 / std::max(ref2, 1e-300));
++    const double ulp = std::ldexp(1.0, (int) std::floor(std::log2(std::max(max_ref, 1e-30))) - 10);
++    const bool passed = relative_l2 <= 2e-3 && max_abs <= 4.0 * ulp;
++    std::printf("case T=%d N=%d K=%d ldy=%d output_offset=%d relative_l2=%.3g max_abs=%.3g (4 ulp = %.3g) %s\n", t, n, k,
++                ldy, output_offset, relative_l2, max_abs, 4.0 * ulp, passed ? "PASS" : "FAIL");
++    return passed;
++}
++
++}  // namespace
++
++int main() {
++    const char* tuning_path = std::getenv("STRATA_ROCBLAS_TUNING");
++    if (!tuning_path || !*tuning_path) {
++        std::fprintf(stderr, "SKIP: set STRATA_ROCBLAS_TUNING to a tuning table (or the tools/hip directory) for this GPU and rocBLAS build\n");
++        return 77;
++    }
++    if (!strata::prefill::prompt_f16()) {
++        std::fprintf(stderr, "SKIP: the FP16 prompt GEMMs (prompt_f16) are off on this device; the table serves that route only\n");
++        return 77;
++    }
++
++    int device = 0;
++    HIP_CHECK(hipGetDevice(&device));
++    hipDeviceProp_t properties{};
++    HIP_CHECK(hipGetDeviceProperties(&properties, device));
++    std::string arch(properties.gcnArchName);
++    if (const auto suffix = arch.find(':'); suffix != std::string::npos) arch.resize(suffix);
++    char version[128] = {0};
++    if (rocblas_get_version_string(version, sizeof version) != rocblas_status_success) {
++        std::fprintf(stderr, "rocblas_get_version_string failed\n");
++        return 2;
++    }
++    std::filesystem::path file(tuning_path);
++    std::error_code ec;
++    if (std::filesystem::is_directory(file, ec)) {   // the engine's rule: <arch>-rocblas-<version>.txt, trailing dots dropped
++        std::string tag(version);
++        while (!tag.empty() && tag.back() == '.') tag.pop_back();
++        file /= arch + "-rocblas-" + tag + ".txt";
++    }
++    strata::prefill::rocblas_tuning::Table table;
++    std::string error;
++    if (!table.load(file.string(), arch, version, error)) {
++        std::fprintf(stderr, "tuning table rejected: %s (%s)\n", error.c_str(), file.string().c_str());
++        return 1;
++    }
++    if (table.rows().empty()) {
++        std::fprintf(stderr, "tuning table has no rows\n");
++        return 1;
++    }
++
++    hipStream_t stream = nullptr;
++    HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
++    bool ok = true;
++    int cases = 0;
++    {
++        std::string init_error;
++        strata::prefill::Gemm gemm;
++        if (!gemm.init((void*) stream, 0, init_error)) {
++            std::fprintf(stderr, "Gemm init failed: %s\n", init_error.c_str());
++            HIP_CHECK(hipStreamDestroy(stream));
++            return 2;
++        }
++        gemm.set_f16_io(true);
++        hipblasHandle_t blas = nullptr;
++        HIPBLAS_CHECK(hipblasCreate(&blas));
++        HIPBLAS_CHECK(hipblasSetStream(blas, stream));
++
++        // the table's first two distinct shapes: at their bucket (an exact row) and at a smaller odd T (the closest
++        // row, a non-tile-multiple tail), the second with the output inside a larger buffer
++        std::vector<const strata::prefill::rocblas_tuning::Row*> picked;
++        for (const auto& row : table.rows()) {
++            if (!row.tuned) continue;
++            bool seen = false;
++            for (const auto* p : picked) seen = seen || (p->n == row.n && p->k == row.k && p->ldy == row.ldy);
++            if (!seen) picked.push_back(&row);
++            if (picked.size() == 2) break;
++        }
++        uint32_t seed = 201;
++        for (const auto* row : picked) {
++            ok &= run_case(gemm, blas, stream, row->t_bucket, row->n, row->k, row->ldy, 0, seed++);
++            ok &= run_case(gemm, blas, stream, std::max(1, row->t_bucket - 37), row->n, row->k, row->ldy, 7, seed++);
++            cases += 2;
++        }
++        HIPBLAS_CHECK(hipblasDestroy(blas));
++    }
++    HIP_CHECK(hipStreamDestroy(stream));
++    std::printf("smoke test: %d cases on the first %zu shapes of the table's %zu rows; %s\n", cases,
++                std::min<size_t>(2, table.rows().size()), table.rows().size(),
++                ok ? "outputs match hipBLASEx within FP16 rounding (solution ids are not verified; see STRATA_ROCBLAS_VERBOSE)"
++                   : "FAILED");
++    return ok ? 0 : 1;
++}
+diff --git a/tools/hip/gfx1030-rocblas-5.6.0.8d1ae90e.txt b/tools/hip/gfx1030-rocblas-5.6.0.8d1ae90e.txt
+new file mode 100644
+index 0000000000..717c3b52ef
+--- /dev/null
++++ b/tools/hip/gfx1030-rocblas-5.6.0.8d1ae90e.txt
+@@ -0,0 +1,116 @@
++# rocBLAS solution indices for the prompt path's FP16-out GEMMs; valid for this architecture and rocBLAS build only
++# rows: type N K ldy T solution   (type f16o: FP16 in, FP16 out, FP32 compute; Gemm::f16_inplace)
++# solution: rocBLAS's solution index, or `default` where its own choice measured best at that bucket
++STRATA_ROCBLAS_TUNING_V1 gfx1030 5.6.0.8d1ae90e
++f16o 10240 2560 10240 256 -1086327703   # 2.35815 ms -> 0.347774 ms
++f16o 10240 2560 10240 512 -1086327703   # 4.93049 ms -> 0.674375 ms
++f16o 10240 2560 10240 768 -1086327719   # 7.56866 ms -> 1.01344 ms
++f16o 10240 2560 10240 1024 -1086327687   # 10.1879 ms -> 1.40927 ms
++f16o 10240 2560 10240 1536 default   # 1.93035 ms
++f16o 10240 2560 10240 2048 default   # 2.56287 ms
++f16o 10240 2560 10240 4096 default   # 5.22701 ms
++f16o 10240 2560 10240 8192 default   # 12.256 ms
++f16o 12288 2560 12288 256 -1086327718   # 3.00699 ms -> 0.504361 ms
++f16o 12288 2560 12288 512 -1086327703   # 1.01009 ms -> 0.831414 ms
++f16o 12288 2560 12288 768 -1086327703   # 1.54412 ms -> 1.30476 ms
++f16o 12288 2560 12288 1024 -1086327687   # 1.84607 ms -> 1.62627 ms
++f16o 12288 2560 12288 1536 -1086327687   # 2.60974 ms -> 2.41411 ms
++f16o 12288 2560 12288 2048 -1086327687   # 3.39763 ms -> 3.2127 ms
++f16o 12288 2560 12288 4096 default   # 6.8017 ms
++f16o 12288 2560 12288 8192 default   # 14.3542 ms
++f16o 6144 2560 6144 256 -1086327717   # 0.980093 ms -> 0.281347 ms
++f16o 6144 2560 6144 512 -1086327703   # 1.83313 ms -> 0.509667 ms
++f16o 6144 2560 6144 768 default   # 0.666733 ms
++f16o 6144 2560 6144 1024 default   # 0.829613 ms
++f16o 6144 2560 6144 1536 default   # 1.29944 ms
++f16o 6144 2560 6144 2048 -1086327687   # 2.4454 ms -> 1.63103 ms
++f16o 6144 2560 6144 4096 default   # 3.20715 ms
++f16o 6144 2560 6144 8192 default   # 6.33023 ms
++f16o 2560 6144 2560 256 -1086327764   # 1.30173 ms -> 0.292693 ms
++f16o 2560 6144 2560 512 -1086327719   # 1.22932 ms -> 0.475053 ms
++f16o 2560 6144 2560 768 default   # 0.795013 ms
++f16o 2560 6144 2560 1024 -1086327719   # 1.01636 ms -> 0.886773 ms
++f16o 2560 6144 2560 1536 -1086327703   # 1.59868 ms -> 1.43847 ms
++f16o 2560 6144 2560 2048 default   # 1.83883 ms
++f16o 2560 6144 2560 4096 default   # 3.45259 ms
++f16o 2560 6144 2560 8192 default   # 7.14512 ms
++f16o 2560 640 2560 256 -1086327695   # 0.04352 ms -> 0.0384667 ms
++f16o 2560 640 2560 512 -1086327711   # 0.0728533 ms -> 0.0594 ms
++f16o 2560 640 2560 768 -1086327694   # 0.0964533 ms -> 0.07984 ms
++f16o 2560 640 2560 1024 -1086327709   # 0.108387 ms -> 0.0945467 ms
++f16o 2560 640 2560 1536 -1086327713   # 0.156893 ms -> 0.13828 ms
++f16o 2560 640 2560 2048 default   # 0.183253 ms
++f16o 2560 640 2560 4096 default   # 0.348147 ms
++f16o 2560 640 2560 8192 default   # 0.685773 ms
++f16o 2560 2560 2560 256 default   # 0.1292 ms
++f16o 2560 2560 2560 512 -1086327719   # 0.215 ms -> 0.204587 ms
++f16o 2560 2560 2560 768 default   # 0.303533 ms
++f16o 2560 2560 2560 1024 -1086327719   # 0.416427 ms -> 0.356733 ms
++f16o 2560 2560 2560 1536 default   # 0.52424 ms
++f16o 2560 2560 2560 2048 default   # 0.687973 ms
++f16o 2560 2560 2560 4096 -1086327703   # 1.55271 ms -> 1.32725 ms
++f16o 2560 2560 2560 8192 -1086327703   # 2.81991 ms -> 2.61531 ms
++f16o 640 2560 640 256 -1086327725   # 0.152587 ms -> 0.0562933 ms
++f16o 640 2560 640 512 -1086327724   # 0.200773 ms -> 0.0829867 ms
++f16o 640 2560 640 768 -1086327723   # 0.165947 ms -> 0.11384 ms
++f16o 640 2560 640 1024 -1086327764   # 0.206733 ms -> 0.125493 ms
++f16o 640 2560 640 1536 -1086327719   # 0.284106 ms -> 0.201267 ms
++f16o 640 2560 640 2048 -1086327703   # 0.217293 ms -> 0.206173 ms
++f16o 640 2560 640 4096 default   # 0.346747 ms
++f16o 640 2560 640 8192 default   # 0.689187 ms
++f16o 512 2560 512 256 -1086327769   # 0.156933 ms -> 0.0474 ms
++f16o 512 2560 512 512 -1086327722   # 0.202507 ms -> 0.0734 ms
++f16o 512 2560 512 768 -1086327774   # 0.147413 ms -> 0.0978133 ms
++f16o 512 2560 512 1024 -1086327722   # 0.15524 ms -> 0.11936 ms
++f16o 512 2560 512 1536 -1086327768   # 0.2222 ms -> 0.17032 ms
++f16o 512 2560 512 2048 default   # 0.2122 ms
++f16o 512 2560 512 4096 default   # 0.344253 ms
++f16o 512 2560 512 8192 default   # 0.664307 ms
++f16o 128 2560 128 256 -1086327780   # 0.0608 ms -> 0.03712 ms
++f16o 128 2560 128 512 -1086327780   # 0.1992 ms -> 0.0377333 ms
++f16o 128 2560 128 768 -1086327780   # 0.113667 ms -> 0.0451733 ms
++f16o 128 2560 128 1024 -1086327774   # 0.118013 ms -> 0.0492533 ms
++f16o 128 2560 128 1536 -1086327772   # 0.151973 ms -> 0.0664 ms
++f16o 128 2560 128 2048 -1086327768   # 0.12424 ms -> 0.07528 ms
++f16o 128 2560 128 4096 -1086327764   # 0.151187 ms -> 0.124813 ms
++f16o 128 2560 128 8192 default   # 0.206573 ms
++f16o 48 2560 48 256 -1086327840   # 0.0455867 ms -> 0.0207733 ms
++f16o 48 2560 48 512 -1086327781   # 0.202253 ms -> 0.0386667 ms
++f16o 48 2560 48 768 -1086327779   # 0.102947 ms -> 0.04176 ms
++f16o 48 2560 48 1024 -1086327779   # 0.10784 ms -> 0.04392 ms
++f16o 48 2560 48 1536 -1086327776   # 0.11252 ms -> 0.0512133 ms
++f16o 48 2560 48 2048 -1086327779   # 0.121 ms -> 0.0565467 ms
++f16o 48 2560 48 4096 -1086327736   # 0.186493 ms -> 0.0971733 ms
++f16o 48 2560 48 8192 -1086327762   # 0.204667 ms -> 0.148867 ms
++f16o 320 10240 320 256 -1086327781   # 0.42828 ms -> 0.13252 ms
++f16o 320 10240 320 512 -1086327769   # 0.497053 ms -> 0.20012 ms
++f16o 320 10240 320 768 -1086327722   # 0.826453 ms -> 0.241627 ms
++f16o 320 10240 320 1024 -1086327773   # 1.16967 ms -> 0.36232 ms
++f16o 320 10240 320 1536 -1086327738   # 1.60872 ms -> 0.466893 ms
++f16o 320 10240 320 2048 -1086327724   # 2.17916 ms -> 0.633547 ms
++f16o 320 10240 320 4096 -1086327717   # 9.61694 ms -> 1.18415 ms
++f16o 320 10240 320 8192 default   # 2.26508 ms
++f16o 10240 320 10240 256 -1086327694   # 0.0583733 ms -> 0.05556 ms
++f16o 10240 320 10240 512 default   # 0.0980133 ms
++f16o 10240 320 10240 768 default   # 0.1398 ms
++f16o 10240 320 10240 1024 default   # 0.181493 ms
++f16o 10240 320 10240 1536 default   # 0.262587 ms
++f16o 10240 320 10240 2048 default   # 0.343693 ms
++f16o 10240 320 10240 4096 default   # 0.669293 ms
++f16o 10240 320 10240 8192 default   # 1.35307 ms
++f16o 4 10240 4 256 -1086327846   # 0.105 ms -> 0.05028 ms
++f16o 4 10240 4 512 -1086327840   # 0.247013 ms -> 0.0543863 ms
++f16o 4 10240 4 768 -1086327840   # 0.253867 ms -> 0.061 ms
++f16o 4 10240 4 1024 -1086327850   # 0.255293 ms -> 0.0801467 ms
++f16o 4 10240 4 1536 -1086327840   # 0.2556 ms -> 0.1116 ms
++f16o 4 10240 4 2048 -1086327815   # 0.305107 ms -> 0.142907 ms
++f16o 4 10240 4 4096 -1086327922   # 0.489133 ms -> 0.253813 ms
++f16o 4 10240 4 8192 -1086327922   # 1.16808 ms -> 0.48448 ms
++f16o 1 2560 1 256 -9   # 0.0432533 ms -> 0.00812 ms
++f16o 1 2560 1 512 -9   # 0.2 ms -> 0.0107333 ms
++f16o 1 2560 1 768 -9   # 0.0864667 ms -> 0.0125333 ms
++f16o 1 2560 1 1024 -9   # 0.0914133 ms -> 0.0166533 ms
++f16o 1 2560 1 1536 -9   # 0.09308 ms -> 0.0197333 ms
++f16o 1 2560 1 2048 -9   # 0.120027 ms -> 0.030653 ms
++f16o 1 2560 1 4096 -9   # 0.0734267 ms -> 0.04152 ms
++f16o 1 2560 1 8192 -9   # 0.200733 ms -> 0.07284 ms
+diff --git a/tools/hip/tune_rocblas.cpp b/tools/hip/tune_rocblas.cpp
+new file mode 100644
+index 0000000000..dfd466b5d0
+--- /dev/null
++++ b/tools/hip/tune_rocblas.cpp
+@@ -0,0 +1,281 @@
++// tools/hip/tune_rocblas.cpp - a rocBLAS tuning table for the prompt path's FP16-out GEMMs (gfx103x, prompt_f16()).
++//
++// On RDNA2 the prompt path's dense products run as rocBLAS FP16 in -> FP16 out (docs/AMD_HIP.md, "RDNA2").  rocBLAS
++// picks its kernel from a table by shape, and for some shapes that pick is far from the best kernel the library has:
++// on an RX 6900 XT, N=10240 K=2560 (the GDN input projection) below T=1152 tokens runs at 5 TFLOPS where the best of
++// rocBLAS's own 237 solutions for the same shape runs at 32 (E270, 2026-10-05).  This tool enumerates the library's
++// solutions for each shape (rocblas_gemm_ex_get_solutions), times them, checks each against the default kernel's
++// output, and writes the rows where a solution beats the default by at least --min-gain (1.05 = 5%) as a table the
++// engine reads through STRATA_ROCBLAS_TUNING (src/prefill/rocblas_tuning.hpp; Gemm::f16_inplace).
++//
++// Solution indices are valid only for one GPU architecture and one rocBLAS build (its version string, tweak hash
++// included), so a table is calibrated on the card with the ROCm the engine runs with:
++//
++//   cmake --build build-hip --target tune_rocblas
++//   ./build-hip/tune_rocblas --tuning-out tools/hip/<arch>-rocblas-<version>.txt
++//
++// Defaults: the engine's 14 FP16 dense shapes at T = 256 ... 8192 (--tokens); --case T,N,K,ldy adds one shape.
++#define ROCBLAS_BETA_FEATURES_API
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <rocblas/rocblas.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <functional>
++#include <limits>
++#include <random>
++#include <string>
++#include <vector>
++
++namespace {
++#define HIP_CHECK(call) do { const hipError_t e = (call); if (e != hipSuccess) { \
++    std::fprintf(stderr, "HIP %s:%d: %s: %s\n", __FILE__, __LINE__, #call, hipGetErrorString(e)); std::exit(2); } } while (0)
++#define RB_CHECK(call) do { const rocblas_status e = (call); if (e != rocblas_status_success) { \
++    std::fprintf(stderr, "rocBLAS %s:%d: %s: status=%d\n", __FILE__, __LINE__, #call, (int) e); std::exit(2); } } while (0)
++
++struct Buffer {
++    void* p = nullptr;
++    explicit Buffer(size_t bytes) { if (bytes) HIP_CHECK(hipMalloc(&p, bytes)); }
++    ~Buffer() { if (p) (void) hipFree(p); }
++    Buffer(const Buffer&) = delete;
++    Buffer& operator=(const Buffer&) = delete;
++};
++
++struct Shape { int t, n, k, ldy; };
++struct Options {
++    std::vector<Shape> shapes;
++    std::vector<int> tokens{256, 512, 768, 1024, 1536, 2048, 4096, 8192};
++    std::string tuning_out;
++    double min_gain = 1.05;
++    bool explicit_shapes = false;
++};
++struct Err { double rel_l2 = 0, max_abs = 0; bool finite = true, ok = true; size_t padding_writes = 0; };
++struct Row { Shape s; bool tuned; int solution; float default_ms, best_ms; };
++
++constexpr int WARMUPS = 2, REPS = 3, TOP = 8;
++constexpr uint16_t CANARY = 0x7BFF;   // the largest finite FP16 (65504): never a product of (-1, 1) inputs
++
++uint16_t f16_bits(float x) { const __half h = __float2half_rn(x); uint16_t b; std::memcpy(&b, &h, 2); return b; }
++float f16_value(uint16_t b) { __half h; std::memcpy(&h, &b, 2); return __half2float(h); }
++
++std::vector<std::string> csv(const std::string& s) {
++    std::vector<std::string> out; size_t b = 0;
++    for (;;) {
++        const size_t p = s.find(',', b);
++        out.push_back(s.substr(b, p == std::string::npos ? p : p - b));
++        if (p == std::string::npos) return out;
++        b = p + 1;
++    }
++}
++int positive(const std::string& s, const char* label) {
++    char* e = nullptr; const long v = std::strtol(s.c_str(), &e, 10);
++    if (s.empty() || !e || *e || v < 1 || v > std::numeric_limits<int>::max()) {
++        std::fprintf(stderr, "invalid %s: %s\n", label, s.c_str()); std::exit(2);
++    }
++    return (int) v;
++}
++void usage(const char* p) {
++    std::printf("Usage: %s [--case T,N,K,ldy]... [--tokens T1,T2,...] [--min-gain 1.05] [--tuning-out PATH]\n", p);
++    std::printf("Defaults: the engine's 14 FP16 dense shapes (ldy = N) at T = 256,512,768,1024,1536,2048,4096,8192.\n");
++}
++Options options(int argc, char** argv) {
++    Options o;
++    for (int i = 1; i < argc; ++i) {
++        const std::string a = argv[i];
++        auto next = [&]() -> std::string {
++            if (i + 1 >= argc) { std::fprintf(stderr, "missing option value\n"); std::exit(2); }
++            return argv[++i];
++        };
++        if (a == "-h" || a == "--help") { usage(argv[0]); std::exit(0); }
++        else if (a == "--case") {
++            const auto f = csv(next());
++            if (f.size() != 4) { std::fprintf(stderr, "--case expects T,N,K,ldy\n"); std::exit(2); }
++            const Shape s{positive(f[0], "T"), positive(f[1], "N"), positive(f[2], "K"), positive(f[3], "ldy")};
++            if (s.ldy < s.n) { std::fprintf(stderr, "ldy must be >= N\n"); std::exit(2); }
++            o.shapes.push_back(s); o.explicit_shapes = true;
++        } else if (a == "--tokens") {
++            o.tokens.clear();
++            for (const auto& x : csv(next())) o.tokens.push_back(positive(x, "token bucket"));
++        } else if (a == "--min-gain") { o.min_gain = std::atof(next().c_str()); if (o.min_gain < 1.0) o.min_gain = 1.0; }
++        else if (a == "--tuning-out") o.tuning_out = next();
++        else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(argv[0]); std::exit(2); }
++    }
++    if (!o.explicit_shapes) {
++        // Qwen3.8-Flash-Next's dense FP16 products, prompt_f16() on (the hc read, GDN and QSA projections, the router
++        // and the shared expert), ldy = N for every one of them.  N K as the engine calls Gemm (ROCBLAS_LAYER=2).
++        const int nk[][2] = {{10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144}, {2560, 640}, {2560, 2560},
++                             {640, 2560}, {512, 2560}, {128, 2560}, {48, 2560}, {320, 10240}, {10240, 320},
++                             {4, 10240}, {1, 2560}};
++        for (const auto& p : nk) for (int t : o.tokens) o.shapes.push_back({t, p[0], p[1], p[0]});
++    }
++    return o;
++}
++
++float time_ms(hipStream_t stream, hipEvent_t a, hipEvent_t b, const std::function<rocblas_status()>& f, int reps,
++              bool& ok) {
++    HIP_CHECK(hipEventRecord(a, stream));
++    for (int i = 0; i < reps; ++i) if (f() != rocblas_status_success) { ok = false; return 0; }
++    HIP_CHECK(hipEventRecord(b, stream));
++    HIP_CHECK(hipEventSynchronize(b));
++    float ms = 0; HIP_CHECK(hipEventElapsedTime(&ms, a, b));
++    ok = true;
++    return ms / reps;
++}
++
++// The candidate's FP16 output against the default kernel's, over the N x T results; the rest of each 2*ldy-half column
++// (what the engine's widen_rows_f16 does not cover) must still hold the canary.
++Err compare(const std::vector<uint16_t>& ref, const std::vector<uint16_t>& got, const Shape& s) {
++    Err e; long double d2 = 0, r2 = 0; float max_ref = 0;
++    const size_t ldc = (size_t) s.ldy * 2;
++    for (int col = 0; col < s.t; ++col) {
++        for (int row = 0; row < s.n; ++row) {
++            const float r = f16_value(ref[col * ldc + row]), g = f16_value(got[col * ldc + row]);
++            if (!std::isfinite(r) || !std::isfinite(g)) { e.finite = false; continue; }
++            const double d = (double) g - r;
++            d2 += (long double) d * d; r2 += (long double) r * r;
++            e.max_abs = std::max(e.max_abs, std::abs(d)); max_ref = std::max(max_ref, std::abs(r));
++        }
++        for (size_t row = s.n; row < ldc; ++row) if (got[col * ldc + row] != CANARY) ++e.padding_writes;
++    }
++    e.rel_l2 = std::sqrt((double) (d2 / std::max(r2, 1e-300L)));
++    // the two kernels sum K products in different orders, then both round to FP16: a few last-bit differences
++    const float ulp = std::ldexp(1.0f, (int) std::floor(std::log2(std::max(max_ref, 1e-30f))) - 10);
++    e.ok = e.finite && e.padding_writes == 0 && e.rel_l2 <= 2e-3 && e.max_abs <= 4.0 * ulp;
++    return e;
++}
++}  // namespace
++
++int main(int argc, char** argv) {
++    const Options o = options(argc, argv);
++    rocblas_handle h; RB_CHECK(rocblas_create_handle(&h));
++    hipStream_t stream; HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
++    RB_CHECK(rocblas_set_stream(h, stream));
++    char ver[128] = {0}; RB_CHECK(rocblas_get_version_string(ver, sizeof ver));
++    int device = 0; hipDeviceProp_t prop{};
++    HIP_CHECK(hipGetDevice(&device)); HIP_CHECK(hipGetDeviceProperties(&prop, device));
++    std::string arch(prop.gcnArchName); if (const auto c = arch.find(':'); c != std::string::npos) arch.resize(c);
++    std::printf("meta device_arch=%s rocblas_version=%s shapes=%zu min_gain=%.3f\n", arch.c_str(), ver, o.shapes.size(), o.min_gain);
++    hipEvent_t ea, eb; HIP_CHECK(hipEventCreate(&ea)); HIP_CHECK(hipEventCreate(&eb));
++
++    std::vector<Row> rows;
++    for (size_t ci = 0; ci < o.shapes.size(); ++ci) {
++        const Shape& s = o.shapes[ci];
++        const size_t na = (size_t) s.n * s.k, nb = (size_t) s.t * s.k, ldc = (size_t) s.ldy * 2, nc = ldc * s.t;
++        std::vector<uint16_t> ha(na), hb(nb), canary(nc, CANARY);
++        std::mt19937 rng(0x5A17C3u + (uint32_t) ci * 0x10001u);
++        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
++        for (auto& x : ha) x = f16_bits(dist(rng));
++        for (auto& x : hb) x = f16_bits(dist(rng));
++        Buffer da(na * 2), db(nb * 2), dc(nc * 2);
++        HIP_CHECK(hipMemcpy(da.p, ha.data(), na * 2, hipMemcpyHostToDevice));
++        HIP_CHECK(hipMemcpy(db.p, hb.data(), nb * 2, hipMemcpyHostToDevice));
++        const float alpha = 1.0f, beta = 0.0f;
++        // the engine's call (Gemm::f16_inplace): C[N x T] = W^T . X, FP16 out, ldc = 2 * ldy halves
++        auto gemm = [&](rocblas_gemm_algo algo, int32_t sol) {
++            return rocblas_gemm_ex(h, rocblas_operation_transpose, rocblas_operation_none, s.n, s.t, s.k, &alpha,
++                                   da.p, rocblas_datatype_f16_r, s.k, db.p, rocblas_datatype_f16_r, s.k, &beta, dc.p,
++                                   rocblas_datatype_f16_r, (int) ldc, dc.p, rocblas_datatype_f16_r, (int) ldc,
++                                   rocblas_datatype_f32_r, algo, sol, 0);
++        };
++        bool ok = true;
++        HIP_CHECK(hipMemcpy(dc.p, canary.data(), nc * 2, hipMemcpyHostToDevice));
++        for (int i = 0; i < WARMUPS; ++i) RB_CHECK(gemm(rocblas_gemm_algo_standard, 0));
++        const float default_ms = time_ms(stream, ea, eb, [&] { return gemm(rocblas_gemm_algo_standard, 0); }, REPS, ok);
++        HIP_CHECK(hipDeviceSynchronize());
++        std::vector<uint16_t> ref(nc);
++        HIP_CHECK(hipMemcpy(ref.data(), dc.p, nc * 2, hipMemcpyDeviceToHost));
++        const Err self = compare(ref, ref, s);
++        std::printf("case T=%d N=%d K=%d ldy=%d default_ms=%.4f default_padding_writes=%zu\n", s.t, s.n, s.k, s.ldy,
++                    default_ms, self.padding_writes);
++
++        rocblas_int count = 0;
++        auto solutions = [&](rocblas_int* list, rocblas_int* n) {
++            return rocblas_gemm_ex_get_solutions(h, rocblas_operation_transpose, rocblas_operation_none, s.n, s.t, s.k,
++                                                 &alpha, da.p, rocblas_datatype_f16_r, s.k, db.p, rocblas_datatype_f16_r,
++                                                 s.k, &beta, dc.p, rocblas_datatype_f16_r, (int) ldc, dc.p,
++                                                 rocblas_datatype_f16_r, (int) ldc, rocblas_datatype_f32_r,
++                                                 rocblas_gemm_algo_solution_index, 0, list, n);
++        };
++        if (solutions(nullptr, &count) != rocblas_status_success || count <= 0) {
++            std::printf("no_solutions T=%d N=%d K=%d ldy=%d\n", s.t, s.n, s.k, s.ldy);
++            continue;
++        }
++        std::vector<rocblas_int> ids(count);
++        RB_CHECK(solutions(ids.data(), &count));
++        // pass 1: one timed call each; pass 2: the TOP fastest get the full measurement and the output check
++        std::vector<std::pair<float, rocblas_int>> quick;
++        for (rocblas_int id : ids) {
++            if (gemm(rocblas_gemm_algo_solution_index, id) != rocblas_status_success) continue;
++            const float ms = time_ms(stream, ea, eb, [&] { return gemm(rocblas_gemm_algo_solution_index, id); }, 1, ok);
++            if (ok) quick.push_back({ms, id});
++        }
++        std::sort(quick.begin(), quick.end());
++        rocblas_int best = 0; float best_ms = std::numeric_limits<float>::infinity();
++        for (size_t i = 0; i < quick.size() && i < (size_t) TOP; ++i) {
++            const rocblas_int id = quick[i].second;
++            HIP_CHECK(hipMemcpy(dc.p, canary.data(), nc * 2, hipMemcpyHostToDevice));
++            for (int w = 0; w < WARMUPS; ++w) if (gemm(rocblas_gemm_algo_solution_index, id) != rocblas_status_success) { ok = false; break; }
++            if (!ok) continue;
++            const float ms = time_ms(stream, ea, eb, [&] { return gemm(rocblas_gemm_algo_solution_index, id); }, REPS, ok);
++            if (!ok) continue;
++            HIP_CHECK(hipDeviceSynchronize());
++            std::vector<uint16_t> got(nc);
++            HIP_CHECK(hipMemcpy(got.data(), dc.p, nc * 2, hipMemcpyDeviceToHost));
++            Err e = compare(ref, got, s);
++            // the engine applies a row to every T nearest its bucket, and a kernel can refuse a T it was not
++            // measured at (a tile or grid predicate): the solution must also run at odd, smaller token counts
++            bool accepts_neighbors = true;
++            for (int tn : {s.t - 1, s.t - 37, s.t - 63, s.t / 2 + 1}) {
++                if (tn < 1) continue;
++                const rocblas_status st = rocblas_gemm_ex(
++                    h, rocblas_operation_transpose, rocblas_operation_none, s.n, tn, s.k, &alpha, da.p,
++                    rocblas_datatype_f16_r, s.k, db.p, rocblas_datatype_f16_r, s.k, &beta, dc.p, rocblas_datatype_f16_r,
++                    (int) ldc, dc.p, rocblas_datatype_f16_r, (int) ldc, rocblas_datatype_f32_r,
++                    rocblas_gemm_algo_solution_index, id, 0);
++                if (st != rocblas_status_success) { accepts_neighbors = false; break; }
++            }
++            HIP_CHECK(hipDeviceSynchronize());
++            e.ok = e.ok && accepts_neighbors;
++            std::printf("  solution=%d ms=%.4f gain=%.2f relative_l2=%.3g max_abs=%.3g padding_writes=%zu %s%s\n", (int) id,
++                        ms, default_ms / ms, e.rel_l2, e.max_abs, e.padding_writes, e.ok ? "ok" : "REJECT",
++                        accepts_neighbors ? "" : " (refuses a smaller T)");
++            if (e.ok && ms < best_ms) { best = id; best_ms = ms; }
++        }
++        if (std::isfinite(best_ms) && default_ms / best_ms >= o.min_gain) {
++            std::printf("best T=%d N=%d K=%d ldy=%d solution=%d ms=%.4f default_ms=%.4f gain=%.2f\n", s.t, s.n, s.k, s.ldy,
++                        (int) best, best_ms, default_ms, default_ms / best_ms);
++            rows.push_back({s, true, (int) best, default_ms, best_ms});
++        } else {
++            // written too: the engine applies a row to the token counts nearest its bucket, and a `default` row keeps
++            // a neighbouring bucket's solution from reaching token counts where the default kernel measured best
++            std::printf("keep_default T=%d N=%d K=%d ldy=%d (%zu solutions; best %.4f ms vs default %.4f)\n", s.t, s.n, s.k,
++                        s.ldy, quick.size(), best_ms, default_ms);
++            rows.push_back({s, false, 0, default_ms, best_ms});
++        }
++    }
++
++    if (!o.tuning_out.empty()) {
++        std::ofstream f(o.tuning_out);
++        if (!f) { std::fprintf(stderr, "cannot write tuning output: %s\n", o.tuning_out.c_str()); return 2; }
++        f << "# rocBLAS solution indices for the prompt path's FP16-out GEMMs; valid for this architecture and rocBLAS build only\n";
++        f << "# rows: type N K ldy T solution   (type f16o: FP16 in, FP16 out, FP32 compute; Gemm::f16_inplace)\n";
++        f << "# solution: rocBLAS's solution index, or `default` where its own choice measured best at that bucket\n";
++        f << "STRATA_ROCBLAS_TUNING_V1 " << arch << " " << ver << "\n";
++        size_t tuned = 0;
++        for (const auto& r : rows) {
++            f << "f16o " << r.s.n << " " << r.s.k << " " << r.s.ldy << " " << r.s.t << " ";
++            if (r.tuned) { f << r.solution << "   # " << r.default_ms << " ms -> " << r.best_ms << " ms\n"; ++tuned; }
++            else f << "default   # " << r.default_ms << " ms\n";
++        }
++        std::printf("wrote %zu rows (%zu with a solution) to %s\n", rows.size(), tuned, o.tuning_out.c_str());
++    }
++    HIP_CHECK(hipEventDestroy(ea)); HIP_CHECK(hipEventDestroy(eb));
++    HIP_CHECK(hipStreamDestroy(stream)); RB_CHECK(rocblas_destroy_handle(h));
++    return 0;
++}

@@ -1,0 +1,1185 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cd60517799..f113cf95b6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -114,6 +114,9 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
+   target_include_directories(conversation_file_test PRIVATE include)
+   add_test(NAME conversation_file_test COMMAND conversation_file_test)
++  add_executable(conversation_spill_test src/core/conversation_spill_test.cpp src/core/conversation_spill.cpp src/core/conversation_file.cpp)
++  target_include_directories(conversation_spill_test PRIVATE include)
++  add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
+ endif()
+ 
+ if(STRATA_HIP_GFX906)
+@@ -437,7 +440,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/remote_expert_opt.cu
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
++    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_spill.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index eaeadf08d4..2e97d13b0d 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -771,6 +771,35 @@ sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disa
+ retention for diagnostic comparisons. Parked snapshots are not
+ persisted across restarts; the session files below are.
+ 
++**Disk tier for the parked conversations (opt-in).** Set `--conversation-cache-spill-dir DIR` to keep a parked
++conversation when RAM pressure or `--conversation-cache-slots` evicts it: the evicted conversation is written to DIR
++as an ordinary session file (the same format and model/configuration identity as the slot save/restore below), so a
++later request - or a restart - can read it back. The directory is scanned at the next start, and a request that
++matches a spilled conversation resumes from it even though it is no longer in RAM. The cache is still off unless
++`--conversation-cache-mib` is nonzero, and `--prompt-cache 0` or `--conversation-cache-slots 0` disables it.
++`--conversation-cache-disk-mib N` caps this model's spill files at 8192 MiB by default; `0` disables the disk tier.
++The index holds at most 256 conversations and evicts the oldest first. On a clean `QUIT` or stdin close, Strata
++captures the active conversation and spills the parked ones before it exits. Use a separate directory per model.
++
++Each spilled conversation is a session file (`.sess`) plus a small metadata sidecar (`.meta`) that holds only its
++token and image lists, so a new request finds the best disk match without reading the conversation's K/V. A file
++whose recorded model or configuration identity differs is refused, and a sidecar whose session file is missing, or
++whose own checksum fails, is removed when the directory is scanned. The identity is the same model fingerprint and
++configuration fingerprint the session files below are bound to, so a spilled conversation and a hand-saved session
++file are interchangeable.
++
++`--conversation-cache-similarity F` sets the least longest-common-prefix fraction of the new prompt a disk hit may
++offer (the fraction is `common_prefix_tokens / new_prompt_tokens`, and must be strictly greater than F);
++`--conversation-cache-n-min N` sets the least common-prefix token count. Both default to 0, which keeps every exact
++prefix the RAM cache would have used. Even when a candidate passes the threshold, Strata restores only a saved
++checkpoint whose token and image keys are an exact prefix of the new prompt; the last prompt token stays unread so
++the next verify window starts in the right position.
++
++A disk hit is read into host RAM before it is restored: it must fit the configured RAM cache budget and leave the
++`--conversation-cache-min-free-mib` physical-memory floor available, or the request reads the prompt normally. The
++engine logs spill, restore, stale-file and disk-budget events. The disk tier keeps the existing single-GPU parking
++limit: with `--layer-split` the disk tier stays off.
++
+ **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
+ restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
+ requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index c28ae01f62..65e3d5c05b 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -178,13 +178,104 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
+     return (int64_t) n;
+ }
+ 
++// The same prefix test against only the first n ids of the checkpoint: a parked conversation's checkpoints are
++// prefixes of its live ids, so a shorter resume point is checked without copying the ids.
++template<class Token>
++int64_t conversation_prefix_at(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
++                               const std::vector<ConversationImageKey>& images, size_t n) {
++    // The last prompt token always starts the next verify window.
++    if (n == 0 || n >= prompt.size() || n > c.ids.size() ||
++        !std::equal(c.ids.begin(), c.ids.begin() + n, prompt.begin())) return 0;
++    size_t a = 0, b = 0;
++    while ((a < c.imgs.size() && c.imgs[a].start < (int64_t) n) ||
++           (b < images.size() && images[b].start < (int64_t) n)) {
++        if (a == c.imgs.size() || c.imgs[a].start >= (int64_t) n ||
++            b == images.size() || images[b].start >= (int64_t) n || !(c.imgs[a] == images[b])) return 0;
++        ++a;
++        ++b;
++    }
++    return (int64_t) n;
++}
++
++// The longest common prefix of a cached conversation and the prompt, in tokens. Unlike conversation_prefix this
++// does not require the whole cached ids to match: it is the resume point a similarity hit would give.
++template<class Token>
++int64_t conversation_lcp(const ConversationCheckpoint& cached, const std::vector<Token>& prompt,
++                         const std::vector<ConversationImageKey>& images) {
++    size_t n = std::min(cached.ids.size(), prompt.size());
++    size_t i = 0;
++    while (i < n && cached.ids[i] == prompt[i]) ++i;
++    // Token ids alone do not identify image embeddings: stop before the first image boundary whose identity
++    // differs, so no state after it is reused.
++    size_t a = 0, b = 0;
++    while ((a < cached.imgs.size() && cached.imgs[a].start < (int64_t) i) ||
++           (b < images.size() && images[b].start < (int64_t) i)) {
++        if (a == cached.imgs.size() || cached.imgs[a].start >= (int64_t) i ||
++            b == images.size() || images[b].start >= (int64_t) i || !(cached.imgs[a] == images[b])) {
++            const int64_t ca = a < cached.imgs.size() ? cached.imgs[a].start : INT64_MAX;
++            const int64_t cb = b < images.size() ? images[b].start : INT64_MAX;
++            const int64_t boundary = std::min(ca, cb);
++            if (boundary < 0) return 0;
++            i = std::min(i, (size_t) boundary);
++            break;
++        }
++        ++a;
++        ++b;
++    }
++    return (int64_t) i;
++}
++
++struct ConversationMatch {
++    size_t index = 0;
++    int64_t tokens = 0;
++    bool live = false;
++};
++
++// The best resume a parked image offers for this prompt. similarity is the least LCP/new-prompt fraction accepted
++// (0 keeps every exact-prefix hit); n_min the least common-prefix tokens. A hit longer than the LCP is never offered.
++template<class Token>
++ConversationMatch conversation_saved_match(const SavedConversation& saved,
++                                           const std::vector<Token>& prompt,
++                                           const std::vector<ConversationImageKey>& images,
++                                           bool cvec, double similarity, int64_t n_min) {
++    ConversationMatch best;
++    if (saved.cvec != cvec || prompt.empty() || similarity < 0.0 || similarity >= 1.0) return best;
++    const int64_t lcp = conversation_lcp(saved.live, prompt, images);
++    if (lcp < n_min || (double) lcp / (double) prompt.size() <= similarity) return best;
++    auto consider = [&](const ConversationCheckpoint& checkpoint, bool live) {
++        const int64_t n = conversation_prefix(checkpoint, prompt, images);
++        if (n > 0 && n <= lcp && n > best.tokens) best = {0, n, live};
++    };
++    consider(saved.live, true);
++    for (const auto& checkpoint : saved.checkpoints) consider(checkpoint, false);
++    return best;
++}
++
++// The same match from a spill directory's metadata only (no K/V read): the live ids and images plus each
++// checkpoint's length, exactly what a parked image's checkpoints are prefixes of.
++template<class Token>
++ConversationMatch conversation_metadata_match(const ConversationCheckpoint& live,
++                                              const std::vector<size_t>& checkpoint_lengths,
++                                              const std::vector<Token>& prompt,
++                                              const std::vector<ConversationImageKey>& images,
++                                              bool cvec, bool cached_cvec,
++                                              double similarity, int64_t n_min) {
++    ConversationMatch best;
++    if (cached_cvec != cvec || prompt.empty() || similarity < 0.0 || similarity >= 1.0) return best;
++    const int64_t lcp = conversation_lcp(live, prompt, images);
++    if (lcp < n_min || (double) lcp / (double) prompt.size() <= similarity) return best;
++    const int64_t live_match = conversation_prefix(live, prompt, images);
++    if (live_match > 0 && live_match <= lcp) best = {0, live_match, true};
++    for (size_t length : checkpoint_lengths) {
++        const int64_t n = conversation_prefix_at(live, prompt, images, length);
++        if (n > 0 && n <= lcp && n > best.tokens) best = {0, n, false};
++    }
++    return best;
++}
++
+ class ConversationCache {
+ public:
+-    struct Match {
+-        size_t index = 0;
+-        int64_t tokens = 0;
+-        bool live = false;
+-    };
++    using Match = ConversationMatch;
+ 
+     ConversationCache(size_t budget, size_t slots) : budget_(budget), slots_(slots) {}
+     bool enabled() const { return budget_ != 0 && slots_ != 0; }
+@@ -215,19 +306,15 @@ class ConversationCache {
+     }
+ 
+     template<class Token>
+-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
++    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
++               double similarity = 0.0, int64_t n_min = 0) const {
+         Match best;
+         // Ties prefer the most recently parked branch. The caller prefers its
+         // already-active state when that offers the same prefix length.
+         for (size_t i = entries_.size(); i-- > 0;) {
+             const auto& e = entries_[i];
+-            if (e.cvec != cvec) continue;
+-            auto consider = [&](const ConversationCheckpoint& c, bool live) {
+-                const int64_t n = conversation_prefix(c, prompt, images);
+-                if (n > best.tokens) best = {i, n, live};
+-            };
+-            consider(e.live, true);
+-            for (const auto& c : e.checkpoints) consider(c, false);
++            Match candidate = conversation_saved_match(e, prompt, images, cvec, similarity, n_min);
++            if (candidate.tokens > best.tokens) { candidate.index = i; best = candidate; }
+         }
+         return best;
+     }
+@@ -242,9 +329,17 @@ class ConversationCache {
+     // Reserve before allocating a snapshot. held is an incoming image removed
+     // with take() but still alive during the exchange; count it against RAM too.
+     bool make_room(size_t incoming, size_t held = 0) {
++        return make_room(incoming, held, [](const SavedConversation&) {});
++    }
++
++    // The spill callback sees every conversation this call evicts from RAM, oldest first, before it is dropped, so
++    // a durable disk tier can keep it. The default does nothing (the RAM cache alone).
++    template<class Spill>
++    bool make_room(size_t incoming, size_t held, Spill&& spill) {
+         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
+         if (bytes() > budget_ - held - incoming) reuse_ = {};
+         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
++            spill(entries_.front());
+             bytes_ -= entries_.front().bytes();
+             entries_.pop_front();
+             ++evictions_;
+@@ -286,6 +381,22 @@ class ConversationCache {
+     }
+     size_t superseded() const { return superseded_; }
+ 
++    // Spill every parked conversation (oldest first) and empty the cache: the shutdown path, so a restart finds
++    // them on disk. Returns how many were handed to the callback.
++    template<class Spill>
++    size_t spill_all(Spill&& spill) {
++        size_t count = 0;
++        while (!entries_.empty()) {
++            spill(entries_.front());
++            bytes_ -= entries_.front().bytes();
++            entries_.pop_front();
++            ++evictions_;
++            ++count;
++        }
++        reuse_ = {};
++        return count;
++    }
++
+     bool put(SavedConversation&& image, size_t held = 0) {
+         const size_t n = image.bytes();
+         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
+diff --git a/include/strata/core/conversation_spill.hpp b/include/strata/core/conversation_spill.hpp
+new file mode 100644
+index 0000000000..d6ff59cb1d
+--- /dev/null
++++ b/include/strata/core/conversation_spill.hpp
+@@ -0,0 +1,94 @@
++// A durable disk tier for --serve's parked conversations: when the RAM cache evicts a conversation, it is written
++// as an ordinary session file (conversation_file.hpp, the same format and model/config identity as the slot save/
++// restore API) and can be restored after a restart. A small sidecar beside each file holds only the token/image
++// metadata, so a new request finds the best disk match without reading the conversation's K/V.
++//
++// This is host code only (no CUDA): it calls the session-file writer and reader, which are host code too.
++#pragma once
++
++#include "strata/core/conversation_cache.hpp"
++#include "strata/core/conversation_file.hpp"
++
++#include <cstddef>
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++struct ConversationSpillMatch {
++    std::string path;        // the session file to read back
++    uint64_t file_bytes = 0;
++    int64_t tokens = 0;
++    bool live = false;
++    explicit operator bool() const { return !path.empty() && tokens > 0; }
++};
++
++class ConversationSpillCache {
++public:
++    // Opens (creating if needed) the spill directory and indexes the conversations already in it. Files whose
++    // sidecar names another model/config identity, or whose session file is missing or unreadable, are removed.
++    bool open(const std::filesystem::path& directory, SessionFileIdentity identity, uint64_t budget_bytes,
++              std::string& error);
++    bool enabled() const { return enabled_; }
++    size_t size() const { return entries_.size(); }
++    uint64_t bytes() const { return bytes_; }
++    size_t stale_files_wiped() const { return stale_files_wiped_; }
++    size_t disk_evictions() const { return disk_evictions_; }
++
++    // The best resume this directory offers for the prompt, from the sidecars only (no K/V read). similarity and
++    // n_min filter weak hits exactly as the RAM cache's best() does.
++    template<class Token>
++    ConversationSpillMatch best(const std::vector<Token>& prompt,
++                                const std::vector<ConversationImageKey>& images, bool cvec,
++                                double similarity, int64_t n_min) const {
++        ConversationSpillMatch best_match;
++        int64_t best_tokens = 0;
++        for (size_t i = entries_.size(); i-- > 0;) {
++            const Entry& entry = entries_[i];
++            const ConversationMatch match = conversation_metadata_match(entry.live_meta,
++                    entry.checkpoint_lengths, prompt, images, cvec, entry.cvec, similarity, n_min);
++            if (match.tokens > best_tokens)
++                best_tokens = match.tokens, best_match = {entry.session_path(), entry.file_bytes, match.tokens, match.live};
++        }
++        return best_match;
++    }
++
++    // Reads a spilled conversation back into image (its K/V included), with the engine's read limits and identity.
++    bool load(const std::string& path, SavedConversation& image, const SessionReadLimits& limits,
++              std::string& error) const;
++    // Writes a parked conversation (its K/V in RAM) as a session file plus its sidecar, and indexes it.
++    bool spill(const SavedConversation& image, std::string& error);
++    bool erase(const std::string& path, std::string& error);
++    // A conversation being restored is held out of eviction until it is put back in RAM or dropped.
++    void pin(const std::string& path);
++    void unpin(const std::string& path);
++    // Removes the disk copies of this conversation a turn back, the same rule the RAM cache applies before evicting.
++    size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
++                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec);
++
++private:
++    struct Entry {
++        std::filesystem::path stem;          // "<dir>/strata-conv-<serial>" (both files share it)
++        uint64_t file_bytes = 0;
++        bool cvec = true;
++        ConversationCheckpoint live_meta;    // ids + imgs only; no running state
++        std::vector<size_t> checkpoint_lengths;
++        std::string session_path() const { return (stem.string() + ".sess"); }
++        std::string meta_path() const { return (stem.string() + ".meta"); }
++    };
++    void enforce_budget();
++    bool read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity, std::string& error) const;
++    bool write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error) const;
++
++    bool enabled_ = false;
++    SessionFileIdentity identity_{};
++    uint64_t budget_ = 0, bytes_ = 0, serial_ = 0;
++    size_t stale_files_wiped_ = 0, disk_evictions_ = 0;
++    std::filesystem::path directory_;
++    std::vector<Entry> entries_;   // oldest spill first
++    std::string pinned_path_;
++};
++
++} // namespace strata::core
+diff --git a/src/core/conversation_spill.cpp b/src/core/conversation_spill.cpp
+new file mode 100644
+index 0000000000..09c646342a
+--- /dev/null
++++ b/src/core/conversation_spill.cpp
+@@ -0,0 +1,339 @@
++// The spill directory's own format is only the sidecar: the conversation itself is an ordinary session file,
++// written and read by conversation_file.cpp, so a spilled conversation is byte-for-byte what the slot save/restore
++// API would write and the same model/config identity rules refuse a foreign file. The sidecar carries the token and
++// image metadata (no K/V) so best() can match without reading the conversation.
++#include "strata/core/conversation_spill.hpp"
++
++#include <algorithm>
++#include <cstring>
++#include <fstream>
++#include <limits>
++#include <new>
++#include <system_error>
++
++namespace strata::core {
++namespace {
++
++constexpr char kMetaMagic[4] = {'S', 'C', 'S', 'M'};   // Strata conversation-spill metadata
++constexpr uint32_t kMetaVersion = 1;
++constexpr size_t kMaxSidecarEntries = 256;
++
++// A small length-delimited writer/reader for the sidecar, with a trailing hash of the payload (the same
++// SessionHasher the session file uses) so a truncated or edited sidecar is refused rather than trusted.
++class MetaWriter {
++public:
++    explicit MetaWriter(std::ostream& out) : out_(out) {}
++    bool raw(const void* p, size_t n) {
++        out_.write(static_cast<const char*>(p), (std::streamsize) n);
++        if (!out_) return false;
++        hash_.update(p, n);
++        return true;
++    }
++    bool u64(uint64_t v) { return raw(&v, sizeof v); }
++    bool i64(int64_t v) { return raw(&v, sizeof v); }
++    bool finish() { const uint64_t d = hash_.digest(); return raw(&d, sizeof d); }
++private:
++    std::ostream& out_;
++    SessionHasher hash_{0};
++};
++
++class MetaReader {
++public:
++    MetaReader(std::istream& in, uint64_t file_bytes) : in_(in), file_bytes_(file_bytes) {}
++    uint64_t remaining() const { return consumed_ <= file_bytes_ && file_bytes_ - consumed_ >= 8 ? file_bytes_ - consumed_ - 8 : 0; }
++    bool raw(void* p, size_t n) {
++        if (n > remaining()) return false;
++        in_.read(static_cast<char*>(p), (std::streamsize) n);
++        if (in_.gcount() != (std::streamsize) n) return false;
++        hash_.update(p, n);
++        consumed_ += n;
++        return true;
++    }
++    bool u64(uint64_t& v) { return raw(&v, sizeof v); }
++    bool i64(int64_t& v) { return raw(&v, sizeof v); }
++    bool finish() {
++        if (consumed_ + 8 != file_bytes_) return false;
++        uint64_t want = 0;
++        in_.read(reinterpret_cast<char*>(&want), 8);
++        if (in_.gcount() != 8) return false;
++        return want == hash_.digest();
++    }
++private:
++    std::istream& in_;
++    uint64_t file_bytes_ = 0, consumed_ = 0;
++    SessionHasher hash_{0};
++};
++
++bool valid_meta_chain(const ConversationCheckpoint& live, const std::vector<size_t>& checkpoint_lengths) {
++    if (live.ids.empty()) return false;
++    int64_t previous_image = -1;
++    for (const auto& key : live.imgs) {
++        if (key.start <= previous_image || key.start < 0 || (uint64_t) key.start >= live.ids.size()) return false;
++        previous_image = key.start;
++    }
++    for (size_t length : checkpoint_lengths)
++        if (length == 0 || length > live.ids.size()) return false;
++    return true;
++}
++
++} // namespace
++
++bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity,
++                                          std::string& error) const {
++    other_identity = false;
++    std::error_code ec;
++    const uint64_t file_bytes = std::filesystem::file_size(meta, ec);
++    if (ec || file_bytes < 4 + 4 + 16 + 8) { error = "spill sidecar is missing or too short"; return false; }
++    std::ifstream in(meta, std::ios::binary);
++    if (!in) { error = "cannot open spill sidecar"; return false; }
++    MetaReader r(in, file_bytes);
++    char magic[4];
++    uint64_t version = 0;
++    uint64_t model = 0, config = 0;
++    if (!r.raw(magic, 4) || std::memcmp(magic, kMetaMagic, 4) != 0 || !r.u64(version) || version != kMetaVersion ||
++        !r.u64(model) || !r.u64(config)) {
++        error = "unknown spill sidecar magic or version"; return false;
++    }
++    if (model != identity_.model || config != identity_.config) { other_identity = true; return false; }
++    uint64_t cvec = 0;
++    if (!r.u64(cvec) || cvec > 1) { error = "invalid cvec flag in sidecar"; return false; }
++    entry.cvec = cvec != 0;
++    uint64_t n = 0;
++    if (!r.u64(n) || n > r.remaining() / 4 || n > (uint64_t) std::numeric_limits<size_t>::max()) {
++        error = "invalid token count in sidecar"; return false;
++    }
++    try { entry.live_meta.ids.resize((size_t) n); } catch (const std::bad_alloc&) { error = "not enough RAM for sidecar"; return false; }
++    for (auto& id : entry.live_meta.ids) { int64_t v = 0; if (!r.i64(v)) { error = "truncated sidecar ids"; return false; } id = (int32_t) v; }
++    if (!r.u64(n) || n > r.remaining() / 16) { error = "invalid image count in sidecar"; return false; }
++    try { entry.live_meta.imgs.resize((size_t) n); } catch (const std::bad_alloc&) { error = "not enough RAM for sidecar"; return false; }
++    for (auto& k : entry.live_meta.imgs)
++        if (!r.i64(k.start) || !r.u64(k.hash)) { error = "truncated sidecar images"; return false; }
++    if (!r.u64(n) || n > kMaxSidecarEntries) { error = "invalid checkpoint count in sidecar"; return false; }
++    entry.checkpoint_lengths.reserve((size_t) n);
++    for (uint64_t i = 0; i < n; ++i) { uint64_t len = 0; if (!r.u64(len)) { error = "truncated sidecar checkpoints"; return false; } entry.checkpoint_lengths.push_back((size_t) len); }
++    if (!r.finish()) { error = "spill sidecar checksum or length mismatch"; return false; }
++    if (!valid_meta_chain(entry.live_meta, entry.checkpoint_lengths)) { error = "spill sidecar is not a valid prefix chain"; return false; }
++    return true;
++}
++
++bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error) const {
++    const std::filesystem::path temporary(meta.string() + ".tmp");
++    {
++        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++        if (!out) { error = "cannot create spill sidecar"; return false; }
++        MetaWriter w(out);
++        if (!w.raw(kMetaMagic, 4) || !w.u64(kMetaVersion) || !w.u64(identity_.model) || !w.u64(identity_.config) ||
++            !w.u64(entry.cvec ? 1 : 0) || !w.u64(entry.live_meta.ids.size())) {
++            error = "cannot write spill sidecar"; return false;
++        }
++        for (int32_t id : entry.live_meta.ids) if (!w.i64(id)) { error = "cannot write spill sidecar ids"; return false; }
++        if (!w.u64(entry.live_meta.imgs.size())) { error = "cannot write spill sidecar"; return false; }
++        for (const auto& k : entry.live_meta.imgs) if (!w.i64(k.start) || !w.u64(k.hash)) { error = "cannot write spill sidecar images"; return false; }
++        if (!w.u64(entry.checkpoint_lengths.size())) { error = "cannot write spill sidecar"; return false; }
++        for (size_t len : entry.checkpoint_lengths) if (!w.u64(len)) { error = "cannot write spill sidecar checkpoints"; return false; }
++        if (!w.finish()) { error = "cannot finish spill sidecar"; return false; }
++        out.flush();
++        if (!out) { error = "cannot flush spill sidecar"; return false; }
++    }
++    std::error_code ec;
++    std::filesystem::rename(temporary, meta, ec);
++    if (ec) { std::filesystem::remove(temporary, ec); error = "cannot commit spill sidecar"; return false; }
++    return true;
++}
++
++bool ConversationSpillCache::open(const std::filesystem::path& directory, SessionFileIdentity identity,
++                                  uint64_t budget_bytes, std::string& error) {
++    enabled_ = false;
++    stale_files_wiped_ = 0;
++    disk_evictions_ = 0;
++    entries_.clear();
++    bytes_ = 0;
++    pinned_path_.clear();
++    directory_ = directory;
++    identity_ = identity;
++    budget_ = budget_bytes;
++    if (directory.empty() || !identity.model || !identity.config || !budget_) return true;
++    try {
++        std::error_code ec;
++        std::filesystem::create_directories(directory_, ec);
++        if (ec || !std::filesystem::is_directory(directory_, ec) || ec) {
++            error = "cannot create or inspect spill directory " + directory_.string(); return false;
++        }
++        std::vector<std::filesystem::path> metas;
++        for (std::filesystem::directory_iterator it(directory_, ec), end; !ec && it != end; it.increment(ec)) {
++            const auto status = it->symlink_status(ec);
++            if (ec) break;
++            const std::string name = it->path().filename().string();
++            if (name.rfind("strata-conv-", 0) != 0) continue;
++            if (!std::filesystem::is_regular_file(status)) continue;
++            if (it->path().extension() == ".meta") metas.push_back(it->path());
++            else if (it->path().extension() == ".tmp") { std::filesystem::remove(it->path(), ec); if (!ec) ++stale_files_wiped_; ec.clear(); }
++        }
++        if (ec) { error = "cannot scan spill directory " + directory_.string(); return false; }
++        std::sort(metas.begin(), metas.end());
++        size_t stale = stale_files_wiped_;
++        for (const auto& meta : metas) {
++            Entry entry;
++            entry.stem = meta;
++            entry.stem.replace_extension();   // drop ".meta" -> the shared stem
++            bool other_identity = false;
++            std::string parse_error;
++            if (!read_sidecar(meta, entry, other_identity, parse_error)) {
++                if (!other_identity) { std::filesystem::remove(meta, ec); ec.clear(); std::filesystem::remove(entry.session_path(), ec); ec.clear(); ++stale; }
++                continue;
++            }
++            std::error_code sec;
++            const uint64_t session_bytes = std::filesystem::file_size(entry.session_path(), sec);
++            if (sec) { std::filesystem::remove(meta, ec); ec.clear(); ++stale; continue; }   // session file gone: sidecar is useless
++            entry.file_bytes = session_bytes;
++            if (session_bytes > budget_) { std::filesystem::remove(meta, ec); ec.clear(); std::filesystem::remove(entry.session_path(), ec); ec.clear(); ++stale; continue; }
++            entries_.push_back(std::move(entry));
++            bytes_ += session_bytes;
++            enforce_budget();
++        }
++        // session files with no sidecar left behind (a crash between the two writes) go too.
++        for (std::filesystem::directory_iterator it(directory_, ec), end; !ec && it != end; it.increment(ec)) {
++            const auto status = it->symlink_status(ec);
++            if (ec) break;
++            const std::string name = it->path().filename().string();
++            if (name.rfind("strata-conv-", 0) != 0 || it->path().extension() != ".sess") continue;
++            if (!std::filesystem::is_regular_file(status)) continue;
++            std::filesystem::path meta = it->path();
++            meta.replace_extension(".meta");
++            if (std::filesystem::exists(meta, ec) && !ec) continue;
++            std::filesystem::remove(it->path(), ec); ec.clear(); ++stale;
++        }
++        enabled_ = true;
++        enforce_budget();
++        stale_files_wiped_ = stale;
++        return true;
++    } catch (const std::bad_alloc&) {
++        entries_.clear(); bytes_ = 0; enabled_ = false;
++        error = "not enough RAM to index spill directory"; return false;
++    } catch (const std::exception& e) {
++        entries_.clear(); bytes_ = 0; enabled_ = false;
++        error = std::string("cannot index spill directory: ") + e.what(); return false;
++    }
++}
++
++bool ConversationSpillCache::load(const std::string& path, SavedConversation& image, const SessionReadLimits& limits,
++                                  std::string& error) const {
++    if (!enabled_) { error = "spill cache is disabled"; return false; }
++    size_t bytes = 0;
++    return session_file_read(path, identity_, image, bytes, error, limits);
++}
++
++bool ConversationSpillCache::spill(const SavedConversation& image, std::string& error) {
++    if (!enabled_) return false;
++    if (image.live.ids.empty() || !image.stage_images.empty()) { error = "spill needs a single-GPU conversation"; return false; }
++    std::error_code ec;
++    std::filesystem::path stem;
++    do {
++        stem = directory_ / ("strata-conv-" + std::to_string(++serial_));
++    } while (std::filesystem::exists(stem.string() + ".sess", ec) || std::filesystem::exists(stem.string() + ".meta", ec));
++    const std::string session = stem.string() + ".sess";
++    size_t file_bytes = 0;
++    SessionWriteOptions wo;
++    wo.durable = true;
++    SessionStatus st;
++    if (!session_file_write(session, image, identity_, file_bytes, error, wo, &st)) {
++        std::filesystem::remove(session, ec);
++        return false;
++    }
++    if (file_bytes > budget_) { std::filesystem::remove(session, ec); error = "snapshot exceeds the disk cache limit"; return false; }
++    Entry entry;
++    entry.stem = stem;
++    entry.file_bytes = file_bytes;
++    entry.cvec = image.cvec;
++    entry.live_meta.ids = image.live.ids;
++    entry.live_meta.imgs = image.live.imgs;
++    entry.checkpoint_lengths.reserve(image.checkpoints.size());
++    for (const auto& c : image.checkpoints) entry.checkpoint_lengths.push_back(c.ids.size());
++    if (!write_sidecar(stem.string() + ".meta", entry, error)) { std::filesystem::remove(session, ec); return false; }
++    try {
++        entries_.push_back(std::move(entry));
++    } catch (const std::bad_alloc&) {
++        std::filesystem::remove(session, ec); std::filesystem::remove(stem.string() + ".meta", ec);
++        error = "not enough RAM to index conversation spill file"; return false;
++    }
++    bytes_ += file_bytes;
++    enforce_budget();
++    return true;
++}
++
++bool ConversationSpillCache::erase(const std::string& path, std::string& error) {
++    auto found = std::find_if(entries_.begin(), entries_.end(),
++                              [&](const Entry& entry) { return entry.session_path() == path; });
++    if (found == entries_.end()) return true;
++    std::error_code ec;
++    std::filesystem::remove(found->session_path(), ec);
++    if (ec) { error = "cannot remove spill file " + found->session_path(); return false; }
++    std::filesystem::remove(found->meta_path(), ec);
++    bytes_ -= found->file_bytes;
++    if (pinned_path_ == path) pinned_path_.clear();
++    entries_.erase(found);
++    return true;
++}
++
++void ConversationSpillCache::pin(const std::string& path) { pinned_path_ = path; }
++
++void ConversationSpillCache::unpin(const std::string& path) {
++    if (pinned_path_ == path) { pinned_path_.clear(); enforce_budget(); }
++}
++
++size_t ConversationSpillCache::drop_superseded(const std::vector<int32_t>& ids,
++                                               const std::vector<ConversationImageKey>& images,
++                                               const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
++    size_t dropped = 0;
++    for (size_t i = 0; i < entries_.size();) {
++        const Entry& entry = entries_[i];
++        size_t deepest = 0;
++        for (size_t length : entry.checkpoint_lengths) deepest = std::max(deepest, length);
++        auto same_saved_prefix = [&](size_t length, const std::vector<int32_t>& candidate_ids,
++                                     const std::vector<ConversationImageKey>& candidate_images) {
++            if (length == 0 || candidate_ids.size() != length || length > entry.live_meta.ids.size() ||
++                !std::equal(entry.live_meta.ids.begin(), entry.live_meta.ids.begin() + (std::ptrdiff_t) length,
++                            candidate_ids.begin())) return false;
++            size_t a = 0, b = 0;
++            while ((a < entry.live_meta.imgs.size() && entry.live_meta.imgs[a].start < (int64_t) length) ||
++                   (b < candidate_images.size() && candidate_images[b].start < (int64_t) length)) {
++                if (a == entry.live_meta.imgs.size() || entry.live_meta.imgs[a].start >= (int64_t) length ||
++                    b == candidate_images.size() || candidate_images[b].start >= (int64_t) length ||
++                    !(entry.live_meta.imgs[a] == candidate_images[b])) return false;
++                ++a;
++                ++b;
++            }
++            return true;
++        };
++        bool held = same_saved_prefix(deepest, ids, images);
++        for (const auto& checkpoint : checkpoints)
++            if (!held && same_saved_prefix(deepest, checkpoint.ids, checkpoint.imgs)) held = true;
++        if (entry.cvec == cvec && deepest && held && entry.session_path() != pinned_path_) {
++            std::error_code ec;
++            std::filesystem::remove(entry.session_path(), ec);
++            std::filesystem::remove(entry.meta_path(), ec);
++            if (ec) { ++i; continue; }
++            bytes_ -= entry.file_bytes;
++            entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
++            ++dropped;
++            continue;
++        }
++        ++i;
++    }
++    return dropped;
++}
++
++void ConversationSpillCache::enforce_budget() {
++    for (size_t i = 0; (bytes_ > budget_ || entries_.size() > kMaxSidecarEntries) && i < entries_.size();) {
++        if (entries_[i].session_path() == pinned_path_) { ++i; continue; }
++        std::error_code ec;
++        std::filesystem::remove(entries_[i].session_path(), ec);
++        std::filesystem::remove(entries_[i].meta_path(), ec);
++        if (ec) { ++i; continue; }
++        bytes_ -= entries_[i].file_bytes;
++        entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
++        ++disk_evictions_;
++    }
++}
++
++} // namespace strata::core
+diff --git a/src/core/conversation_spill_test.cpp b/src/core/conversation_spill_test.cpp
+new file mode 100644
+index 0000000000..1547bd8c6e
+--- /dev/null
++++ b/src/core/conversation_spill_test.cpp
+@@ -0,0 +1,192 @@
++// CPU-only tests for the spill directory (include/strata/core/conversation_spill.hpp): a parked conversation is
++// written as a session file plus a metadata sidecar, matched from the sidecar alone, and read back whole.
++// Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.
++#include "strata/core/conversation_spill.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <string>
++#include <vector>
++#include <chrono>
++
++using namespace strata::core;
++namespace fs = std::filesystem;
++
++namespace {
++int checks = 0;
++void check(bool ok, const char* label) {
++    ++checks;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
++}
++
++ConversationBuffer pattern(size_t n, uint8_t seed) {
++    ConversationBuffer b;
++    b.resize(n);
++    b.visit(0, n, [&](uint8_t* p, size_t c, size_t at) {
++        for (size_t i = 0; i < c; ++i) p[i] = uint8_t((at + i) * 131u + seed);
++        return true;
++    });
++    return b;
++}
++std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
++    std::vector<uint8_t> v(n);
++    for (size_t i = 0; i < n; ++i) v[i] = uint8_t(i * 7u + seed);
++    return v;
++}
++ConversationCheckpoint checkpoint(size_t tokens, uint8_t seed) {
++    ConversationCheckpoint c;
++    for (size_t i = 0; i < tokens; ++i) c.ids.push_back(int32_t(1000 + i));
++    c.gdn = bytes_of(4099, seed); c.ple = bytes_of(77, seed + 1);
++    c.tails = bytes_of(301, seed + 2); c.dead = bytes_of(64, seed + 3); c.block_pos = bytes_of(8, seed + 4);
++    c.used = 42 + seed;
++    return c;
++}
++SavedConversation sample(size_t tokens) {
++    SavedConversation s;
++    for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(100 + i);
++    s.layer_lo = 0; s.layer_hi = 48; s.cvec = false;
++    s.live = checkpoint(tokens, 1);
++    s.checkpoints.push_back(checkpoint(tokens / 4, 2));
++    s.checkpoints.push_back(checkpoint(tokens / 2, 3));
++    for (int layer = 0; layer < 2; ++layer) {
++        ConversationKv kv;
++        kv.format = 2 + layer; kv.cells = 1024; kv.heads = 2; kv.head_dim = 256;
++        kv.page_size = 64; kv.pooled_rows = 9; kv.idx_dim = 128;
++        kv.k = pattern(4096, uint8_t(layer)); kv.v = pattern(4096 + layer, uint8_t(layer + 10));
++        kv.k_scale = pattern(512, uint8_t(layer + 20)); kv.v_scale = pattern(512, uint8_t(layer + 30));
++        kv.pooled = pattern(9 * 128 * 4, uint8_t(layer + 40));
++        s.kv.push_back(std::move(kv));
++    }
++    return s;
++}
++bool buffers_equal(const ConversationBuffer& a, const ConversationBuffer& b) {
++    if (a.size() != b.size()) return false;
++    bool same = true;
++    size_t at = 0;
++    a.visit(0, a.size(), [&](const uint8_t* p, size_t c, size_t off) {
++        b.visit(off, c, [&](const uint8_t* q, size_t c2, size_t) {
++            if (c2 != c) { same = false; return false; }
++            for (size_t i = 0; i < c; ++i) if (p[i] != q[i]) { same = false; return false; }
++            return true;
++        });
++        at += c;
++        return same;
++    });
++    return same && at == a.size();
++}
++} // namespace
++
++int main() {
++    const fs::path dir = fs::temp_directory_path() / ("strata-spill-test-" + std::to_string(
++        std::chrono::steady_clock::now().time_since_epoch().count()));
++    fs::remove_all(dir);
++    SessionFileIdentity id{0x1111222233334444ull, 0x5555666677778888ull};
++
++    ConversationSpillCache spill;
++    std::string error;
++    check(spill.open(dir, id, 1ull << 30, error), "open empty dir");
++    check(spill.enabled(), "enabled");
++    check(spill.size() == 0, "empty index");
++
++    SavedConversation a = sample(1000);
++    check(spill.spill(a, error), "spill first");
++    check(spill.size() == 1, "one entry");
++    // the prompt continues the conversation (one token past its end): the whole live state resumes.
++    std::vector<int32_t> continuing = a.live.ids;
++    continuing.push_back(int32_t(7777));
++    const auto first = spill.best(continuing, a.live.imgs, false, 0.0, 0);
++    check(bool(first), "match own conversation");
++    check(first.tokens == (int64_t) a.live.ids.size(), "full prefix match");
++    check(first.live, "live match");
++
++    // read it back whole and compare the K/V byte for byte
++    SavedConversation back;
++    check(spill.load(first.path, back, {}, error), "load back");
++    check(back.live.ids == a.live.ids, "ids round-trip");
++    check(back.checkpoints.size() == a.checkpoints.size(), "checkpoint count round-trip");
++    check(back.kv.size() == a.kv.size(), "kv layer count");
++    bool kv_same = true;
++    for (size_t i = 0; i < back.kv.size(); ++i)
++        kv_same = kv_same && buffers_equal(back.kv[i].k, a.kv[i].k) && buffers_equal(back.kv[i].v, a.kv[i].v) &&
++                  buffers_equal(back.kv[i].pooled, a.kv[i].pooled);
++    check(kv_same, "kv bytes round-trip");
++
++    // a different prompt sharing a prefix resumes at the common prefix, not the whole thing
++    std::vector<int32_t> other = a.live.ids;
++    other.resize(400);
++    for (size_t i = 400; i < a.live.ids.size(); ++i) other.push_back(int32_t(9000 + i));
++    check(other.size() == a.live.ids.size(), "other same length, diverges at 400");
++    const auto partial = spill.best(other, {}, false, 0.0, 0);
++    // the resume lands on the deepest checkpoint still a prefix (250); the 500 checkpoint crosses the divergence.
++    check(bool(partial) && partial.tokens == 250, "resume at the deepest still-valid checkpoint");
++    check(!partial.live, "checkpoint resume, not live");
++
++    // similarity filters a weak hit: 400/1000 = 0.4 LCP is refused at similarity 0.5
++    const auto weak = spill.best(other, {}, false, 0.5, 0);
++    check(!bool(weak), "similarity filters weak hit");
++    // n_min filters a short hit
++    const auto short_hit = spill.best(std::vector<int32_t>(a.live.ids.begin(), a.live.ids.begin() + 10), {}, false, 0.0, 100);
++    check(!bool(short_hit), "n_min filters short hit");
++
++    // cvec mismatch never matches
++    const auto wrong_cvec = spill.best(a.live.ids, a.live.imgs, true, 0.0, 0);
++    check(!bool(wrong_cvec), "cvec mismatch refused");
++
++    // reopen the directory: the sidecar is reindexed without reading the session file
++    ConversationSpillCache again;
++    check(again.open(dir, id, 1ull << 30, error), "reopen dir");
++    check(again.size() == 1, "reindexed one entry");
++    const auto rematched = again.best(continuing, a.live.imgs, false, 0.0, 0);
++    check(bool(rematched) && rematched.tokens == (int64_t) a.live.ids.size(), "rematch after reopen");
++
++    // a foreign identity is refused and its files removed
++    ConversationSpillCache foreign;
++    check(foreign.open(dir, SessionFileIdentity{1, 2}, 1ull << 30, error), "open with foreign identity");
++    check(foreign.size() == 0, "foreign identity: nothing indexed");
++    check(fs::exists(dir / "strata-conv-1.sess"), "another identity's files are left alone");
++
++    // budget eviction drops the oldest
++    ConversationSpillCache tight;
++    check(tight.open(dir, id, 1ull << 30, error), "open for budget test");
++    const uint64_t before = tight.bytes();
++    SavedConversation b = sample(2000);
++    check(tight.spill(b, error), "spill second");
++    const uint64_t newest = tight.bytes() - before;   // the newest session file's bytes
++    // a budget that fits the newest alone: reopening keeps it and evicts the older one.
++    ConversationSpillCache small;
++    check(small.open(dir, id, newest, error), "open with a budget for one");
++    check(small.size() == 1, "budget keeps one");
++    check(small.disk_evictions() >= 1, "budget evicted the oldest");
++
++    // the RAM cache handing its evictions to the disk tier: make_room's spill callback writes what it drops.
++    fs::remove_all(dir);
++    ConversationSpillCache tier;
++    check(tier.open(dir, id, 1ull << 30, error), "open for the RAM-cache tier test");
++    SavedConversation c1 = sample(1000), c2 = sample(1500);
++    const size_t need = c1.bytes() + c2.bytes();
++    ConversationCache ram(need, 1);   // one slot: putting the second evicts the first
++    check(ram.enabled(), "ram cache enabled");
++    check(ram.put(std::move(c1)), "put first in RAM");
++    size_t spilled = 0;
++    auto spill_cb = [&](const SavedConversation& evicted) { ++spilled; tier.spill(evicted, error); };
++    // make_room for the second conversation evicts the first and hands it to the callback.
++    check(ram.make_room(c2.bytes(), 0, spill_cb), "make_room evicts to make space");
++    check(spilled == 1, "one conversation handed to the spill callback");
++    check(tier.size() == 1, "the evicted conversation reached disk");
++    // the disk copy resumes the same conversation the RAM cache dropped.
++    std::vector<int32_t> cont1 = sample(1000).live.ids;
++    cont1.push_back(int32_t(7777));
++    const auto from_disk = tier.best(cont1, sample(1000).live.imgs, false, 0.0, 0);
++    check(bool(from_disk) && from_disk.tokens == 1000, "disk resumes the evicted conversation");
++    // spill_all empties the RAM cache onto disk (the shutdown path).
++    check(ram.put(std::move(c2)), "put second in RAM");
++    const size_t drained = ram.spill_all(spill_cb);
++    check(drained == 1, "spill_all drained the parked conversation");
++    check(ram.size() == 0, "ram cache empty after spill_all");
++    check(tier.size() == 2, "both conversations now on disk");
++
++    fs::remove_all(dir);
++    std::printf("conversation_spill_test: %d checks passed\n", checks);
++    return 0;
++}
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3b551f3aaf..a18a33ab3b 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -22,6 +22,7 @@
+ #include "strata/core/conversation_snapshot.hpp"
+ #include "strata/core/conversation_file.hpp"
+ #include "strata/core/conversation_memory.hpp"
++#include "strata/core/conversation_spill.hpp"
+ #include "strata/core/coupled_draft.hpp"
+ #include "strata/core/expert_source.hpp"
+ #include "strata/core/pinned.hpp"
+@@ -588,6 +589,13 @@ struct Options {
+     int64_t conversation_cache_min_free_mib = 2560;
+     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
+     int64_t session_min_free_mib = 4096;
++    /// --serve: a durable disk tier for the conversation cache. When the RAM cache evicts a parked conversation it
++    /// is written here as a session file (the same format as the slot save/restore API) and can come back after a
++    /// restart. Empty = off.
++    std::string conversation_cache_spill_dir;
++    int64_t conversation_cache_disk_mib = 8192;   // the spill directory's limit (0 = off)
++    double conversation_cache_similarity = 0.0;   // least LCP/new-prompt fraction a disk hit may offer (range [0,1))
++    int64_t conversation_cache_n_min = 0;         // least common-prefix tokens a disk hit may offer
+     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
+     int64_t prompt_cache_every = 16384;
+     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
+@@ -727,6 +735,12 @@ void usage() {
+                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
+                  "                       session file (default 2560)\n"
+                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
++                 "  --conversation-cache-spill-dir DIR  --serve: keep conversations the RAM cache evicts on disk,\n"
++                 "                       across restarts (default off; needs --conversation-cache-mib)\n"
++                 "  --conversation-cache-disk-mib N  --serve: the spill directory's limit (default 8192; 0 = off)\n"
++                 "  --conversation-cache-similarity F  --serve: least common-prefix fraction a disk hit may offer\n"
++                 "                       (default 0 = any; range [0,1))\n"
++                 "  --conversation-cache-n-min N  --serve: least common-prefix tokens a disk hit may offer (default 0)\n"
+                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
+                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
+                  "                       give VRAM back to other programs between requests and take it back later\n"
+@@ -1705,11 +1719,13 @@ int main(int argc, char** argv) {
+         else if (a == "--vision") o.vision = true;
+         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
+-                 a == "--conversation-cache-min-free-mib" || a == "--session-min-free-mib") {
++                 a == "--conversation-cache-min-free-mib" || a == "--session-min-free-mib" ||
++                 a == "--conversation-cache-disk-mib" || a == "--conversation-cache-n-min") {
+             const std::string value = next(a.c_str());
+             int64_t number = 0;
+             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+-            const int64_t limit = a == "--conversation-cache-slots" ? INT32_MAX : INT64_MAX / (1024 * 1024);
++            const int64_t limit = a == "--conversation-cache-slots" ? INT32_MAX :
++                                  a == "--conversation-cache-n-min" ? INT64_MAX : INT64_MAX / (1024 * 1024);
+             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
+                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+                 return 2;
+@@ -1717,7 +1733,22 @@ int main(int argc, char** argv) {
+             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
+             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
+             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
+-            else o.conversation_cache_slots = (int) number;
++            else if (a == "--conversation-cache-slots") o.conversation_cache_slots = (int) number;
++            else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
++            else o.conversation_cache_n_min = number;
++        }
++        else if (a == "--conversation-cache-spill-dir") o.conversation_cache_spill_dir = next("--conversation-cache-spill-dir");
++        else if (a == "--conversation-cache-similarity") {
++            const std::string value = next("--conversation-cache-similarity");
++            char* end = nullptr;
++            errno = 0;
++            const double similarity = std::strtod(value.c_str(), &end);
++            if (errno == ERANGE || end == value.c_str() || end != value.c_str() + value.size() ||
++                !std::isfinite(similarity) || similarity < 0.0 || similarity >= 1.0) {
++                std::fprintf(stderr, "--conversation-cache-similarity needs a finite number in [0,1)\n");
++                return 2;
++            }
++            o.conversation_cache_similarity = similarity;
+         }
+         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+@@ -1859,6 +1890,11 @@ int main(int argc, char** argv) {
+     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
+         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
+                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
++    if (o.serve && !o.conversation_cache_spill_dir.empty() &&
++        (o.conversation_cache_mib == 0 || o.prompt_cache == 0 || o.conversation_cache_slots == 0 ||
++         o.conversation_cache_disk_mib == 0))
++        std::fprintf(stderr, "strata serve: warning: the disk conversation cache needs --conversation-cache-mib, "
++                             "--prompt-cache, --conversation-cache-slots and a nonzero --conversation-cache-disk-mib\n");
+     // parking with --layer-split saves every stage (SavedConversation::stage_images)
+     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
+     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
+@@ -6377,6 +6413,45 @@ int main(int argc, char** argv) {
+             id.config = *config_fp;
+             return true;
+         };
++        // The durable disk tier: conversations the RAM cache evicts are written here as session files, so a restart
++        // finds them. The identity is the same one the slot save/restore API binds its files to, so a spilled
++        // conversation and a hand-saved session file are interchangeable.
++        strata::core::ConversationSpillCache conversation_spill;
++        strata::core::SessionFileIdentity spill_identity;
++        if (o.serve && conversations.enabled() && !o.conversation_cache_spill_dir.empty() &&
++            o.conversation_cache_disk_mib > 0 && stages.empty()) {
++            std::string identity_error;
++            if (!session_identity(spill_identity, identity_error, nullptr)) {
++                std::fprintf(stderr, "strata serve: conversation cache: disk tier disabled (%s)\n", identity_error.c_str());
++            } else {
++                std::string spill_error;
++                if (!conversation_spill.open(o.conversation_cache_spill_dir, spill_identity,
++                        (uint64_t) o.conversation_cache_disk_mib * 1024 * 1024, spill_error)) {
++                    std::fprintf(stderr, "strata serve: conversation cache: disk tier disabled (%s)\n", spill_error.c_str());
++                } else if (conversation_spill.enabled()) {
++                    std::fprintf(stderr, "strata serve: conversation cache: spill dir ready (%zu conversations, %llu MiB, "
++                                 "%zu stale files wiped, %zu disk evictions)\n",
++                                 conversation_spill.size(), (unsigned long long) (conversation_spill.bytes() >> 20),
++                                 conversation_spill.stale_files_wiped(), conversation_spill.disk_evictions());
++                }
++            }
++        }
++        auto spill_evicted = [&](const strata::core::SavedConversation& evicted) {
++            if (!conversation_spill.enabled()) return;
++            try {
++                std::string spill_error;
++                if (conversation_spill.spill(evicted, spill_error)) {
++                    std::fprintf(stderr, "strata serve: conversation cache: spilled %zu tokens (%zu MiB); disk=%zu MiB "
++                                 "disk_evictions=%zu\n", evicted.live.ids.size(), evicted.bytes() >> 20,
++                                 (size_t) (conversation_spill.bytes() >> 20), conversation_spill.disk_evictions());
++                } else {
++                    std::fprintf(stderr, "strata serve: conversation cache: could not spill evicted conversation (%s); "
++                                 "dropping it\n", spill_error.c_str());
++                }
++            } catch (...) {
++                std::fprintf(stderr, "strata serve: conversation cache: spill failed; dropping evicted conversation\n");
++            }
++        };
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
+         auto park_current_body = [&](size_t held) -> bool {
+@@ -6386,6 +6461,10 @@ int main(int argc, char** argv) {
+             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
+                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
++            const size_t disk_dropped = conversation_spill.drop_superseded(live, live_imgs, checks, cvec_cached);
++            if (disk_dropped)
++                std::fprintf(stderr, "strata serve: conversation cache: removed %zu superseded disk conversation%s\n",
++                             disk_dropped, disk_dropped == 1 ? "" : "s");
+             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
+             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
+             // stage parts for the capture and put back together whichever way this ends (no running state copied).
+@@ -6451,7 +6530,7 @@ int main(int argc, char** argv) {
+             // estimate must stay uncapped: it counts the retained buffers'
+             // capacity and directories, and put() charges that same true size -
+             // a capped figure would under-evict and overfill the budget.
+-            if (!conversations.make_room(estimate, held)) {
++            if (!conversations.make_room(estimate, held, spill_evicted)) {
+                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
+                              estimate >> 20);
+                 return true;
+@@ -7183,7 +7262,9 @@ int main(int argc, char** argv) {
+                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
++                        "conversation_cache_min_free_mib=%lld conversation_cache_disk_mib=%lld "
++                        "conversation_cache_similarity=%.3f conversation_cache_n_min=%lld "
++                        "tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
+                         (long long) o.max_context, o.kv.c_str(),
+                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
+@@ -7194,7 +7275,9 @@ int main(int argc, char** argv) {
+                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
+                         pool.workers(), o.pcie_frac,
+                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+-                        (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
++                        (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_disk_mib,
++                        o.conversation_cache_similarity, (long long) o.conversation_cache_n_min,
++                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
+                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0)).c_str() : "");
+         }
+@@ -8252,9 +8335,75 @@ int main(int argc, char** argv) {
+                             slot_ck = &c;
+                         }
+                 }
+-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
++            auto parked = conversations.best(ids, req_imgs, want_cvec,
++                                             o.conversation_cache_similarity, o.conversation_cache_n_min);
+             std::optional<strata::core::SavedConversation> incoming;
+-            if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
++            bool incoming_from_disk = false;
++            std::string incoming_disk_path;
++            // A spilled conversation can beat the RAM cache: match it from its sidecar (no K/V read), and only if it
++            // offers a longer resume than RAM, the batch slots and the live state does, read it back whole.
++            const auto disk_match = conversation_spill.best(ids, req_imgs, want_cvec,
++                                                            o.conversation_cache_similarity, o.conversation_cache_n_min);
++            if (!disk_match.path.empty() && disk_match.tokens > std::max(resume, std::max(slot_tokens, parked.tokens))) {
++                constexpr uint64_t admission_extra = 1ull << 20;
++                const uint64_t estimate = disk_match.file_bytes > UINT64_MAX - disk_match.file_bytes / 8 - admission_extra
++                                              ? UINT64_MAX
++                                              : disk_match.file_bytes + disk_match.file_bytes / 8 + admission_extra;
++                const uint64_t ram_budget = (uint64_t) o.conversation_cache_mib * 1024 * 1024;
++                if (estimate > ram_budget || estimate > SIZE_MAX) {
++                    std::fprintf(stderr, "strata serve: conversation cache: disk hit needs %llu MiB; RAM budget is %llu MiB\n",
++                                 (unsigned long long) (estimate >> 20), (unsigned long long) (ram_budget >> 20));
++                } else {
++                    conversation_spill.pin(disk_match.path);
++                    if (!conversations.make_room((size_t) estimate, 0, spill_evicted)) {
++                        std::fprintf(stderr, "strata serve: conversation cache: disk hit does not fit the RAM cache budget\n");
++                        conversation_spill.unpin(disk_match.path);
++                    } else {
++                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
++                        if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
++                                estimate, floor)) {
++                            std::fprintf(stderr, "strata serve: conversation cache: disk hit skipped (physical RAM admission; "
++                                         "need %llu MiB plus a %lld MiB floor, or telemetry unavailable)\n",
++                                         (unsigned long long) (estimate >> 20), (long long) o.conversation_cache_min_free_mib);
++                            conversation_spill.unpin(disk_match.path);
++                        } else {
++                            strata::core::SessionReadLimits limits;
++                            limits.admit = [floor, &o](uint64_t need, std::string& why) {
++                                const auto avail = strata::core::conversation_available_memory();
++                                if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
++                                why = "not enough RAM to read it";
++                                return false;
++                            };
++                            std::string limits_error;
++                            if (!strata::core::conversation_session_read_limits(
++                                    limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
++                                    (uint64_t) std::max(o.prompt_cache, 1), limits_error)) {
++                                std::fprintf(stderr, "strata serve: conversation cache: disk hit skipped (%s)\n", limits_error.c_str());
++                                conversation_spill.unpin(disk_match.path);
++                            } else {
++                                strata::core::SavedConversation restored;
++                                std::string spill_error;
++                                if (!conversation_spill.load(disk_match.path, restored, limits, spill_error)) {
++                                    std::fprintf(stderr, "strata serve: conversation cache: discard unreadable disk conversation (%s)\n",
++                                                 spill_error.c_str());
++                                    std::string erase_error;
++                                    conversation_spill.erase(disk_match.path, erase_error);
++                                    conversation_spill.unpin(disk_match.path);
++                                } else if (restored.bytes() > ram_budget) {
++                                    std::fprintf(stderr, "strata serve: conversation cache: disk conversation exceeds the RAM cache budget after loading\n");
++                                    conversation_spill.unpin(disk_match.path);
++                                } else {
++                                    incoming.emplace(std::move(restored));
++                                    parked = {0, disk_match.tokens, disk_match.live};
++                                    incoming_from_disk = true;
++                                    incoming_disk_path = disk_match.path;
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            if (!incoming && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+             if (incoming) slot_source = -1;
+             // Reject the entire image before parking/overwriting the outgoing
+             // state. Invalid entries can safely fall back to its existing prefix.
+@@ -8276,6 +8425,12 @@ int main(int argc, char** argv) {
+             if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
+                     use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err)) {
+                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
++                if (incoming_from_disk) {   // a disk conversation this engine cannot use: drop its files
++                    std::string erase_error;
++                    conversation_spill.erase(incoming_disk_path, erase_error);
++                    conversation_spill.unpin(incoming_disk_path);
++                    incoming_from_disk = false;
++                }
+                 incoming.reset();
+                 err.clear();
+             }
+@@ -8380,9 +8535,11 @@ int main(int argc, char** argv) {
+                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
+                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                 }
++                if (incoming_from_disk)
++                    conversation_spill.unpin(incoming_disk_path);   // it is back in RAM: the disk copy is evictable again
+                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+-                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
+-                             (long long) resume, from_live ? "live" : "checkpoint",
++                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s%s) in %.1f ms; parked=%zu bytes=%zu\n",
++                             (long long) resume, incoming_from_disk ? "disk/" : "", from_live ? "live" : "checkpoint",
+                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                              conversations.size(), conversations.bytes());
+             }
+@@ -10089,6 +10246,15 @@ int main(int argc, char** argv) {
+                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
+                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
+         }
++        if (conversation_spill.enabled()) {   // the parked conversations go to disk, so a restart finds them
++            if (!park_current(0))
++                std::fprintf(stderr, "strata serve: conversation cache: the final active conversation was not captured (%s)\n",
++                             err.c_str());
++            const size_t resident = conversations.spill_all(spill_evicted);
++            std::fprintf(stderr, "strata serve: conversation cache: shutdown spilled %zu parked conversations; disk=%zu MiB "
++                         "disk_evictions=%zu\n", resident, (size_t) (conversation_spill.bytes() >> 20),
++                         conversation_spill.disk_evictions());
++        }
+         save_profile("exit");   // #477: QUIT, or the server closed stdin
+         return 0;
+     }
