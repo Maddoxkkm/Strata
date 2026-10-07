@@ -1,0 +1,1686 @@
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index eaeadf08d4..6f0d46b1fe 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -536,8 +536,33 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
+ | What the model is doing right now | `GET /status`, `GET /slots` (single slot, busy or idle) |
+ | Save / restore the conversation to a file (session files, below) | `POST /slots/0?action=save\|restore` |
+ | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
++| The same for Prometheus, with vLLM's metric names (asked with `Accept: text/plain` or `?format=prometheus`) | `GET /metrics` |
+ | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
+ 
++`GET /metrics` answers a Prometheus scrape (`Accept: text/plain` or `application/openmetrics-text`) in the text
++format with vLLM's names - `vllm:num_requests_running` / `_waiting`, `vllm:kv_cache_usage_perc`, the token and
++request counters, `vllm:prefix_cache_queries_total` / `_hits_total` (prompt tokens read / reused),
++`vllm:spec_decode_num_draft_tokens_total` / `_accepted_tokens_total` (the MTP drafts), and the histograms
++`vllm:time_to_first_token_seconds`, `vllm:inter_token_latency_seconds` and `vllm:e2e_request_latency_seconds` - so the
++dashboards and alerts written for a vLLM server read this one. With an API key, the scraper sends it as a bearer
++token. Any other request keeps the JSON.
++
++The JSON's own facts that vLLM has no name for come in the same scrape under `strata:`, named after their JSON key,
++so a Monitor-tab panel and a Grafana panel read the same value: `strata:live_state{state="..."}`, `strata:live_tok_s`,
++`strata:live_prefill_tok_s_mean`, `strata:live_prompt_read`, `strata:engine_max_context`,
++`strata:totals_prompt_seconds_total` / `strata:totals_decode_seconds_total`, `strata:last_hit_rate` and
++`strata:last_decode_tok_s` (the last request's), and the hardware - `strata:gpu_util`, `strata:gpu_mem_used_bytes`,
++`strata:gpu_mem_total_bytes`, `strata:gpu_temp_celsius`, `strata:gpu_power_watts` (one sample per card, label
++`gpu`), `strata:cpu`, `strata:ram_used_bytes`, `strata:ram_total_bytes`. A value the server does not have (no GPU
++telemetry, an older engine) has no sample rather than a zero.
++
++Ready to use, in `docs/monitoring/`: `prometheus.yml` (a scrape config, the API key as a bearer token),
++`servicemonitor.yaml` (the same for the Prometheus Operator) and `grafana-strata.json`, a Grafana dashboard to
++import (it asks for the Prometheus data source): requests running and waiting, tokens per second, time to first
++token, time between tokens and request duration (p50 / p95), the prompt cache and MTP draft rates, and the engine's
++own panels (state, batch slots, rates, expert cache hit rate, GPU and RAM). Its first row uses only vLLM's names, so
++it also reads a vLLM server.
++
+ `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
+ 
+ ```bash
+diff --git a/docs/monitoring/grafana-strata.json b/docs/monitoring/grafana-strata.json
+new file mode 100644
+index 0000000000..c595bfd94b
+--- /dev/null
++++ b/docs/monitoring/grafana-strata.json
+@@ -0,0 +1,1033 @@
++{
++ "__inputs": [
++  {
++   "name": "DS_PROMETHEUS",
++   "label": "Prometheus",
++   "type": "datasource",
++   "pluginId": "prometheus",
++   "pluginName": "Prometheus"
++  }
++ ],
++ "title": "Strata (and vLLM)",
++ "uid": "strata-serving",
++ "tags": [
++  "strata",
++  "vllm",
++  "llm"
++ ],
++ "timezone": "",
++ "schemaVersion": 39,
++ "version": 1,
++ "refresh": "30s",
++ "time": {
++  "from": "now-6h",
++  "to": "now"
++ },
++ "editable": true,
++ "templating": {
++  "list": [
++   {
++    "name": "model",
++    "label": "Model",
++    "type": "query",
++    "datasource": {
++     "type": "prometheus",
++     "uid": "${DS_PROMETHEUS}"
++    },
++    "refresh": 2,
++    "includeAll": true,
++    "multi": true,
++    "allValue": ".*",
++    "current": {
++     "selected": true,
++     "text": [
++      "All"
++     ],
++     "value": [
++      "$__all"
++     ]
++    },
++    "query": {
++     "query": "label_values(vllm:generation_tokens_total, model_name)",
++     "refId": "model"
++    },
++    "definition": "label_values(vllm:generation_tokens_total, model_name)",
++    "sort": 1
++   },
++   {
++    "name": "instance",
++    "label": "Instance",
++    "type": "query",
++    "datasource": {
++     "type": "prometheus",
++     "uid": "${DS_PROMETHEUS}"
++    },
++    "refresh": 2,
++    "includeAll": true,
++    "multi": true,
++    "allValue": ".*",
++    "current": {
++     "selected": true,
++     "text": [
++      "All"
++     ],
++     "value": [
++      "$__all"
++     ]
++    },
++    "query": {
++     "query": "label_values(vllm:generation_tokens_total{model_name=~\"$model\"}, instance)",
++     "refId": "instance"
++    },
++    "definition": "label_values(vllm:generation_tokens_total{model_name=~\"$model\"}, instance)",
++    "sort": 1
++   }
++  ]
++ },
++ "panels": [
++  {
++   "id": 1,
++   "type": "row",
++   "title": "Requests and throughput (vLLM names: the same panels read a vLLM server)",
++   "collapsed": false,
++   "gridPos": {
++    "h": 1,
++    "w": 24,
++    "x": 0,
++    "y": 0
++   },
++   "panels": []
++  },
++  {
++   "id": 2,
++   "type": "timeseries",
++   "title": "Requests running / waiting",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 0,
++    "y": 1
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum by (model_name) (vllm:num_requests_running{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "{{model_name}} running"
++    },
++    {
++     "refId": "B",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum by (model_name) (vllm:num_requests_waiting{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "{{model_name}} waiting"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "none",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 3,
++   "type": "timeseries",
++   "title": "Tokens per second",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 12,
++    "y": 1
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum by (model_name) (rate(vllm:generation_tokens_total{model_name=~\"$model\",instance=~\"$instance\"}[1m]))",
++     "legendFormat": "{{model_name}} generated"
++    },
++    {
++     "refId": "B",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum by (model_name) (rate(vllm:prompt_tokens_total{model_name=~\"$model\",instance=~\"$instance\"}[1m]))",
++     "legendFormat": "{{model_name}} prompt"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "suffix: tok/s",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 4,
++   "type": "timeseries",
++   "title": "Time to first token (p50 / p95)",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 0,
++    "y": 8
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "histogram_quantile(0.95, sum by (le, model_name) (rate(vllm:time_to_first_token_seconds_bucket{model_name=~\"$model\",instance=~\"$instance\"}[5m])))",
++     "legendFormat": "{{model_name}} p95"
++    },
++    {
++     "refId": "B",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(vllm:time_to_first_token_seconds_bucket{model_name=~\"$model\",instance=~\"$instance\"}[5m])))",
++     "legendFormat": "{{model_name}} p50"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "s",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 5,
++   "type": "timeseries",
++   "title": "Time between tokens (p50 / p95)",
++   "description": "Strata observes the mean gap of each request (the engine reports its decode time, not each token's).",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 12,
++    "y": 8
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "histogram_quantile(0.95, sum by (le, model_name) (rate(vllm:inter_token_latency_seconds_bucket{model_name=~\"$model\",instance=~\"$instance\"}[5m])))",
++     "legendFormat": "{{model_name}} p95"
++    },
++    {
++     "refId": "B",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(vllm:inter_token_latency_seconds_bucket{model_name=~\"$model\",instance=~\"$instance\"}[5m])))",
++     "legendFormat": "{{model_name}} p50"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "s",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 6,
++   "type": "timeseries",
++   "title": "Request duration (p50 / p95)",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 0,
++    "y": 15
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "histogram_quantile(0.95, sum by (le, model_name) (rate(vllm:e2e_request_latency_seconds_bucket{model_name=~\"$model\",instance=~\"$instance\"}[5m])))",
++     "legendFormat": "{{model_name}} p95"
++    },
++    {
++     "refId": "B",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(vllm:e2e_request_latency_seconds_bucket{model_name=~\"$model\",instance=~\"$instance\"}[5m])))",
++     "legendFormat": "{{model_name}} p50"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "s",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 7,
++   "type": "timeseries",
++   "title": "Speed of one answer",
++   "description": "1 / the mean time between tokens: what one user sees, against the total above.",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 12,
++    "y": 15
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum by (model_name) (rate(vllm:inter_token_latency_seconds_count{model_name=~\"$model\",instance=~\"$instance\"}[5m])) / sum by (model_name) (rate(vllm:inter_token_latency_seconds_sum{model_name=~\"$model\",instance=~\"$instance\"}[5m]))",
++     "legendFormat": "{{model_name}}"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "suffix: tok/s",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 8,
++   "type": "timeseries",
++   "title": "Prompt tokens served from the cache",
++   "description": "Strata: the prompt cache and parked conversations; vLLM: its prefix-cache blocks.",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 0,
++    "y": 22
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum by (model_name) (rate(vllm:prefix_cache_hits_total{model_name=~\"$model\",instance=~\"$instance\"}[15m])) / sum by (model_name) (rate(vllm:prefix_cache_queries_total{model_name=~\"$model\",instance=~\"$instance\"}[15m]))",
++     "legendFormat": "{{model_name}}"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "percentunit",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 9,
++   "type": "timeseries",
++   "title": "MTP drafts accepted",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 12,
++    "y": 22
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum by (model_name) (rate(vllm:spec_decode_num_accepted_tokens_total{model_name=~\"$model\",instance=~\"$instance\"}[15m])) / sum by (model_name) (rate(vllm:spec_decode_num_draft_tokens_total{model_name=~\"$model\",instance=~\"$instance\"}[15m]))",
++     "legendFormat": "{{model_name}}"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "percentunit",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 10,
++   "type": "timeseries",
++   "title": "Requests finished per minute",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 0,
++    "y": 29
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum by (model_name) (rate(vllm:request_success_total{model_name=~\"$model\",instance=~\"$instance\"}[5m])) * 60",
++     "legendFormat": "{{model_name}}"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "suffix: req/min",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 11,
++   "type": "timeseries",
++   "title": "Context in use",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 12,
++    "y": 29
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max by (model_name) (vllm:kv_cache_usage_perc{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "{{model_name}}"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "percentunit",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 12,
++   "type": "row",
++   "title": "Strata engine (strata: names, after the /metrics JSON keys)",
++   "collapsed": false,
++   "gridPos": {
++    "h": 1,
++    "w": 24,
++    "x": 0,
++    "y": 36
++   },
++   "panels": []
++  },
++  {
++   "id": 13,
++   "type": "timeseries",
++   "title": "Engine state",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 0,
++    "y": 37
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max by (state) (strata:live_state{model_name=~\"$model\",instance=~\"$instance\"}) > 0",
++     "legendFormat": "{{state}}"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "none",
++     "custom": {
++      "fillOpacity": 60,
++      "showPoints": "never",
++      "stacking": {
++       "mode": "normal"
++      }
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 14,
++   "type": "timeseries",
++   "title": "Batch slots by state",
++   "description": "\"parallel\": N / --batch only.",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 12,
++    "y": 37
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum by (state) (strata:live_slots{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "{{state}}"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "none",
++     "custom": {
++      "fillOpacity": 60,
++      "showPoints": "never",
++      "stacking": {
++       "mode": "normal"
++      }
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 15,
++   "type": "timeseries",
++   "title": "Engine rates",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 0,
++    "y": 44
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max(strata:live_tok_s{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "decode tok/s"
++    },
++    {
++     "refId": "B",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max(strata:live_prefill_tok_s_mean{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "prompt tok/s"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "suffix: tok/s",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 16,
++   "type": "timeseries",
++   "title": "Expert cache hit rate (last request)",
++   "description": "Experts found in VRAM. Below ~90 % the CPU and the PCIe link compute the rest and decode slows down.",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 12,
++    "y": 44
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max(strata:last_hit_rate{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "hit rate"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "percentunit",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 17,
++   "type": "timeseries",
++   "title": "Engine time: prompts / decoding",
++   "description": "Seconds of work per second: 1 = busy all the time (more with requests running together).",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 0,
++    "y": 51
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum(rate(strata:totals_prompt_seconds_total{model_name=~\"$model\",instance=~\"$instance\"}[5m]))",
++     "legendFormat": "reading prompts"
++    },
++    {
++     "refId": "B",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "sum(rate(strata:totals_decode_seconds_total{model_name=~\"$model\",instance=~\"$instance\"}[5m]))",
++     "legendFormat": "decoding"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "percentunit",
++     "custom": {
++      "fillOpacity": 60,
++      "showPoints": "never",
++      "stacking": {
++       "mode": "normal"
++      }
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 18,
++   "type": "timeseries",
++   "title": "GPU busy, per card",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 12,
++    "y": 51
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max by (gpu) (strata:gpu_util{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "GPU {{gpu}}"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "percent",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 19,
++   "type": "timeseries",
++   "title": "GPU memory, per card",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 0,
++    "y": 58
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max by (gpu) (strata:gpu_mem_used_bytes{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "GPU {{gpu}} used"
++    },
++    {
++     "refId": "B",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max by (gpu) (strata:gpu_mem_total_bytes{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "GPU {{gpu}} total"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "bytes",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  },
++  {
++   "id": 20,
++   "type": "timeseries",
++   "title": "Host RAM",
++   "description": "",
++   "datasource": {
++    "type": "prometheus",
++    "uid": "${DS_PROMETHEUS}"
++   },
++   "gridPos": {
++    "h": 7,
++    "w": 12,
++    "x": 12,
++    "y": 58
++   },
++   "targets": [
++    {
++     "refId": "A",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max(strata:ram_used_bytes{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "used"
++    },
++    {
++     "refId": "B",
++     "datasource": {
++      "type": "prometheus",
++      "uid": "${DS_PROMETHEUS}"
++     },
++     "expr": "max(strata:ram_total_bytes{model_name=~\"$model\",instance=~\"$instance\"})",
++     "legendFormat": "total"
++    }
++   ],
++   "fieldConfig": {
++    "defaults": {
++     "unit": "bytes",
++     "custom": {
++      "fillOpacity": 10,
++      "showPoints": "never"
++     }
++    },
++    "overrides": []
++   },
++   "options": {
++    "legend": {
++     "displayMode": "list",
++     "placement": "bottom"
++    },
++    "tooltip": {
++     "mode": "multi"
++    }
++   }
++  }
++ ]
++}
+diff --git a/docs/monitoring/prometheus.yml b/docs/monitoring/prometheus.yml
+new file mode 100644
+index 0000000000..a87634d28f
+--- /dev/null
++++ b/docs/monitoring/prometheus.yml
+@@ -0,0 +1,12 @@
++# Scrape a Strata server's GET /metrics (Prometheus text, vLLM's names; docs/DETAILS.md).
++# Prometheus asks for text/plain, so it gets the text format; the Monitor tab keeps the JSON.
++scrape_configs:
++  - job_name: strata
++    metrics_path: /metrics
++    scrape_interval: 15s
++    # with an API key (strata-<model>.json "api_key" or --api-key): sent as a bearer token
++    authorization:
++      type: Bearer
++      credentials_file: /etc/prometheus/strata-api-key
++    static_configs:
++      - targets: ["127.0.0.1:8080"]
+diff --git a/docs/monitoring/servicemonitor.yaml b/docs/monitoring/servicemonitor.yaml
+new file mode 100644
+index 0000000000..256bca4495
+--- /dev/null
++++ b/docs/monitoring/servicemonitor.yaml
+@@ -0,0 +1,21 @@
++# Kubernetes (Prometheus Operator): Strata behind a Service whose port is named "http".
++# The API key lives in a Secret (key "key"), sent as a bearer token.
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: strata
++  labels:
++    release: kube-prometheus-stack   # whatever your Prometheus selects ServiceMonitors by
++spec:
++  selector:
++    matchLabels:
++      app: strata
++  endpoints:
++    - port: http
++      path: /metrics
++      interval: 15s
++      authorization:
++        type: Bearer
++        credentials:
++          name: strata-api-key
++          key: key
+diff --git a/serve/prometheus.py b/serve/prometheus.py
+new file mode 100644
+index 0000000000..7c09192c94
+--- /dev/null
++++ b/serve/prometheus.py
+@@ -0,0 +1,160 @@
++"""GET /metrics in the Prometheus text format, with vLLM's metric names, so the dashboards and alerts written for a
++vLLM server read a Strata server unchanged.  Everything comes from the server's own record (Service.metrics(), the
++same dict the JSON /metrics returns) plus three latency histograms observed when a request finishes.
++
++What vLLM has no name for is the JSON's own facts under `strata:`, named after the JSON's keys (live.tok_s ->
++strata:live_tok_s, totals.decode_ms -> strata:totals_decode_seconds_total, hardware.gpu_util -> strata:gpu_util), so
++the two formats say the same thing and a panel can be moved from the Monitor tab to Grafana by its key."""
++import threading
++
++# vLLM's buckets for the request latencies (seconds)
++BUCKETS = (0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0,
++           80.0, 160.0, 640.0, 2560.0)
++CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
++
++
++def wants_prometheus(accept: str, query: str) -> bool:
++    """Prometheus asks with Accept: text/plain or application/openmetrics-text; a person can add ?format=prometheus.
++    Anything else (the Monitor tab, curl without a header) keeps the JSON."""
++    return "format=prometheus" in (query or "") or "openmetrics" in (accept or "") or "text/plain" in (accept or "")
++
++
++class Histogram:
++    def __init__(self):
++        self.counts = [0] * len(BUCKETS)
++        self.sum = 0.0
++        self.n = 0
++
++    def observe(self, v: float, times: int = 1):
++        if v is None or times <= 0:
++            return
++        for i, b in enumerate(BUCKETS):
++            if v <= b:
++                self.counts[i] += times
++        self.sum += v * times
++        self.n += times
++
++
++class Latencies:
++    """Time to first token, the time between tokens and the whole request, per finished request."""
++
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.ttft, self.itl, self.e2e = Histogram(), Histogram(), Histogram()
++
++    def observe(self, ttft_s, output_tokens, decode_s, total_s):
++        with self.lock:
++            self.ttft.observe(ttft_s)
++            if output_tokens and output_tokens > 1 and decode_s:
++                # the mean gap, once per gap: the engine reports the decode time, not each token's
++                self.itl.observe(decode_s / (output_tokens - 1), output_tokens - 1)
++            self.e2e.observe(total_s)
++
++    def snapshot(self):
++        with self.lock:
++            return {k: (list(h.counts), h.sum, h.n) for k, h in
++                    (("ttft", self.ttft), ("itl", self.itl), ("e2e", self.e2e))}
++
++
++def _num(v, default=0):
++    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
++
++
++def render(m: dict, lat: dict) -> str:
++    """The text for one scrape.  `m` is Service.metrics(), `lat` Latencies.snapshot()."""
++    model = str((m.get("engine") or {}).get("model") or "strata").replace("\\", "\\\\").replace('"', '\\"')
++    lab = f'model_name="{model}"'
++    live, totals = m.get("live") or {}, m.get("totals") or {}
++    out = []
++
++    def metric(name, kind, help_, value):
++        out.append(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name}{{{lab}}} {value}")
++
++    busy = live.get("state") in ("reading", "generating")
++    ctx = _num((m.get("engine") or {}).get("max_context"), 0)
++    used = _num(live.get("prompt_tokens")) + _num(live.get("generated")) if busy else 0
++    # "parallel": live.running / live.waiting count the requests together (waiting: for a slot or the control lines)
++    metric("vllm:num_requests_running", "gauge", "Requests reading their prompt or generating.",
++           _num(live.get("running"), int(busy)))
++    metric("vllm:num_requests_waiting", "gauge", "Requests waiting for their turn.",
++           _num(live.get("queued")) + _num(live.get("waiting")))
++    metric("vllm:kv_cache_usage_perc", "gauge", "The running request's share of the context (1 = full).",
++           round(min(1.0, used / ctx), 4) if ctx else 0)
++    metric("vllm:prompt_tokens_total", "counter", "Prompt tokens of the finished requests.",
++           _num(totals.get("prompt_tokens")))
++    metric("vllm:generation_tokens_total", "counter", "Generated tokens.", _num(totals.get("output_tokens")))
++    metric("vllm:request_success_total", "counter", "Finished requests.", _num(totals.get("requests")))
++    metric("vllm:prefix_cache_queries_total", "counter", "Prompt tokens looked up in the prompt cache.",
++           _num(totals.get("prompt_tokens")))
++    metric("vllm:prefix_cache_hits_total", "counter", "Prompt tokens the prompt cache already held.",
++           _num(totals.get("reused")))
++    metric("vllm:spec_decode_num_draft_tokens_total", "counter", "MTP draft tokens offered.",
++           _num(totals.get("drafts_offered")))
++    metric("vllm:spec_decode_num_accepted_tokens_total", "counter", "MTP draft tokens accepted.",
++           _num(totals.get("drafts_accepted")))
++    metric("vllm:num_preemptions_total", "counter", "Preempted requests (Strata does not preempt).", 0)
++    for name, key, help_ in (("vllm:time_to_first_token_seconds", "ttft", "Time to the first token."),
++                             ("vllm:inter_token_latency_seconds", "itl", "Time between two tokens."),
++                             ("vllm:e2e_request_latency_seconds", "e2e", "A request from start to end.")):
++        counts, total, n = lat[key]
++        out.append(f"# HELP {name} {help_}\n# TYPE {name} histogram")
++        for b, c in zip(BUCKETS, counts):
++            out.append(f'{name}_bucket{{{lab},le="{b}"}} {c}')
++        out.append(f'{name}_bucket{{{lab},le="+Inf"}} {n}')
++        out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
++    strata(m, out, lab)
++    return "\n".join(out) + "\n"
++
++
++def strata(m: dict, out: list, lab: str):
++    """The JSON's facts vLLM has no name for, under `strata:` and the JSON's key."""
++    live, totals = m.get("live") or {}, m.get("totals") or {}
++    hw, eng = m.get("hardware") or {}, m.get("engine") or {}
++    reqs = m.get("requests") or []
++
++    typed = set()
++
++    def metric(name, kind, help_, value, labels=""):
++        if not isinstance(value, (int, float)) or isinstance(value, bool):
++            return                                       # unknown here (no GPU telemetry, an older engine): no sample
++        if name not in typed:                            # one HELP / TYPE per family, before its first sample
++            typed.add(name)
++            out.append(f"# HELP strata:{name} {help_}\n# TYPE strata:{name} {kind}")
++        out.append(f"strata:{name}{{{lab}{labels}}} {value}")
++
++    for state in ("unloaded", "idle", "reading", "generating"):
++        metric("live_state", "gauge", "1 for what the engine is doing (live.state).", int(live.get("state") == state),
++               f',state="{state}"')
++    metric("live_tok_s", "gauge", "Decode rate over the last seconds (live.tok_s).", live.get("tok_s") or 0)
++    metric("live_prefill_tok_s_mean", "gauge", "Prompt reading rate of the running request (live.prefill_tok_s_mean).",
++           live.get("prefill_tok_s_mean") or 0)
++    metric("live_prompt_read", "gauge", "Prompt tokens read so far by the running request (live.prompt_read).",
++           live.get("prompt_read") or 0)
++    for state in ("idle", "reading", "generating"):
++        slots = live.get("slots")
++        if isinstance(slots, list) and slots:
++            metric("live_slots", "gauge", "The batch slots in each state (live.slots).",
++                   sum(1 for x in slots if isinstance(x, dict) and x.get("state") == state), f',state="{state}"')
++    metric("engine_max_context", "gauge", "The engine's context (engine.max_context).", eng.get("max_context"))
++    metric("totals_prompt_seconds_total", "counter", "Time spent reading prompts (totals.prompt_ms).",
++           round((totals.get("prompt_ms") or 0) / 1000, 3))
++    metric("totals_decode_seconds_total", "counter", "Time spent generating (totals.decode_ms).",
++           round((totals.get("decode_ms") or 0) / 1000, 3))
++    last = reqs[0] if reqs else {}
++    metric("last_hit_rate", "gauge", "The last request's expert cache hit rate (requests[0].hit_rate).",
++           last.get("hit_rate"))
++    metric("last_decode_tok_s", "gauge", "The last request's decode rate (requests[0].decode_tok_s).",
++           last.get("decode_tok_s"))
++    gpus = hw.get("gpus") or ([{"index": 0, "util": hw.get("gpu_util"), "mem_used": hw.get("gpu_mem_used"),
++                                "mem_total": hw.get("gpu_mem_total"), "temp": hw.get("gpu_temp"),
++                                "power": hw.get("gpu_power")}] if hw.get("gpu_util") is not None else [])
++    for name, key, help_ in (("gpu_util", "util", "GPU busy, percent (hardware.gpu_util)."),
++                             ("gpu_mem_used_bytes", "mem_used", "GPU memory in use (hardware.gpu_mem_used)."),
++                             ("gpu_mem_total_bytes", "mem_total", "GPU memory (hardware.gpu_mem_total)."),
++                             ("gpu_temp_celsius", "temp", "GPU temperature (hardware.gpu_temp)."),
++                             ("gpu_power_watts", "power", "GPU power draw (hardware.gpu_power).")):
++        for g in gpus:                                   # a family's samples together, one per card
++            metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"')
++    metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
++    metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
++    metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))
+diff --git a/serve/server.py b/serve/server.py
+index d6b1fc37e6..0f2ab006b0 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -650,6 +650,11 @@ def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str |
+         gs = self.batch // groups if self.batch else 0
+         # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
+         self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
++        # pipelined groups (the engine says how many it runs: INFO batch_groups, 0.1.39+ engines; older ones: the
++        # args).  A pipelined group's window spans its slots up to its last busy one, and the engine keeps no
++        # pipelined slot as a conversation cache - see pick_slot
++        groups_run = int(self.info.get("batch_groups") or groups)
++        self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+         self.slot_q = [queue.Queue() for _ in range(self.batch)]
+         self.slot_busy = [False] * self.batch
+         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
+@@ -1298,6 +1303,16 @@ def pick_slot(self, prompt: list[int]) -> int | None:
+         free = [b for b in self.slot_order if not self.slot_busy[b]]
+         if not free:
+             return None
++        gs = getattr(self, "slot_gs", 0)
++        if gs:
++            # pipelined groups: the engine keeps no pipelined slot as a conversation cache, so nothing is worth keeping
++            # free for a next turn.  A group's window spans its slots up to its last busy one, so first fill a hole
++            # below a busy slot of the same group (it costs no extra row), then follow the spreading order
++            # (reported on #793: least-recently-used picks left leading holes, [_ B], that cost a whole row each)
++            def fills_hole(b):
++                g0 = b - b % gs
++                return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
++            return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
+         def held_prefix(b):
+             h = self.slot_held[b]
+             return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
+@@ -2188,6 +2203,8 @@ def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name
+                        "prompt_ms": 0.0, "decode_ms": 0.0,
+                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
+         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
++        from serve.prometheus import Latencies
++        self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
+         self.last_request_at = None                      # when a request last started or finished
+         self.started_at = time.time()
+         self.status_lock = threading.Lock()
+@@ -3132,6 +3149,9 @@ def cut(evs):
+                             t["decode_ms"] += last.get("decode_ms") or 0.0
+                             t["drafts_offered"] += last.get("drafts_offered") or 0
+                             t["drafts_accepted"] += last.get("drafts_accepted") or 0
++                            ft0 = st.get("first_token")             # this request's own (#465: one per request)
++                            self.latencies.observe(ft0 - started if ft0 else None, n,
++                                                   (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
+                             fresh = getattr(self.engine, "last", None)
+                             if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                                 timings = request_timings(seen, n, last)
+@@ -3794,6 +3814,16 @@ def do_GET(self):
+                 self.wfile.write(body)
+                 return
+             if path == "/metrics":
++                from serve import prometheus
++                if prometheus.wants_prometheus(self.headers.get("Accept", ""), urlsplit(self.path).query):
++                    if self._authorized():   # a scraper: the text format, vLLM's names (serve/prometheus.py)
++                        body = prometheus.render(svc.metrics(), svc.latencies.snapshot()).encode()
++                        self.send_response(200)
++                        self.send_header("Content-Type", prometheus.CONTENT_TYPE)
++                        self.send_header("Content-Length", str(len(body)))
++                        self.end_headers()
++                        self.wfile.write(body)
++                    return
+                 if self._authorized():
+                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
+                     self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+diff --git a/serve/test_prometheus.py b/serve/test_prometheus.py
+new file mode 100644
+index 0000000000..c9f2d08946
+--- /dev/null
++++ b/serve/test_prometheus.py
+@@ -0,0 +1,181 @@
++"""serve/test_prometheus.py - GET /metrics in the Prometheus text format (vLLM's names), against the mock engine.
++
++    python -m unittest serve.test_prometheus -v
++"""
++from __future__ import annotations
++
++import json
++import re
++import sys
++import threading
++import time
++import unittest
++import urllib.request
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from serve.frontend import ChatTemplate  # noqa: E402
++from serve.prometheus import BUCKETS, Latencies, render, wants_prometheus  # noqa: E402
++from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def parse(text):
++    """{(name, labels): value} for every sample line; checks each family has HELP and TYPE first."""
++    out, typed = {}, set()
++    for line in text.splitlines():
++        if line.startswith("# TYPE "):
++            assert line.split()[2] not in typed, f"two # TYPE lines for {line.split()[2]}"
++            typed.add(line.split()[2])
++            continue
++        if line.startswith("#") or not line:
++            continue
++        m = re.fullmatch(r'([a-z0-9_:]+)\{([^}]*)\} (\S+)', line)
++        assert m, f"not a sample line: {line!r}"
++        name, labels, value = m.groups()
++        family = re.sub(r"_(bucket|sum|count)$", "", name)
++        assert name in typed or family in typed, f"{name} has no # TYPE"
++        out[(name, labels)] = float(value)
++    return out
++
++
++class Units(unittest.TestCase):
++    def test_who_gets_the_text(self):
++        self.assertTrue(wants_prometheus("text/plain;version=0.0.4", ""))
++        self.assertTrue(wants_prometheus("application/openmetrics-text;version=1.0.0", ""))
++        self.assertTrue(wants_prometheus("", "format=prometheus"))
++        self.assertFalse(wants_prometheus("application/json", ""))
++        self.assertFalse(wants_prometheus("*/*", "requests=all"))
++
++    def test_histograms_are_cumulative(self):
++        lat = Latencies()
++        lat.observe(0.3, 11, 1.0, 1.5)       # 10 gaps of 0.1 s
++        lat.observe(None, 1, 0.0, 0.2)       # no first token, one token: no gap
++        s = lat.snapshot()
++        counts, total, n = s["itl"]
++        self.assertEqual(n, 10)
++        self.assertAlmostEqual(total, 1.0)
++        self.assertEqual(counts[BUCKETS.index(0.1)], 10)
++        self.assertEqual(counts[BUCKETS.index(0.08)], 0)
++        self.assertEqual(s["ttft"][2], 1)
++        self.assertEqual(s["e2e"][2], 2)
++        self.assertEqual(counts, sorted(counts))
++
++    def test_render_reads_the_server_record(self):
++        m = {"engine": {"model": 'a "b"', "max_context": 1000},
++             "live": {"state": "generating", "queued": 2, "prompt_tokens": 400, "generated": 100},
++             "totals": {"requests": 3, "prompt_tokens": 900, "reused": 600, "output_tokens": 50,
++                        "drafts_offered": 40, "drafts_accepted": 30}}
++        got = parse(render(m, Latencies().snapshot()))
++        lab = 'model_name="a \\"b\\""'
++        self.assertEqual(got[("vllm:num_requests_running", lab)], 1)
++        self.assertEqual(got[("vllm:num_requests_waiting", lab)], 2)
++        self.assertEqual(got[("vllm:kv_cache_usage_perc", lab)], 0.5)
++        self.assertEqual(got[("vllm:prefix_cache_hits_total", lab)], 600)
++        self.assertEqual(got[("vllm:spec_decode_num_accepted_tokens_total", lab)], 30)
++        self.assertEqual(got[("vllm:time_to_first_token_seconds_count", lab)], 0)
++
++    def test_strata_names_follow_the_json(self):
++        m = {"engine": {"model": "m", "max_context": 1000},
++             "live": {"state": "reading", "queued": 0, "prompt_read": 300, "prefill_tok_s_mean": 2500.0},
++             "totals": {"requests": 1, "prompt_ms": 1500.0, "decode_ms": 2000.0},
++             "requests": [{"hit_rate": 0.97, "decode_tok_s": 101.5}],
++             "hardware": {"gpu_util": 40.0, "gpus": [{"index": 0, "util": 30.0, "mem_used": 1 << 30, "temp": 60},
++                                                     {"index": 1, "util": 50.0, "mem_used": 2 << 30, "temp": 65}],
++                          "cpu": 12.5, "ram_used": 8 << 30, "ram_total": 64 << 30}}
++        got = parse(render(m, Latencies().snapshot()))
++        lab = 'model_name="m"'
++        self.assertEqual(got[("strata:live_state", lab + ',state="reading"')], 1)
++        self.assertEqual(got[("strata:live_state", lab + ',state="generating"')], 0)
++        self.assertEqual(got[("strata:live_prompt_read", lab)], 300)
++        self.assertEqual(got[("strata:totals_decode_seconds_total", lab)], 2.0)
++        self.assertEqual(got[("strata:last_hit_rate", lab)], 0.97)
++        self.assertEqual(got[("strata:gpu_util", lab + ',gpu="1"')], 50)
++        self.assertEqual(got[("strata:gpu_mem_used_bytes", lab + ',gpu="0"')], 1 << 30)
++        self.assertNotIn(("strata:gpu_power_watts", lab + ',gpu="0"'), got)   # not measured: no sample
++        self.assertEqual(got[("strata:ram_total_bytes", lab)], 64 << 30)
++
++
++class Endpoint(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        tok = ByteTokenizer()
++        cls.svc = Service(MockEngine(tok, "</think>\n\nhello there", max_context=4096), tok,
++                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        cls.httpd = serve(cls.svc, port=0)
++        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.httpd.shutdown()
++        cls.httpd.server_close()
++
++    def get(self, path, accept):
++        req = urllib.request.Request(self.base + path, headers={"Accept": accept})
++        with urllib.request.urlopen(req, timeout=30) as r:
++            return r.headers.get("Content-Type"), r.read().decode()
++
++    def test_a_request_shows_in_both_formats(self):
++        body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 32}).encode()
++        req = urllib.request.Request(self.base + "/v1/chat/completions", data=body,
++                                     headers={"Content-Type": "application/json"})
++        with urllib.request.urlopen(req, timeout=30) as r:
++            usage = json.loads(r.read())["usage"]
++        ctype, text = self.get("/metrics", "text/plain")
++        self.assertTrue(ctype.startswith("text/plain"))
++        got = {k[0]: v for k, v in parse(text).items()}
++        self.assertGreaterEqual(got["vllm:request_success_total"], 1)
++        self.assertGreaterEqual(got["vllm:generation_tokens_total"], usage["completion_tokens"])
++        self.assertGreaterEqual(got["vllm:e2e_request_latency_seconds_count"], 1)
++        ctype, text = self.get("/metrics", "application/json")
++        self.assertTrue(ctype.startswith("application/json"))
++        self.assertGreaterEqual(json.loads(text)["totals"]["requests"], 1)
++        ctype, _ = self.get("/metrics?format=prometheus", "*/*")
++        self.assertTrue(ctype.startswith("text/plain"))
++
++
++class BatchEngine(MockEngine):
++    """--batch as the server sees it: several requests generate at once, none waits for the control lines."""
++    batch, waiting = 4, 0
++
++
++class Batched(unittest.TestCase):
++    def test_every_concurrent_request_is_counted(self):
++        tok = ByteTokenizer()
++        svc = Service(BatchEngine(tok, "</think>\n\n" + "y" * 40, max_context=4096, delay_s=0.02), tok,
++                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        httpd = serve(svc, port=0)
++        base = f"http://127.0.0.1:{httpd.server_address[1]}"
++        try:
++            body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}],
++                               "max_tokens": 64}).encode()
++
++            def ask():
++                req = urllib.request.Request(base + "/v1/chat/completions", data=body,
++                                             headers={"Content-Type": "application/json"})
++                with urllib.request.urlopen(req, timeout=60) as r:
++                    r.read()
++
++            threads = [threading.Thread(target=ask) for _ in range(3)]
++            [t.start() for t in threads]
++            time.sleep(0.4)                              # the three are generating
++            req = urllib.request.Request(base + "/metrics", headers={"Accept": "text/plain"})
++            with urllib.request.urlopen(req, timeout=30) as r:
++                during = {k[0]: v for k, v in parse(r.read().decode()).items()}
++            [t.join() for t in threads]
++            with urllib.request.urlopen(req, timeout=30) as r:
++                after = {k[0]: v for k, v in parse(r.read().decode()).items()}
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++        self.assertEqual(during["vllm:num_requests_running"], 3)
++        self.assertEqual(after["vllm:num_requests_running"], 0)
++        self.assertEqual(after["vllm:request_success_total"], 3)      # each one, not only the last to finish
++        self.assertEqual(after["vllm:e2e_request_latency_seconds_count"], 3)
++        self.assertEqual(after["vllm:time_to_first_token_seconds_count"], 3)
++        self.assertEqual(svc.metrics()["totals"]["requests"], 3)          # the JSON agrees
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/serve/test_slot_alloc.py b/serve/test_slot_alloc.py
+new file mode 100644
+index 0000000000..474b4f78ed
+--- /dev/null
++++ b/serve/test_slot_alloc.py
+@@ -0,0 +1,83 @@
++"""serve/test_slot_alloc.py - which batch slot a request gets (StrataEngine.pick_slot), no engine needed.
++
++    python -m unittest serve.test_slot_alloc -v
++"""
++from __future__ import annotations
++
++import random
++import sys
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from serve.server import StrataEngine  # noqa: E402
++
++
++def engine(batch, groups, pipelined=True):
++    e = object.__new__(StrataEngine)          # pick_slot reads only the slot tables
++    gs = batch // groups
++    e.batch = batch
++    e.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
++    e.slot_busy = [False] * batch
++    e.slot_held = [[] for _ in range(batch)]
++    e.slot_used = [0.0] * batch
++    e.slot_gs = gs if pipelined and groups > 1 else 0
++    return e
++
++
++class Pipelined(unittest.TestCase):
++    def test_spreads_over_the_groups_first(self):
++        e = engine(6, 3)
++        got = []
++        for _ in range(6):
++            b = e.pick_slot([1, 2, 3])
++            e.slot_busy[b] = True
++            got.append(b)
++        self.assertEqual(got, [0, 2, 4, 1, 3, 5])
++
++    def test_fills_a_leading_hole_first(self):
++        # #793's report: a group left as [_ B] costs a whole row; the next request goes into that hole
++        e = engine(6, 3)
++        e.slot_busy[3] = True                       # group 1 = [_ B]
++        e.slot_used[0] = 0.0                        # least recently used: what the LRU fallback picked
++        e.slot_used[2] = 99.0
++        self.assertEqual(e.pick_slot([1]), 2)
++
++    def test_never_opens_a_hole_below_the_pick(self):
++        for batch, groups in ((6, 3), (8, 4), (8, 2), (4, 2)):
++            gs = batch // groups
++            e, rng = engine(batch, groups), random.Random(batch * 10 + groups)
++            for _ in range(2000):
++                busy = [b for b in range(batch) if e.slot_busy[b]]
++                if busy and (rng.random() < 0.45 or len(busy) == batch):
++                    e.slot_busy[rng.choice(busy)] = False          # a request ends, anywhere
++                    continue
++                b = e.pick_slot([7])
++                g0 = b - b % gs
++                with self.subTest(batch=batch, groups=groups):
++                    self.assertTrue(all(e.slot_busy[x] for x in range(g0, b)),
++                                    f"slot {b} picked with a free slot below it in its group: {e.slot_busy}")
++                e.slot_busy[b] = True
++
++    def test_held_tokens_are_ignored(self):
++        # the engine keeps no pipelined slot as a cache: a held prefix must not pull a request into a hole-making slot
++        e = engine(6, 3)
++        e.slot_held[5] = [1, 2]
++        self.assertEqual(e.pick_slot([1, 2, 3]), 0)
++
++
++class OneGroup(unittest.TestCase):
++    def test_reuse_then_least_recently_used(self):
++        e = engine(4, 1, pipelined=False)
++        e.slot_held[2] = [1, 2]
++        self.assertEqual(e.pick_slot([1, 2, 3]), 2)        # its conversation's next turn
++        e.slot_held[2] = [9]
++        e.slot_held = [[5], [], [9], [6]]
++        self.assertEqual(e.pick_slot([1, 2, 3]), 1)        # an empty slot before evicting a held one
++        e.slot_held[1] = [8]
++        e.slot_used = [5.0, 3.0, 9.0, 1.0]
++        self.assertEqual(e.pick_slot([1, 2, 3]), 3)        # else the least recently used
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3b551f3aaf..9ec9e13003 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -7196,7 +7196,8 @@ int main(int argc, char** argv) {
+                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
+-                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0)).c_str() : "");
++                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
++                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+         }
+         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
+         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
+@@ -7624,6 +7625,7 @@ int main(int argc, char** argv) {
+             int32_t tok[strata::kernels::kVerifyMaxT] = {};
+             int64_t pos[strata::kernels::kVerifyMaxT] = {};
+             int64_t since = 0;              ///< tick it started waiting (fairness)
++            int S = 0;                      ///< slots in its window: up to its last active one (idle ones cost rows)
+         };
+         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
+         std::vector<int> stage_group((size_t) n_pipe, -1);
+@@ -7654,7 +7656,7 @@ int main(int argc, char** argv) {
+                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
+                 // the last stage: the group's picks
+                 const int32_t* outb = vk.batch_out();
+-                for (int t = 0; t < GS; ++t) {
++                for (int t = 0; t < G.S; ++t) {
+                     BSlot& sl = bs[(size_t) (gi * GS + t)];
+                     if (!sl.active) continue;
+                     const int32_t y = outb[t];
+@@ -7698,7 +7700,11 @@ int main(int argc, char** argv) {
+                     if (pick < 0) continue;
+                     rr = pick + 1;
+                     PGroup& G = pg[(size_t) pick];
+-                    for (int t = 0; t < GS; ++t) {
++                    // the window holds the group's slots up to its last active one (by crazyaimachine, PR #559): with
++                    // the requests spread over the groups first, two requests sat in two windows of mostly pad rows
++                    G.S = 0;
++                    for (int t = 0; t < GS; ++t) if (bs[(size_t) (pick * GS + t)].active) G.S = t + 1;
++                    for (int t = 0; t < G.S; ++t) {
+                         BSlot& sl = bs[(size_t) (pick * GS + t)];
+                         G.tok[t] = sl.active ? sl.x : 0;
+                         G.pos[t] = sl.active ? sl.p : 0;
+@@ -7711,7 +7717,7 @@ int main(int argc, char** argv) {
+                 }
+                 PGroup& G = pg[(size_t) pick];
+                 strata::core::progress().busy.store(true);
+-                if (!stage_verifier(k).batch_launch(pick * GS, GS, G.tok, G.pos, err)) {
++                if (!stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err)) {
+                     std::printf("ERR %s\n", err.c_str());
+                     return false;
+                 }

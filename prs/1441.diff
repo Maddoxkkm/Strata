@@ -1,0 +1,161 @@
+diff --git a/docs/MULTI_GPU.md b/docs/MULTI_GPU.md
+index 50080d7d86..0e1718e147 100644
+--- a/docs/MULTI_GPU.md
++++ b/docs/MULTI_GPU.md
+@@ -149,6 +149,37 @@ Prompts are read in chunks that flow through the cards in turn; while a later ca
+ already reads chunk c+1. Conversation checkpoints save and restore every card's state; the adaptive expert swaps copy
+ into the card that owns the layer.
+ 
++## Prompt chunks sized for the pipeline (`STRATA_PREFILL_PIPE=1`, opt-in)
++
++`--prefill auto` takes the largest chunk the buffers allow (up to 8192), which is what one card wants: a chunk costs a
++pass over its layers' experts plus a part per token, so few large chunks are cheapest. On a split that is the wrong
++end of the trade: with a chunk as big as the prompt the later cards wait while the first one reads it, and with a few
++large chunks the pipeline barely fills (a 10.7K-token prompt in a 7680 and a 3011 chunk over four stages: the first
++stage carried 24 of the 36 s). With `STRATA_PREFILL_PIPE=1` the first stage reads each prompt in the chunk that
++minimizes the pipeline's time: about (S - 1 + n/C) stage-chunks of (b + a C), whose minimum is at
++C = sqrt(n (b/a) / (S - 1)) for n tokens and S stages, b the per-chunk pass and a the per-token part of a layer.
++b/a is in tokens, set more by the model (its experts per token) than by the card: ~1000 for Flash-Next on the
++cards below, the default 1024; `STRATA_PREFILL_PIPE=<b/a>` sets another. The chunk is rounded up to the 256-token
++grid, at least 512, at most the buffers' chunk (keep `--prefill auto` so the buffers allow long prompts their larger
++chunks), and evened out over the chunks it takes; a prompt the rule would read in one chunk keeps today's path. The
++chunk geometry changes the rounding, so it is opt-in. One line in the log says what it chose:
++
++    strata prefill: 10041 tokens in 2048-token chunks over 4 stages (STRATA_PREFILL_PIPE)
++
++Measured on four GP100 dies (PH402 SKU 200, `--layer-split 12,24,36`, Flash-Next IQ3_XXS, 64K context), prompt
++tok/s, fresh prompts, two interleaved rounds (each within 0.2%):
++
++| Prompt tokens | `--prefill auto` | `--prefill 2048` | `--prefill auto` + `STRATA_PREFILL_PIPE=1` (chunk) |
++| ---: | ---: | ---: | ---: |
++| 2,013 | 180.9 | 181.4 | 228.0 (1024) |
++| 3,865 | 207.6 | 276.5 | 312.4 (1024) |
++| 10,041 | 261.1 | 433.0 | 432.6 (2048) |
++| 28,998 | 475.7 | 554.1 | 559.7 (3328) |
++
++To measure b and a on another rig: `STRATA_PREFILL_TIMING=1` logs each stage's GPU time per chunk; two prompts read
++at two chunk sizes give a stage-chunk time t = layers x (b + a C) for each, and b/a = (t1 C2 - t2 C1) / (t2 - t1)
++(the layer count cancels). Not measured here on two-card splits, where S - 1 = 1 makes the chosen chunks larger and the gain smaller.
++
+ ## Limits (for now)
+ 
+ - **Works across cards** (bench/results/2026-09-29-layer-split-limits):
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 03c4374d49..75018003a1 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -81,6 +81,10 @@ class Prefill {
+     static double pinned_share();
+     /// The chunk size from which a chunk streams every expert the GPU does not hold (1024; STRATA_PREFILL_STREAM_MIN).
+     static int64_t stream_all_min_tokens();
++    /// STRATA_PREFILL_PIPE (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
++    /// stages and chunks of at most `cap` (the buffers' size): the one that keeps the stages busy at once - see the
++    /// definition. `cap` when it is off, with one stage, or for a prompt the rule would read in one chunk anyway.
++    static int64_t pipeline_chunk(int64_t n, int64_t cap, int stages);
+     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
+     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
+     static void set_ring_override(int slots);
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 23eaf1ddf8..959bd5dba7 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1549,6 +1549,33 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
+ double Prefill::pinned_share() { return g_pinned_share; }
+ int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
+ 
++// STRATA_PREFILL_PIPE=1 (opt-in): a layer split reads a prompt as a pipeline - stage s reads chunk c while stage s+1
++// reads chunk c-1 - so the prompt costs about (S - 1 + n/C) stage-chunk times, and a stage-chunk costs its layers
++// x (b + a C): a fixed pass over the layer's experts per chunk (b) and a per-token part (a). Few large chunks keep
++// the later stages waiting (one 7680-token chunk of a 10.7K prompt: the first of four stages carried 24 of 36 s);
++// many small ones pay b again and again. The minimum of (S - 1 + n/C)(b + a C) is at C = sqrt(n (b/a) / (S - 1)).
++// b/a is measured in tokens: ~1000 on a PH402 (four GP100 dies, Flash-Next IQ3_XXS: b ~ 80 ms and a ~ 0.08 ms per
++// layer, from STRATA_PREFILL_TIMING at two chunk sizes); it is set by the model's experts-per-token ratio more
++// than by the card. STRATA_PREFILL_PIPE=<b/a> sets it (1 = the default 1024). The chunk is rounded up to the
++// 256-token grid, at least 512, at most the buffers' chunk, and evened out over the chunks it takes (no short
++// last one). The chunk geometry changes the rounding, so it is off by default.
++int64_t Prefill::pipeline_chunk(int64_t n, int64_t cap, int stages) {
++    static const double ratio = [] {
++        const char* v = std::getenv("STRATA_PREFILL_PIPE");
++        if (v == nullptr || v[0] == '\0' || (v[0] == '0' && v[1] == '\0')) return 0.0;
++        const double r = std::atof(v);
++        return r > 1.0 ? r : 1024.0;
++    }();
++    if (ratio <= 0.0 || stages < 2 || n <= 0 || cap <= 0) return cap;
++    const double best = std::sqrt((double) n * ratio / (double) (stages - 1));
++    int64_t want = std::max<int64_t>(512, (((int64_t) best + 255) / 256) * 256);
++    if (want >= n) return cap;                                     // one chunk anyway
++    want = std::min(want, cap);
++    const int64_t k = (n + want - 1) / want;                       // chunks
++    const int64_t even = (((n + k - 1) / k + 255) / 256) * 256;    // the same count, evened out
++    return std::min(even, cap);
++}
++
+ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+     return bytes_needed_impl(g, ss, chunk, false);
+ }
+@@ -1794,7 +1821,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+     // layer split: a prompt of one chunk runs the stages one after the other, so the next stage's GPU idles while
+     // this one reads; it streams and computes a share of this stage's experts then (set_stage_helper), in the
+     // place of a --peer-device peer, and gives the stage back its own buffers when the run ends
+-    const bool single_chunk = hand_in_ == nullptr ? n <= m.T : single_chunk_;
++    // the chunk this prompt is read in: the buffers' size, or with STRATA_PREFILL_PIPE on a layer split the one that
++    // keeps every stage busy. Only the first stage chooses: a later one is handed one chunk at a time.
++    int stages = 1;
++    for (const Prefill* p = next_; p != nullptr; p = p->next_) ++stages;
++    const int64_t C = hand_in_ == nullptr ? pipeline_chunk(n, m.T, stages) : m.T;
++    if (C < m.T && hand_in_ == nullptr)
++        std::fprintf(stderr, "strata prefill: %lld tokens in %lld-token chunks over %d stages (STRATA_PREFILL_PIPE)\n",
++                     (long long) n, (long long) C, stages);
++    const bool single_chunk = hand_in_ == nullptr ? n <= C : single_chunk_;
+     const bool helped = single_chunk && bind_stage_helper(n);
+     if (helped) std::swap(m.pp, m.help_pp);
+     struct HelpScope {
+@@ -1830,8 +1865,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
+                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+     const int32_t prev0[2] = {prev[0], prev[1]};
+-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
+-        const int64_t T = std::min(m.T, n - c0);
++    auto ple_gather = [&m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
++        const int64_t T = std::min(C, n - c0);
+         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
+         int32_t pv[2] = {at(c0), at(c0 + 1)};
+         for (int64_t t = 0; t < T; ++t) {
+@@ -1847,10 +1882,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
+     int ple_buf = 0;
+ 
+-    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
++    for (int64_t c0 = 0; c0 < n; c0 += C) {
+         if (should_stop && should_stop()) { err = "cancelled"; return false; }
+         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
+-        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
++        const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
+         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
+         ++stats_.chunks;
+         pt.mark(kPfStart, cs);
+@@ -1932,13 +1967,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                 err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
+-            if (c0 + m.T < n) {
++            if (c0 + C < n) {
+                 // the other buffer's upload (a chunk ago) is done before the SSD thread refills it
+                 if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
+                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
+                     return false;
+                 }
+-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
++                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + C, b = ple_buf ^ 1] {
+                     return ple_gather(c1, b, ple_next_err);
+                 });
+             }
+@@ -3557,7 +3592,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
+             std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long) c, mx);
+         };
+-        const int64_t last = (n - 1) % m.T;
++        const int64_t last = (n - 1) % C;
+         std::fprintf(stderr, "strata dbg: prompt end: last residual row");
+         bad(m.R + last * D, D);
+         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }

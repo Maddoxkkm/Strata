@@ -1,0 +1,807 @@
+diff --git a/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/README.md b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/README.md
+new file mode 100644
+index 0000000000..354e3e7b02
+--- /dev/null
++++ b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/README.md
+@@ -0,0 +1,104 @@
++# Community benchmark on AMD Radeon RX 7900 XTX 24 GB — follow-up: a gfx1100 hipBLASLt 100500 table, the 128K prefill confound resolved
++
++Measured 2026-10-04 by xyzzing. What was tested: the ROCm 10.2 nightly engine from
++[the 2026-10-03 comparison](../2026-10-03-community-rx7900xtx-rocm102-nightly/), whose 128K
++prefill number was flagged as confounded — its hipBLASLt library reports version 100500, no
++gfx1100 table ships for it, and the engine falls back to plain hipBLAS (the documented
++version-mismatch mechanism). This follow-up tunes a matching table **on this device, against
++that exact nightly library**, and re-measures the same 128K workload with and without it.
++Main limitation: results are one-shot `strata generate` cells (not the serve path), and the
++table's solution IDs are scoped to this hipBLASLt build — a ROCm update invalidates it, as it
++does the shipped 100100/100200 tables.
++
++## Hardware and software
++
++Identical to the parent folder: RX 7900 XTX 24 GB (gfx1100), Ryzen 9 7900X, 96 GB DDR5, NVMe
++ext4, PCIe Gen4 x16; Fedora 44, in-tree amdgpu; the ROCm 10.2 nightly SDK
++(`libamdhip64.so.7.17.26392`) and the matching nightly hipBLASLt (`libhipblaslt.so.1.5`,
++runtime-reported version **100500**). Engine: the same 0.1.38-lineage nightly binary
++(`build-nightly/strata`) used for the parent's r10 cells. Desktop (KDE/Wayland + browser)
++co-resident; per-cell systemd scope with `MemoryMax=66G MemoryHigh=61G`; each cell waits for
++the previous cell's VRAM/RAM to drain before starting.
++
++- The system-packaged ROCm 7.1.1 stack (hipBLASLt 100100) was **not** re-measured; its numbers
++  come from the parent comparison and are quoted as context only.
++
++## Model and configuration
++
++Same model and serving-config lineage as the parent (Qwen3.8-Flash-Next GSQ-RCO IQ3_S, 2
++shards; expert cache `auto` pre-filled from the shipped routing profile; `--vram-reserve-mib
++3072`; KV int8 `--kv-resident 32768`; prefill chunk 8192; MTP loaded; `--spec 3`; greedy):
++
++```text
++# per cell (one-shot, not serve): the candidate serve config's exact args + tier context
++env LD_LIBRARY_PATH=$SDK/lib \
++    STRATA_HIPBLASLT_TUNING=<table|unset>  STRATA_PREFILL_RING=96 STRATA_GR_V3=1 \
++    STRATA_SELECT_WMMA=1 STRATA_PREFILL_TIMING=1 \
++  strata --tokens-file qsa-profile-131072.tokens --max-new 256 --max-context 139264 \
++    --pack packs/iq3_s --native <shard1> --ple-gguf <shard2> --mtp mtp/rt \
++    --expert-profile expert-profile.bin --expert-cache auto --spec 3 --kv int8 \
++    --kv-resident 32768 --prefill 8192 --vram-reserve-mib 3072
++# each cell launched under: systemd-run --user --collect --wait --pipe \
++#   -p MemoryMax=66G -p MemoryHigh=61G (see ab-driver.py)
++```
++
++The two arms differ **only** in `STRATA_HIPBLASLT_TUNING`: `nightly-100500` points at the new
++table (in this folder), `nightly-notable` leaves it unset — the parent folder's exact nightly
++condition. The table itself was produced by the tree's own `tune_hipblaslt` run against the
++nightly SDK's library (`tune-command.txt`): 16 GEMM shapes × {4096, 8192} token buckets = 32
++cases, every candidate correctness-gated (rel-L2 ≤ 1e-4, max-abs ≤ 1e-2, padding canary), and
++every table row is its case's measured best. The engine log confirms engagement per cell:
++`prefill gemm: hipBLASLt tuning enabled (32 rows, gfx1100, version 100500)`.
++
++## Method
++
++One-shot `strata generate` cells (the tree's published AMD-rates methodology): greedy, 256
++generated tokens (none ended early), the 131072-token code-agent prompt workload, one fresh
++engine per cell. Arms interleaved-arm-blocked: 3 cells `nightly-100500`, then 3 cells
++`nightly-notable`. Published numbers are medians of 3 clean cells with range; a cell would be
++flagged and excluded if either phase fell below 40% of the arm's best observed rate
++(background-GPU stall rule) — no cell was flagged, 7/7 clean
++(`runs.json` has every cell with its raw-log reference).
++
++- **prefill tok/s** = prompt tokens / GPU-timeline seconds (engine's `STRATA_PREFILL_TIMING`
++  line) — not derived from wall time.
++- **decode tok/s** from the engine's own decode summary line.
++- **TTFT**: not available — the one-shot path does not print a TTFT line (serve path only).
++- Prompt reuse: none (fresh engine per cell; the whole 131071-token prompt is read each time).
++- Memory: engine loads ~46.8 GiB of experts into host memory; VRAM ~22.5 GiB incl. the
++  3072 MiB desktop reserve.
++
++## Results
++
++| Configuration | Actual prompt tokens | Reused tokens | Generated tokens | Runs | Prefill tok/s median (range) | Decode tok/s median (range) | TTFT |
++| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
++| nightly 10.2 + gfx1100-100500 table | 131071 | 0 | 256 | 3 | **1687.0** (1679.6–1694.0) | 62.26 (62.19–62.41) | n/a |
++| nightly 10.2, no table (parent's r10 condition) | 131071 | 0 | 256 | 3 | 926.1 (917.4–926.2) | 60.69 (55.24–61.02) | n/a |
++| sanity: nightly 10.2 + table, 1k prompt | 1023 | 0 | 256 | 1 | 645.8 (single cell) | 69.38 (single cell) | n/a |
++
++- **The table recovers +82% 128K prefill on the same binary and library** (1687 vs 926
++  median). The no-table arm reproduces the parent comparison's confounded r10 cell (921
++  tok/s, single run) within noise — the earlier number measured the fallback, not the
++  toolchain.
++- For context (single cells, different stack, from the parent folder): packaged ROCm 7.1.1
++  with its matching 100100 table prefilled at 1535 tok/s. The nightly's 100500 library with a
++  matching table prefills faster than that; cross-stack cells are not paired and this is not a
++  claim.
++- Decode is unchanged by the table, as expected: 62.26 vs 60.69 median with overlapping
++  ranges — decode is O(1) in context and table-insensitive at these shapes.
++
++## Correctness and limitations
++
++- Greedy; **no token-identity check between arms** — the two arms use different GEMM
++  implementations (hipBLASLt solutions vs plain hipBLAS) whose floating-point rounding can
++  differ; the throughput comparison does not depend on token equality. Within the tuner,
++  every candidate was byte-compared against the reference before timing (the tuner's own
++  gate), and the engine refuses a table that fails its version/arch check.
++- Single GPU, single host, one model; the 128K tier is the one the parent comparison flagged.
++- Solution IDs are scoped to this hipBLASLt build (100500-era). A ROCm/hipBLASLt update
++  invalidates the table exactly like the shipped ones — that version keying is the mechanism
++  this folder exists to close, not a defect of it.
++- Shipping the table in `tools/hip/` is an engine-tree change and deliberately **not** part
++  of this results-only PR; the file, the shape set, and the exact tuning command are in this
++  folder for whoever wants to pick it up (upstream tables for gfx1201/gfx1200 at 100500
++  already ship; gfx1100 was the gap).
+diff --git a/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/ab-driver.py b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/ab-driver.py
+new file mode 100644
+index 0000000000..ecb10061b6
+--- /dev/null
++++ b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/ab-driver.py
+@@ -0,0 +1,284 @@
++#!/usr/bin/env python3
++"""hipblaslt1005_driver.py - unconfound the 128K prefill comparison in PR #745.
++
++T4 (record-autotune-128k-pr-20261004.json) measured the ROCm 10.2 nightly arm without a
++matching hipBLASLt tuning table (its 100500-era library refuses the gfx1100-100100 table),
++so its prefill number carried the #505 table-version fallback, not the toolchain.  This
++driver A/Bs the SAME nightly engine on the SAME workload with and without a freshly tuned
++gfx1100-hipblaslt-100500 table (tuned on this host against the nightly SDK's own
++libhipblaslt by build-hip-0138/tune_hipblaslt under LD_LIBRARY_PATH).
++
++Methodology = rates_amd.py: one-shot `strata generate`, greedy, 256 generated tokens,
++prefill_tok_s = prompt_tokens / GPU_timeline_s, decode from the engine's own decode line,
++median of 3 clean cells per arm (STALL_FRAC flagging, flagged cells never published).
++One 1k cell on the table arm is the decode sanity check (decode is O(1) in context).
++
++Cells run one at a time inside a systemd-run --user scope with MemoryMax (the desktop
++protection), gated on MemAvailable, and each cell first checks no stale engine process
++holds the GPU (the P1 KFD-pid check).
++"""
++import json
++import os
++import re
++import subprocess
++import sys
++import time
++
++TS = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
++OUT = f"/home/zacch/projects/strata-amd/artifacts/rocm/results/record-hipblaslt-100500-{TS}.json"
++LOGDIR = "/home/zacch/projects/strata-amd/artifacts/rocm/logs"
++
++SDK = "/home/zacch/strata-rocm-experiments/20261003-231142/sdk"
++EXE = "/home/zacch/strata-rocm-experiments/20261003-231142/build-nightly/strata"
++TABLE = "/home/zacch/strata-rocm-experiments/20261003-231142/gfx1100-hipblaslt-100500.txt"
++
++# the nightly candidate's exact serving args (serve-nightly-8082.json) - the config the
++# PR's r10 numbers and runs.json describe.
++COMMON = [
++    "--pack", "/home/zacch/projects/strata-amd/packs/iq3_s",
++    "--native", "/home/zacch/models/flash-next-iq3s/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
++    "--ple-gguf", "/home/zacch/models/flash-next-iq3s/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
++    "--mtp", "/mnt/LINUXWINSHARE/Backup/models/mtp/rt",
++    "--expert-profile", "/home/zacch/projects/strata-amd/Strata/data/expert-profile.bin",
++    "--expert-cache", "auto", "--spec", "3",
++    "--kv", "int8", "--kv-resident", "32768", "--prefill", "8192",
++    # without an explicit reserve the cache auto-sizes against ~all free VRAM and the later
++    # cublasCreate fails ALLOC (cell 1 of run 5: engine fully loaded, then status 2).  3072
++    # matches serve-nightly-8082.json exactly.
++    "--vram-reserve-mib", "3072",
++]
++ARM_ENV = {
++    "nightly-100500": {"STRATA_HIPBLASLT_TUNING": TABLE},
++    "nightly-notable": {},
++}
++BASE_ENV = {
++    "LD_LIBRARY_PATH": f"{SDK}/lib",
++    "STRATA_PREFILL_RING": "96",
++    "STRATA_GR_V3": "1",
++    "STRATA_SELECT_WMMA": "1",
++    "STRATA_PREFILL_TIMING": "1",
++    "HIP_VISIBLE_DEVICES": "0",
++    "HOME": "/home/zacch",
++}
++
++TOKENS = "/home/zacch/projects/strata-amd/artifacts/rocm/workloads/qsa-profile-%d.tokens"
++PLAN = [
++    # (arm, tier, prompt tokens, token file, --max-context)
++    ("nightly-100500", "1k",   1024,   TOKENS % 1024,   9216),
++    ("nightly-100500", "128k", 131072, TOKENS % 131072, 139264),
++    ("nightly-notable", "128k", 131072, TOKENS % 131072, 139264),
++]
++PER_ARM = 3          # clean cells per (arm, tier); the 1k sanity tier needs only 1
++SANITY = {("nightly-100500", "1k")}
++STALL_FRAC = 0.4
++
++PRE_RE = re.compile(r"prefill timing: (\d+) tokens, GPU timeline ([\d.]+) ms, wall ([\d.]+) ms")
++DEC_RE = re.compile(r"decode\s+(\d+) tokens? in ([\d.]+)\s*(ms|s)\s*->\s*([\d.]+) tok/s", re.I)
++SPEC_RE = re.compile(r"spec accept[^%]*?([\d.]+)%")
++TTFT_RE = re.compile(r"ttft[^0-9]*([\d.]+)\s*s", re.I)
++LT_ENABLED_RE = re.compile(r"hipBLASLt tuning enabled \((\d+) rows, (\S+), version (\d+)\)")
++LT_REFUSED_RE = re.compile(r"prefill gemm: (.*mismatch.*|.*cannot open.*|.*invalid.*); using hipBLASEx")
++
++
++def mem_available_gb():
++    for line in open("/proc/meminfo"):
++        if line.startswith("MemAvailable:"):
++            return int(line.split()[1]) / 1e6
++    return 0.0
++
++
++def stale_engine_holders():
++    out = subprocess.run(["ps", "-eo", "pid,cmd"], capture_output=True, text=True).stdout
++    hits = []
++    for l in out.splitlines():
++        if ("build-nightly/strata" in l or "build-hip" in l and "/strata" in l) \
++                and "ps -eo" not in l and "appimage" not in l.lower():
++            hits.append(l.strip())
++    return hits
++
++
++def vram_used_mib():
++    try:
++        return int(open("/sys/class/drm/card1/device/mem_info_vram_used").read()) // 1048576
++    except OSError:
++        return 0
++
++
++def wait_headroom(need_gb=58, timeout_s=1800):
++    # 58 GB RAM + < 2600 MiB VRAM, not the campaigns' 66/70-RAM-only gate: those assumed the
++    # 51 GB-resident 8081 co-running and nothing else touching VRAM.  The resident is stopped
++    # for this run; the desktop is protected by the per-cell MemoryMax/MemoryHigh scope.
++    # VRAM must be gated per cell because a previous cell's pages drain asynchronously
++    # (a shrunken expert cache silently poisons every later cell otherwise), and RAM because
++    # this engine refuses rc=1 below its own startup demand.
++    t0 = time.time()
++    while time.time() - t0 < timeout_s:
++        if mem_available_gb() >= need_gb and vram_used_mib() < 2600:
++            return True
++        time.sleep(10)
++    return False
++
++
++def run_cell(arm, tier, tokfile, ctx, seq):
++    """One one-shot generate inside a MemoryMax scope; returns the parsed cell dict."""
++    log_path = f"{LOGDIR}/t1005-raw-{arm}-{tier}-{seq}.log"
++    env = dict(BASE_ENV)
++    env.update(ARM_ENV[arm])
++    envstr = " ".join(f"{k}={json.dumps(str(v))}" if "(" in str(v) or " " in str(v) else f"{k}={v}"
++                      for k, v in env.items())
++    cmd = (" ".join(["--tokens-file", tokfile, "--max-new", "256", "--max-context", str(ctx)] + COMMON))
++    unit = f"t1005-{seq}"
++    # --wait is load-bearing: without it systemd-run only SUBMITS the unit (rc 0, no engine
++    # output in our log - cell 1 of the first run proved it).  --pipe is equally load-bearing:
++    # without it the unit's stdout/stderr go to the journal and a failed cell's error is
++    # invisible (cell 1 of the third run: rc=1 with only systemd's summary in the log).
++    scope = ["systemd-run", "--user", "--collect", "--wait", "--pipe", f"--unit={unit}",
++             "-p", "MemoryMax=66G", "-p", "MemoryHigh=61G", "-p", "Restart=no",
++             "/usr/sbin/bash", "-c",
++             f"cd /home/zacch/projects/strata-amd && exec env {envstr} {EXE} {cmd}"]
++    with open(log_path, "w") as lf:
++        t0 = time.time()
++        p = subprocess.run(scope, stdout=lf, stderr=subprocess.STDOUT, timeout=3600)
++        wall = time.time() - t0
++    out = open(log_path, errors="replace").read()
++    cell = {"arm": arm, "tier": tier, "exit": p.returncode, "wall_s": round(wall, 1),
++            "raw_log": log_path,
++            "conditions": {"loadavg": open("/proc/loadavg").read().split()[:3],
++                           "mem_available_gb": round(mem_available_gb(), 1)}}
++    m = LT_ENABLED_RE.search(out)
++    if m:
++        cell["lt_table"] = {"rows": int(m.group(1)), "arch": m.group(2), "version": int(m.group(3))}
++    else:
++        r = LT_REFUSED_RE.search(out)
++        cell["lt_table"] = {"engaged": False, "refusal": r.group(1) if r else "no tuning line found"}
++    m = PRE_RE.search(out)
++    if m:
++        cell["prompt_tokens"] = int(m.group(1))
++        gpu_s = float(m.group(2)) / 1000.0
++        cell["prefill_gpu_s"] = round(gpu_s, 4)
++        cell["prefill_tok_s"] = round(cell["prompt_tokens"] / gpu_s, 2) if gpu_s else None
++    m = DEC_RE.search(out)
++    if m:
++        cell["decoded"] = int(m.group(1))
++        cell["decode_wall_s"] = round(float(m.group(2)) / (1000.0 if m.group(3).lower() == "ms" else 1.0), 3)
++        cell["decode_tok_s"] = round(float(m.group(4)), 2)
++    m = SPEC_RE.search(out)
++    if m:
++        cell["spec_accept"] = round(float(m.group(1)) / 100.0, 3)
++    m = TTFT_RE.search(out)
++    if m:
++        cell["ttft_s"] = round(float(m.group(1)), 2)
++    return cell
++
++
++def median(xs):
++    xs = sorted(xs)
++    n = len(xs)
++    return None if not n else xs[n // 2] if n % 2 else round((xs[n // 2 - 1] + xs[n // 2]) / 2, 2)
++
++
++def main():
++    if not os.path.exists(TABLE):
++        sys.exit(f"table missing: {TABLE} - tune it first (see record-hipblaslt-100500)")
++    state = {"record": "hipblaslt-100500-unconfound", "at": TS,
++             "pr": "https://github.com/Niko1221/Strata/pull/745",
++             "method": ("rates_amd.py methodology on the PR #745 nightly candidate (ROCm 10.2 "
++                        "nightly SDK + rocWMMA, spec 3): one-shot strata generate, greedy, 256 "
++                        "generated tokens; prefill_tok_s = prompt_tokens / GPU_timeline_s; median "
++                        "of 3 clean cells per arm (STALL_FRAC=0.4 flagging, flagged cells never "
++                        "published); arms differ ONLY in STRATA_HIPBLASLT_TUNING "
++                        "(gfx1100-hipblaslt-100500.txt tuned on this host vs unset)."),
++             "engine": EXE, "sdk": SDK, "table": TABLE, "table_provenance": {
++                 "tuner": "/home/zacch/projects/strata/build-hip-0138/tune_hipblaslt under "
++                          "LD_LIBRARY_PATH=<sdk>/lib",
++                 "shapes": "artifacts/rocm/tables/hipblaslt-shapes-canon.json (16 shapes x "
++                           "{4096,8192} buckets, union of shipped gfx1100 tables + upstream "
++                           "gfx1201-100500 set)",
++                 "tuner_log": "artifacts/rocm/logs/tune-hipblaslt-100500.log"},
++             "cells": [], "verdict": None}
++    if os.path.exists(OUT):
++        state["cells"] = json.load(open(OUT)).get("cells", [])
++
++    def clean_cells(arm, tier):
++        cs = [c for c in state["cells"] if c["arm"] == arm and c["tier"] == tier
++              and c["exit"] == 0 and c.get("decode_tok_s") and c.get("prefill_tok_s")
++              and not c.get("stall_flag")]
++        return cs
++
++    def flag_stalls():
++        for arm, tier, _, _, _ in PLAN:
++            need = 1 if (arm, tier) in SANITY else PER_ARM
++            cs = [c for c in state["cells"] if c["arm"] == arm and c["tier"] == tier
++                  and c["exit"] == 0 and c.get("decode_tok_s") and c.get("prefill_tok_s")]
++            bd = max((c["decode_tok_s"] for c in cs), default=0.0)
++            bp = max((c["prefill_tok_s"] for c in cs), default=0.0)
++            for c in cs:
++                d = bool(bd and c["decode_tok_s"] < STALL_FRAC * bd)
++                pp = bool(bp and c["prefill_tok_s"] < STALL_FRAC * bp)
++                c["stall_flag"] = bool(d or pp)
++                c["stall_why"] = "decode" if d and pp else "prefill" if pp else "decode" if d else ""
++
++    seq = len(state["cells"])
++    consecutive_fail = 0
++    for arm, tier, _, tokfile, ctx in PLAN:
++        while len(clean_cells(arm, tier)) < (1 if (arm, tier) in SANITY else PER_ARM):
++            if consecutive_fail >= 3:
++                state["verdict"] = "aborted: 3 consecutive cell failures"
++                break
++            if not wait_headroom():
++                state["verdict"] = "incomplete: MemAvailable gate timed out"
++                break
++            stale = stale_engine_holders()
++            if stale:
++                print("stale engine holders, waiting:", stale, flush=True)
++                time.sleep(20)
++                continue
++            flag_stalls()
++            seq += 1
++            print(f"cell {seq}: {arm} {tier} (vram={vram_used_mib()}MiB "
++                  f"avail={mem_available_gb():.0f}GB) ...", flush=True)
++            cell = run_cell(arm, tier, tokfile, ctx, seq)
++            state["cells"].append(cell)
++            flag_stalls()
++            json.dump(state, open(OUT, "w"), indent=1)
++            print(f"  rc={cell['exit']} lt={cell['lt_table']} prefill={cell.get('prefill_tok_s')} "
++                  f"decode={cell.get('decode_tok_s')}", flush=True)
++            consecutive_fail = consecutive_fail + 1 if (cell["exit"] != 0 or
++                                                        not cell.get("decode_tok_s")) else 0
++        else:
++            continue
++        break
++
++    # verdict: medians per arm at 128k, table effect on the nightly stack
++    flag_stalls()
++    verdict = {"128k": {}, "1k_sanity": None}
++    for arm in ARM_ENV:
++        cs = clean_cells(arm, "128k")
++        if cs:
++            verdict["128k"][arm] = {
++                "n": len(cs),
++                "prefill_tok_s_median": median([c["prefill_tok_s"] for c in cs]),
++                "prefill_range": [min(c["prefill_tok_s"] for c in cs), max(c["prefill_tok_s"] for c in cs)],
++                "decode_tok_s_median": median([c["decode_tok_s"] for c in cs]),
++                "decode_range": [min(c["decode_tok_s"] for c in cs), max(c["decode_tok_s"] for c in cs)],
++            }
++    sanity = clean_cells("nightly-100500", "1k")
++    if sanity:
++        verdict["1k_sanity"] = {"decode_tok_s": sanity[0]["decode_tok_s"],
++                                "prefill_tok_s": sanity[0]["prefill_tok_s"]}
++    a, b = verdict["128k"].get("nightly-100500"), verdict["128k"].get("nightly-notable")
++    if a and b and a["prefill_tok_s_median"] and b["prefill_tok_s_median"]:
++        verdict["prefill_table_effect_pct"] = round(
++            100.0 * (a["prefill_tok_s_median"] / b["prefill_tok_s_median"] - 1.0), 2)
++        verdict["conclusion"] = (
++            "prefill gain from the 100500 table on the nightly stack; the T4 r10 deficit was the "
++            "table-version fallback" if verdict["prefill_table_effect_pct"] > 10.0 else
++            "prefill NOT recovered by the table - the T4 r10 deficit is NOT purely the "
++            "table-version effect; report as measured")
++    state["verdict"] = verdict
++    json.dump(state, open(OUT, "w"), indent=1)
++    print(json.dumps(verdict, indent=1), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/gfx1100-hipblaslt-100500.txt b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/gfx1100-hipblaslt-100500.txt
+new file mode 100644
+index 0000000000..ae842daf4d
+--- /dev/null
++++ b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/gfx1100-hipblaslt-100500.txt
+@@ -0,0 +1,34 @@
++# solution IDs are scoped to this hipBLASLt version and device architecture
++STRATA_HIPBLASLT_TUNING_V1 gfx1100 100500
++bf16 1 2560 1 4096 1035
++bf16 1 2560 1 8192 1035
++bf16 4 10240 4 4096 1035
++bf16 4 10240 4 8192 1034
++bf16 48 2560 96 4096 1035
++bf16 48 2560 96 8192 1036
++bf16 128 2560 128 4096 1036
++bf16 128 2560 128 8192 1036
++bf16 320 10240 320 4096 1036
++bf16 320 10240 320 8192 1036
++bf16 512 2560 512 4096 1036
++bf16 512 2560 512 8192 1036
++bf16 2560 2560 2560 4096 1036
++bf16 2560 2560 2560 8192 1036
++bf16 10240 320 10240 4096 1036
++bf16 10240 320 10240 8192 1036
++f16 512 2560 512 4096 2106
++f16 512 2560 512 8192 2106
++f16 640 2560 640 4096 2106
++f16 640 2560 640 8192 2106
++f16 2560 640 2560 4096 2106
++f16 2560 640 2560 8192 2106
++f16 2560 6144 2560 4096 2106
++f16 2560 6144 2560 8192 2106
++f16 6144 2560 6144 4096 2106
++f16 6144 2560 6144 8192 2106
++f16 10240 2560 10240 4096 2106
++f16 10240 2560 10240 8192 2106
++f16 12288 2560 12288 4096 2106
++f16 12288 2560 12288 8192 2106
++bf16 10240 2560 10240 4096 1036
++bf16 10240 2560 10240 8192 1036
+diff --git a/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/runs.json b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/runs.json
+new file mode 100644
+index 0000000000..87819f8595
+--- /dev/null
++++ b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/runs.json
+@@ -0,0 +1,232 @@
++{
++ "what": "per-run data for the gfx1100 hipBLASLt 100500 table A/B on the ROCm 10.2 nightly (PR #745 follow-up)",
++ "fields": {
++  "arm": "nightly-100500 = STRATA_HIPBLASLT_TUNING pointed at gfx1100-hipblaslt-100500.txt; nightly-notable = the variable unset (the parent folder's nightly condition)",
++  "tier": "prompt workload: qsa-profile-1024 / qsa-profile-131072 token files (code-agent prompts), one-shot strata generate, greedy, --max-new 256",
++  "exit": "engine process exit code (0 = completed all 256 tokens)",
++  "prompt_tokens": "actual prompt tokens from the engine's 'prefill timing:' line",
++  "prefill_gpu_s": "GPU timeline seconds for prefill (same line); prefill_tok_s = prompt_tokens / prefill_gpu_s",
++  "decoded": "tokens actually generated (256 cap; none ended early)",
++  "decode_tok_s": "from the engine's own decode summary line ('decode N tokens in X ms -> Y tok/s'), not derived from wall time",
++  "lt_table": "what the engine logged at prefill init: rows/arch/version when the table engaged, or the fallback condition",
++  "wall_s": "whole one-shot run incl. engine load (~25 s), prefill and decode",
++  "conditions": "system load and MemAvailable at request time",
++  "stall_rule": "cells below 40% of the arm's best observed rate in either phase would be flagged and excluded from medians; no cell was flagged (all 7 clean)"
++ },
++ "cells": [
++  {
++   "arm": "nightly-100500",
++   "tier": "1k",
++   "exit": 0,
++   "prompt_tokens": 1023,
++   "prefill_gpu_s": 1.584,
++   "prefill_tok_s": 645.83,
++   "decoded": 256,
++   "decode_wall_s": 3.69,
++   "decode_tok_s": 69.38,
++   "wall_s": 29.4,
++   "lt_table": {
++    "rows": 32,
++    "arch": "gfx1100",
++    "version": 100500
++   },
++   "conditions": {
++    "loadavg": [
++     "3.65",
++     "2.71",
++     "1.85"
++    ],
++    "mem_available_gb": 65.3
++   }
++  },
++  {
++   "arm": "nightly-100500",
++   "tier": "128k",
++   "exit": 0,
++   "prompt_tokens": 131071,
++   "prefill_gpu_s": 77.694,
++   "prefill_tok_s": 1687.02,
++   "decoded": 256,
++   "decode_wall_s": 4.117,
++   "decode_tok_s": 62.19,
++   "wall_s": 107.8,
++   "lt_table": {
++    "rows": 32,
++    "arch": "gfx1100",
++    "version": 100500
++   },
++   "conditions": {
++    "loadavg": [
++     "6.32",
++     "3.98",
++     "2.41"
++    ],
++    "mem_available_gb": 66.0
++   }
++  },
++  {
++   "arm": "nightly-100500",
++   "tier": "128k",
++   "exit": 0,
++   "prompt_tokens": 131071,
++   "prefill_gpu_s": 77.372,
++   "prefill_tok_s": 1694.04,
++   "decoded": 256,
++   "decode_wall_s": 4.102,
++   "decode_tok_s": 62.41,
++   "wall_s": 107.2,
++   "lt_table": {
++    "rows": 32,
++    "arch": "gfx1100",
++    "version": 100500
++   },
++   "conditions": {
++    "loadavg": [
++     "4.07",
++     "3.83",
++     "2.52"
++    ],
++    "mem_available_gb": 66.0
++   }
++  },
++  {
++   "arm": "nightly-100500",
++   "tier": "128k",
++   "exit": 0,
++   "prompt_tokens": 131071,
++   "prefill_gpu_s": 78.038,
++   "prefill_tok_s": 1679.58,
++   "decoded": 256,
++   "decode_wall_s": 4.112,
++   "decode_tok_s": 62.26,
++   "wall_s": 106.9,
++   "lt_table": {
++    "rows": 32,
++    "arch": "gfx1100",
++    "version": 100500
++   },
++   "conditions": {
++    "loadavg": [
++     "6.23",
++     "4.96",
++     "3.09"
++    ],
++    "mem_available_gb": 66.0
++   }
++  },
++  {
++   "arm": "nightly-notable",
++   "tier": "128k",
++   "exit": 0,
++   "prompt_tokens": 131071,
++   "prefill_gpu_s": 142.876,
++   "prefill_tok_s": 917.38,
++   "decoded": 256,
++   "decode_wall_s": 4.218,
++   "decode_tok_s": 60.69,
++   "wall_s": 171.4,
++   "lt_table": {
++    "engaged": false,
++    "refusal": "no tuning line found"
++   },
++   "conditions": {
++    "loadavg": [
++     "4.85",
++     "4.95",
++     "3.40"
++    ],
++    "mem_available_gb": 66.0
++   }
++  },
++  {
++   "arm": "nightly-notable",
++   "tier": "128k",
++   "exit": 0,
++   "prompt_tokens": 131071,
++   "prefill_gpu_s": 141.528,
++   "prefill_tok_s": 926.11,
++   "decoded": 256,
++   "decode_wall_s": 4.635,
++   "decode_tok_s": 55.24,
++   "wall_s": 171.7,
++   "lt_table": {
++    "engaged": false,
++    "refusal": "no tuning line found"
++   },
++   "conditions": {
++    "loadavg": [
++     "3.39",
++     "4.36",
++     "3.45"
++    ],
++    "mem_available_gb": 66.2
++   }
++  },
++  {
++   "arm": "nightly-notable",
++   "tier": "128k",
++   "exit": 0,
++   "prompt_tokens": 131071,
++   "prefill_gpu_s": 141.517,
++   "prefill_tok_s": 926.19,
++   "decoded": 256,
++   "decode_wall_s": 4.195,
++   "decode_tok_s": 61.02,
++   "wall_s": 170.2,
++   "lt_table": {
++    "engaged": false,
++    "refusal": "no tuning line found"
++   },
++   "conditions": {
++    "loadavg": [
++     "3.76",
++     "4.41",
++     "3.65"
++    ],
++    "mem_available_gb": 66.2
++   }
++  }
++ ],
++ "raw_logs": [
++  "t1005-raw-nightly-100500-1k-1.log",
++  "t1005-raw-nightly-100500-128k-2.log",
++  "t1005-raw-nightly-100500-128k-3.log",
++  "t1005-raw-nightly-100500-128k-4.log",
++  "t1005-raw-nightly-notable-128k-5.log",
++  "t1005-raw-nightly-notable-128k-6.log",
++  "t1005-raw-nightly-notable-128k-7.log"
++ ],
++ "medians": {
++  "nightly-100500": {
++   "n": 3,
++   "prefill_tok_s_median": 1687.02,
++   "prefill_range": [
++    1679.58,
++    1694.04
++   ],
++   "decode_tok_s_median": 62.26,
++   "decode_range": [
++    62.19,
++    62.41
++   ]
++  },
++  "nightly-notable": {
++   "n": 3,
++   "prefill_tok_s_median": 926.11,
++   "prefill_range": [
++    917.38,
++    926.19
++   ],
++   "decode_tok_s_median": 60.69,
++   "decode_range": [
++    55.24,
++    61.02
++   ]
++  }
++ },
++ "sanity_1k": {
++  "decode_tok_s": 69.38,
++  "prefill_tok_s": 645.83
++ },
++ "ttft": "not available: the one-shot generate path does not print a TTFT line (serve path only)"
++}
+\ No newline at end of file
+diff --git a/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/shapes-canon.json b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/shapes-canon.json
+new file mode 100644
+index 0000000000..e6107cc9f9
+--- /dev/null
++++ b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/shapes-canon.json
+@@ -0,0 +1,98 @@
++[
++ {
++  "dtype": "bf16",
++  "N": 1,
++  "K": 2560,
++  "ldy": 1
++ },
++ {
++  "dtype": "bf16",
++  "N": 4,
++  "K": 10240,
++  "ldy": 4
++ },
++ {
++  "dtype": "bf16",
++  "N": 48,
++  "K": 2560,
++  "ldy": 96
++ },
++ {
++  "dtype": "bf16",
++  "N": 128,
++  "K": 2560,
++  "ldy": 128
++ },
++ {
++  "dtype": "bf16",
++  "N": 320,
++  "K": 10240,
++  "ldy": 320
++ },
++ {
++  "dtype": "bf16",
++  "N": 512,
++  "K": 2560,
++  "ldy": 512
++ },
++ {
++  "dtype": "bf16",
++  "N": 2560,
++  "K": 2560,
++  "ldy": 2560
++ },
++ {
++  "dtype": "bf16",
++  "N": 10240,
++  "K": 320,
++  "ldy": 10240
++ },
++ {
++  "dtype": "f16",
++  "N": 512,
++  "K": 2560,
++  "ldy": 512
++ },
++ {
++  "dtype": "f16",
++  "N": 640,
++  "K": 2560,
++  "ldy": 640
++ },
++ {
++  "dtype": "f16",
++  "N": 2560,
++  "K": 640,
++  "ldy": 2560
++ },
++ {
++  "dtype": "f16",
++  "N": 2560,
++  "K": 6144,
++  "ldy": 2560
++ },
++ {
++  "dtype": "f16",
++  "N": 6144,
++  "K": 2560,
++  "ldy": 6144
++ },
++ {
++  "dtype": "f16",
++  "N": 10240,
++  "K": 2560,
++  "ldy": 10240
++ },
++ {
++  "dtype": "f16",
++  "N": 12288,
++  "K": 2560,
++  "ldy": 12288
++ },
++ {
++  "dtype": "bf16",
++  "N": 10240,
++  "K": 2560,
++  "ldy": 10240
++ }
++]
+diff --git a/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/tune-command.txt b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/tune-command.txt
+new file mode 100644
+index 0000000000..f47db659b9
+--- /dev/null
++++ b/bench/results/2026-10-04-community-rx7900xtx-hipblaslt-100500/tune-command.txt
+@@ -0,0 +1,18 @@
++# Reproduce the gfx1100 hipBLASLt 100500 tuning table
++
++# Tuner binary: preserved from the 0.1.38-lineage build (same tree as the nightly
++# candidate; rebuildable from the fork source with `cmake --build <bld> --target tune_hipblaslt`).
++# It links hipBLASLt dynamically, so pointing
++# LD_LIBRARY_PATH at the ROCm 10.2 nightly SDK's lib makes it tune and stamp
++# the table for THAT library (hipblasLtGetVersion() is queried at run time).
++SDK=/home/zacch/strata-rocm-experiments/20261003-231142/sdk
++LD_LIBRARY_PATH=$SDK/lib /home/zacch/strata-rocm-experiments/20261003-231142/tune_hipblaslt \
++  --shapes-file shapes-canon.json \
++  --tokens 4096,8192 \
++  --workspace-mib 32 \
++  --tuning-out gfx1100-hipblaslt-100500.txt
++
++# meta line to expect: device_arch=gfx1100 hipblaslt_version=100500
++# 32 cases (16 shapes x {4096,8192} token buckets), every candidate
++# correctness-gated by the tuner (rel-L2 1e-4 / max-abs 1e-2, padding canary);
++# each table row is its case's measured best.  ~1 GB VRAM, a few minutes.

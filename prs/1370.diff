@@ -1,0 +1,480 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 10728a4809..063a7fd922 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -766,6 +766,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_executable(gemm_bf16_parity src/prefill/gemm_bf16_parity.cu)
+     target_link_libraries(gemm_bf16_parity PRIVATE strata_prefill )
+     add_test(NAME gemm_bf16_parity COMMAND gemm_bf16_parity)
++    # the hyper-connection read's fused up projection + mix (gr_upmix, STRATA_HC_UPMIX) against cuBLAS + gr_mix_r,
++    # bitwise where cuBLAS sums K in the same order, else within FP32 rounding and as close to FP64 (GPU, synthetic,
++    # no model; --bench adds timings)
++    add_executable(gr_upmix_parity src/prefill/gr_upmix_parity.cu)
++    target_link_libraries(gr_upmix_parity PRIVATE strata_prefill )
++    add_test(NAME gr_upmix_parity COMMAND gr_upmix_parity)
+   endif()
+   # native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the launches before them (GPU, synthetic,
+   # no model; --bench adds v1/new timings of a window's 48 calls in a graph)
+diff --git a/include/strata/prefill/kernels.hpp b/include/strata/prefill/kernels.hpp
+index f7a058c1a6..fc570d7d1d 100644
+--- a/include/strata/prefill/kernels.hpp
++++ b/include/strata/prefill/kernels.hpp
+@@ -26,7 +26,7 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
+ /// F-2: gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just written - the same bits as
+ /// the two calls, without reading R back.
+ /// S23 (opt-in STRATA_HC_UPMIX=1): the up projection (lo16 x w_up^T, BF16, FP32 accumulate) with gr_mix_r as its
+-/// epilogue - `gated` is never written.  False (nothing launched) off gfx11.
++/// epilogue - `gated` is never written.  gfx11 and CUDA sm_80+; false (nothing launched) elsewhere.
+ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
+               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream);
+ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
+diff --git a/src/prefill/gr_upmix_parity.cu b/src/prefill/gr_upmix_parity.cu
+new file mode 100644
+index 0000000000..0c3975ca2b
+--- /dev/null
++++ b/src/prefill/gr_upmix_parity.cu
+@@ -0,0 +1,229 @@
++// src/prefill/gr_upmix_parity.cu - the hyper-connection read's fused up projection + mix (gr_upmix, STRATA_HC_UPMIX=1)
++// against the default pair (Gemm::bf16 - cuBLAS - writing `gated`, then gr_mix_r), on synthetic inputs of the model's
++// shapes (N = 2560, 4 streams, K = 320).  Where cuBLAS's kernel sums K in the fused kernel's order the outputs are the
++// same bits (CUDA 13.3 on an RTX 5090 from 33 tokens - the prompt path's default there); elsewhere FP32 rounding: the
++// check bounds max |diff| / max |value| of `mixed`, counts the BF16 / FP16 images that differ, and measures both
++// against an FP64 reference on sampled tokens (the fused one must be as close to it as cuBLAS).
++//   gr_upmix_parity            the checks (T = 1 .. 32768)
++//   gr_upmix_parity --bench    and the timings of the pair and the fused kernel at T = 2048 / 8192 / 32768
++#include "strata/prefill/gemm.hpp"
++#include "strata/prefill/kernels.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++namespace {
++
++constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
++
++uint16_t to_bf16(float f) {
++    uint32_t u;
++    std::memcpy(&u, &f, 4);
++    u += 0x7fffu + ((u >> 16) & 1u);
++    return (uint16_t) (u >> 16);
++}
++float from_bf16(uint16_t h) {
++    const uint32_t u = (uint32_t) h << 16;
++    float f;
++    std::memcpy(&f, &u, 4);
++    return f;
++}
++bool ck(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) std::printf("FAIL: %s: %s\n", what, cudaGetErrorString(e));
++    return e == cudaSuccess;
++}
++template <typename T> T* dalloc(size_t n) {
++    T* p = nullptr;
++    if (!ck(cudaMalloc(&p, n * sizeof(T)), "cudaMalloc")) std::exit(2);
++    return p;
++}
++
++struct Inputs {
++    int64_t T;
++    std::vector<uint16_t> lo16, wu;
++    std::vector<float> R, rs, w;
++    uint16_t *d_lo16, *d_wu;
++    float *d_R, *d_rs, *d_w;
++    Inputs(int64_t t, uint32_t seed) : T(t) {
++        std::mt19937 g(seed);
++        std::normal_distribution<float> nd(0.0f, 1.0f);
++        lo16.resize((size_t) T * LR);
++        for (auto& x : lo16) x = to_bf16(nd(g) * 0.5f);            // silu outputs: O(1) and below
++        wu.resize((size_t) D * LR);
++        for (auto& x : wu) x = to_bf16(nd(g) * 0.12f);              // gated ~ N(0, ~1): sigmoid in its live range
++        R.resize((size_t) T * D);
++        for (auto& x : R) x = nd(g) * 3.0f;
++        rs.resize((size_t) T * HC);
++        for (auto& x : rs) x = 0.2f + 0.3f * std::fabs(nd(g));
++        w.resize(D);
++        for (auto& x : w) x = 1.0f + 0.1f * nd(g);
++        d_lo16 = dalloc<uint16_t>(lo16.size());
++        d_wu = dalloc<uint16_t>(wu.size());
++        d_R = dalloc<float>(R.size());
++        d_rs = dalloc<float>(rs.size());
++        d_w = dalloc<float>(w.size());
++        cudaMemcpy(d_lo16, lo16.data(), lo16.size() * 2, cudaMemcpyHostToDevice);
++        cudaMemcpy(d_wu, wu.data(), wu.size() * 2, cudaMemcpyHostToDevice);
++        cudaMemcpy(d_R, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
++        cudaMemcpy(d_rs, rs.data(), rs.size() * 4, cudaMemcpyHostToDevice);
++        cudaMemcpy(d_w, w.data(), w.size() * 4, cudaMemcpyHostToDevice);
++    }
++    ~Inputs() { cudaFree(d_lo16); cudaFree(d_wu); cudaFree(d_R); cudaFree(d_rs); cudaFree(d_w); }
++};
++
++struct Outputs {
++    float* mixed;
++    uint16_t *bf, *h;
++    explicit Outputs(int64_t T) {
++        mixed = dalloc<float>((size_t) T * N);
++        bf = dalloc<uint16_t>((size_t) T * N);
++        h = dalloc<uint16_t>((size_t) T * N);
++    }
++    ~Outputs() { cudaFree(mixed); cudaFree(bf); cudaFree(h); }
++};
++
++// mixed[t][d] in FP64 from the same BF16 inputs (the exact result both GPU paths round)
++double exact_mixed(const Inputs& in, int64_t t, int d) {
++    double s = 0.0;
++    for (int c = 0; c < HC; ++c) {
++        double g = 0.0;
++        const int j = c * N + d;
++        for (int k = 0; k < LR; ++k)
++            g += (double) from_bf16(in.lo16[(size_t) t * LR + k]) * (double) from_bf16(in.wu[(size_t) j * LR + k]);
++        const double x = (double) in.R[(size_t) t * D + j] * in.rs[(size_t) t * HC + c] * in.w[j];
++        s += x / (1.0 + std::exp(-g));
++    }
++    return s / HC;
++}
++
++int check(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T, uint32_t seed) {
++    Inputs in(T, seed);
++    Outputs ref(T), got(T);
++    gm.bf16(in.d_lo16, in.d_wu, gated, T, D, LR);
++    strata::prefill::gr_mix_r(in.d_R, in.d_rs, in.d_w, gated, ref.mixed, ref.bf, T, st, ref.h);
++    if (!strata::prefill::gr_upmix(in.d_lo16, in.d_wu, in.d_R, in.d_rs, in.d_w, got.mixed, got.bf, got.h, T, st)) {
++        std::printf("FAIL T=%lld: gr_upmix refused (needs CUDA sm_80+)\n", (long long) T);
++        return 1;
++    }
++    if (!ck(cudaStreamSynchronize(st), "run")) return 1;
++    const size_t n = (size_t) T * N;
++    std::vector<float> a(n), b(n);
++    std::vector<uint16_t> abf(n), bbf(n), ah(n), bh(n);
++    cudaMemcpy(a.data(), ref.mixed, n * 4, cudaMemcpyDeviceToHost);
++    cudaMemcpy(b.data(), got.mixed, n * 4, cudaMemcpyDeviceToHost);
++    cudaMemcpy(abf.data(), ref.bf, n * 2, cudaMemcpyDeviceToHost);
++    cudaMemcpy(bbf.data(), got.bf, n * 2, cudaMemcpyDeviceToHost);
++    cudaMemcpy(ah.data(), ref.h, n * 2, cudaMemcpyDeviceToHost);
++    cudaMemcpy(bh.data(), got.h, n * 2, cudaMemcpyDeviceToHost);
++    double md = 0, mv = 0;
++    size_t bf_diff = 0, h_diff = 0, bit_diff = 0, nonfinite = 0;
++    for (size_t i = 0; i < n; ++i) {
++        if (!std::isfinite(b[i])) ++nonfinite;
++        md = std::max(md, (double) std::fabs(a[i] - b[i]));
++        mv = std::max(mv, (double) std::fabs(a[i]));
++        bf_diff += abf[i] != bbf[i];
++        h_diff += ah[i] != bh[i];
++        bit_diff += std::memcmp(&a[i], &b[i], 4) != 0;
++    }
++    // FP64 on sampled tokens: each path's max |error| / max |value|
++    std::mt19937 g(seed ^ 0x5a5a);
++    const int samples = (int) std::min<int64_t>(T, 24);
++    double ea = 0, eb = 0, ev = 0;
++    for (int i = 0; i < samples; ++i) {
++        const int64_t t = T <= 24 ? i : (int64_t) (g() % (uint32_t) T);
++        for (int d = 0; d < N; d += 37) {
++            const double x = exact_mixed(in, t, d);
++            ea = std::max(ea, std::fabs(a[(size_t) t * N + d] - x));
++            eb = std::max(eb, std::fabs(b[(size_t) t * N + d] - x));
++            ev = std::max(ev, std::fabs(x));
++        }
++    }
++    const double rel = md / std::max(mv, 1e-30);
++    const bool bad = nonfinite != 0 || rel > 1e-5 || eb > 2.0 * ea + 1e-6 * ev;
++    std::printf("%s T=%-6lld %s mixed max |diff| / max |value| %.2e, BF16 / FP16 images differing %.4f%% / %.4f%%; "
++                "vs FP64 (sampled): cuBLAS + mix %.2e, fused %.2e\n", bad ? "FAIL" : "ok  ", (long long) T,
++                bit_diff == 0 && bf_diff == 0 && h_diff == 0 ? "bitwise " : "        ", rel,
++                100.0 * (double) bf_diff / (double) n, 100.0 * (double) h_diff / (double) n, ea / ev, eb / ev);
++    return bad ? 1 : 0;
++}
++
++float median(std::vector<float> v) {
++    std::sort(v.begin(), v.end());
++    return v[v.size() / 2];
++}
++
++void bench(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T) {
++    Inputs in(T, 7);
++    Outputs o(T);
++    cudaEvent_t e0, e1;
++    cudaEventCreate(&e0);
++    cudaEventCreate(&e1);
++    std::vector<float> tp, tg, tm, tf;
++    for (int i = 0; i < 23; ++i) {
++        const bool fused_first = i & 1;   // alternate which runs first
++        for (int k = 0; k < 2; ++k) {
++            if ((k == 0) == fused_first) {
++                cudaEventRecord(e0, st);
++                strata::prefill::gr_upmix(in.d_lo16, in.d_wu, in.d_R, in.d_rs, in.d_w, o.mixed, o.bf, o.h, T, st);
++                cudaEventRecord(e1, st);
++                cudaEventSynchronize(e1);
++                float ms;
++                cudaEventElapsedTime(&ms, e0, e1);
++                if (i >= 3) tf.push_back(ms);
++            } else {
++                cudaEvent_t em;
++                cudaEventCreate(&em);
++                cudaEventRecord(e0, st);
++                gm.bf16(in.d_lo16, in.d_wu, gated, T, D, LR);
++                cudaEventRecord(em, st);
++                strata::prefill::gr_mix_r(in.d_R, in.d_rs, in.d_w, gated, o.mixed, o.bf, T, st, o.h);
++                cudaEventRecord(e1, st);
++                cudaEventSynchronize(e1);
++                float ms, msg;
++                cudaEventElapsedTime(&ms, e0, e1);
++                cudaEventElapsedTime(&msg, e0, em);
++                if (i >= 3) { tp.push_back(ms); tg.push_back(msg); tm.push_back(ms - msg); }
++                cudaEventDestroy(em);
++            }
++        }
++    }
++    const float p = median(tp), f = median(tf);
++    // the fused kernel's bytes: R and the outputs (FP32 + 3 x 16-bit), lo16 and w_up once
++    const double bytes = (double) T * D * 4 + (double) T * N * (4 + 6) + (double) T * LR * 2 + (double) D * LR * 2;
++    std::printf("  T=%-6lld default pair %.3f ms (up GEMM %.3f + gr_mix_r %.3f) | fused %.3f ms: %.2fx  "
++                "(fused: %.0f GB/s of its bytes, %.0f TFLOPS of its GEMM)\n", (long long) T, p, median(tg), median(tm),
++                f, p / f, bytes / f / 1e6, 2.0 * T * D * LR / f / 1e9);
++    cudaEventDestroy(e0);
++    cudaEventDestroy(e1);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
++    cudaStream_t st = nullptr;
++    if (!ck(cudaStreamCreate(&st), "stream")) return 1;
++    strata::prefill::Gemm gm;
++    std::string err;
++    if (!gm.init(st, 0, err)) { std::printf("FAIL: %s\n", err.c_str()); return 1; }
++    const int64_t Tmax = 32768;
++    float* gated = dalloc<float>((size_t) Tmax * D);
++    int fails = 0;
++    uint32_t seed = 101;
++    for (const int64_t T : {1, 7, 16, 31, 32, 33, 48, 63, 64, 65, 96, 126, 127, 128, 129, 600, 1000, 2048, 4099, 8192, 32768}) fails += check(gm, st, gated, T, seed++);
++    if (do_bench) {
++        std::printf("--bench: the hyper-connection read's up projection + mix (medians of 20 alternating runs)\n");
++        for (const int64_t T : {2048, 8192, 32768}) bench(gm, st, gated, T);
++    }
++    cudaFree(gated);
++    std::printf("gr_upmix_parity: %d failures\n", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/src/prefill/kernels.cu b/src/prefill/kernels.cu
+index 3f14fb16d1..d2ef84398e 100644
+--- a/src/prefill/kernels.cu
++++ b/src/prefill/kernels.cu
+@@ -3,6 +3,7 @@
+ #include "strata/kernels/mrope.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/kernels/router_top10.hpp"
++#include "strata/core/emulate.hpp"
+ 
+ #include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+@@ -1442,6 +1443,138 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
+     }
+ }
+ #endif
++#if !defined(__HIPCC__)
++// S23 on CUDA (sm_80+; opt-in STRATA_HC_UPMIX=1, see hc_upmix in prefill.cpp): the hyper-connection read's up
++// projection (lo16 x w_up^T, BF16 in, FP32 accumulate over K = 320) with gr_mix_r as its epilogue, so `gated`
++// (T x 10240 FP32, 336 MB for an 8,192-token chunk) is neither written by the GEMM nor read back by the mix - gr_mix_r
++// reads R and `gated` at ~96% of the bandwidth already, so only fewer bytes make the read faster.  A block: 128 tokens
++// x 32 columns x the 4 streams (128 output columns), K staged in 32-deep slices (cp.async, double-buffered), 8 warps of
++// 32 tokens x 16 columns x 4 streams on mma.m16n8k16 (ldmatrix); a lane then holds its (token, column) pairs for all 4
++// streams, and the mix runs in registers in gr_mix_r_kernel's order (x_c = R * rs * w; s = fmaf(x_c, sigm(g_c), s);
++// s / 4) with the BF16 / FP16 images.  The epilogue's R rows are asked into L2 at the start.  With cuBLAS's up GEMM
++// summing K in the same order (CUDA 13.3 on an RTX 5090 from 33 tokens: gr_upmix_parity) `mixed` is the default pair's
++// bits.
++constexpr int UC_BM = 128, UC_BD = 32;   // tokens, columns a stream
++#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800   // cp.async, bf16 mma: the kernel is empty before sm_80
++constexpr int UC_KC = 32, UC_LD = UC_KC + 8;   // k a slice, a staged row
++__device__ __forceinline__ void uc_pf_l2(const float* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
++__device__ __forceinline__ void uc_cp16(void* s, const void* g) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(s)), "l"(g));
++}
++__device__ __forceinline__ void uc_ldm4(unsigned (&r)[4], const void* p) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"((unsigned) __cvta_generic_to_shared(p)));
++}
++__device__ __forceinline__ void uc_mma(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++#endif
++__global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* __restrict__ lo16,
++                                                              const uint16_t* __restrict__ wu,
++                                                              const float* __restrict__ R, const float* __restrict__ rs,
++                                                              const float* __restrict__ w, float* __restrict__ mixed,
++                                                              uint16_t* __restrict__ mixed16,
++                                                              uint16_t* __restrict__ mixed_h,
++                                                              int64_t T) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++    __shared__ __align__(16) uint16_t sA[2][UC_BM][UC_LD];
++    __shared__ __align__(16) uint16_t sB[2][HC * UC_BD][UC_LD];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp >> 1, wn = warp & 1;
++    // blocks column-tile fastest: the blocks in flight share a token tile (its lo16 rows stay in L2, the epilogue's R
++    // reads run along rows)
++    const int64_t t0 = (int64_t) blockIdx.y * UC_BM;
++    const int d0 = blockIdx.x * UC_BD;
++    // the epilogue's R rows (128 tokens x 4 streams x 128 bytes) asked into L2 now, so they arrive under the GEMM
++    for (int i = tid; i < UC_BM * HC; i += 256) {
++        const int64_t t = t0 + i / HC;
++        if (t < T) uc_pf_l2(R + t * D + (i % HC) * N + d0);
++    }
++    auto stage = [&](int kc, int buf) {
++        for (int i = tid; i < UC_BM * (UC_KC / 8); i += 256) {
++            const int r = i / (UC_KC / 8), q = i % (UC_KC / 8);
++            const int64_t t = t0 + r < T ? t0 + r : T - 1;   // the last tile's missing rows read a real row, unused
++            uc_cp16(&sA[buf][r][q * 8], lo16 + t * LR + kc * UC_KC + q * 8);
++        }
++        for (int i = tid; i < HC * UC_BD * (UC_KC / 8); i += 256) {
++            const int r = i / (UC_KC / 8), q = i % (UC_KC / 8);
++            uc_cp16(&sB[buf][r][q * 8], wu + ((int64_t) (r / UC_BD) * N + d0 + r % UC_BD) * LR + kc * UC_KC + q * 8);
++        }
++        asm volatile("cp.async.commit_group;\n" ::);
++    };
++    float acc[2][HC][2][4];
++#pragma unroll
++    for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++        for (int c = 0; c < HC; ++c)
++#pragma unroll
++            for (int s = 0; s < 2; ++s)
++#pragma unroll
++                for (int i = 0; i < 4; ++i) acc[mt][c][s][i] = 0.0f;
++    constexpr int NK = LR / UC_KC;
++    stage(0, 0);
++    for (int kc = 0; kc < NK; ++kc) {
++        const int buf = kc & 1;
++        if (kc + 1 < NK) {
++            stage(kc + 1, buf ^ 1);
++            asm volatile("cp.async.wait_group 1;\n" ::);
++        } else {
++            asm volatile("cp.async.wait_group 0;\n" ::);
++        }
++        __syncthreads();
++#pragma unroll
++        for (int ks = 0; ks < UC_KC / 16; ++ks) {
++            unsigned a[2][4];
++#pragma unroll
++            for (int mt = 0; mt < 2; ++mt) uc_ldm4(a[mt], &sA[buf][wm * 32 + mt * 16 + (lane & 15)][ks * 16 + (lane >> 4) * 8]);
++#pragma unroll
++            for (int c = 0; c < HC; ++c) {
++                unsigned b[4];   // b[0..1]: columns 0-7 of this warp's 16, b[2..3]: 8-15 (k 0-7, 8-15 each)
++                uc_ldm4(b, &sB[buf][c * UC_BD + wn * 16 + (lane & 7) + ((lane >> 4) << 3)][ks * 16 + ((lane >> 3) & 1) * 8]);
++#pragma unroll
++                for (int mt = 0; mt < 2; ++mt) {
++                    uc_mma(acc[mt][c][0], a[mt], b[0], b[1]);
++                    uc_mma(acc[mt][c][1], a[mt], b[2], b[3]);
++                }
++            }
++        }
++        __syncthreads();   // every read of `buf` before stage(kc + 2) refills it
++    }
++#pragma unroll
++    for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int64_t t = t0 + wm * 32 + mt * 16 + (lane >> 2) + h * 8;
++            if (t >= T) continue;
++#pragma unroll
++            for (int s = 0; s < 2; ++s) {
++                const int d = d0 + wn * 16 + s * 8 + (lane & 3) * 2;
++                float sm[2] = {0.0f, 0.0f};
++#pragma unroll
++                for (int c = 0; c < HC; ++c) {
++                    const float2 r2 = *reinterpret_cast<const float2*>(R + t * D + c * N + d);
++                    const float2 w2 = *reinterpret_cast<const float2*>(w + c * N + d);
++                    const float rsc = rs[t * HC + c];
++                    const float x0 = r2.x * rsc * w2.x, x1 = r2.y * rsc * w2.y;   // gr_mix_r_kernel's order
++                    sm[0] = fmaf(x0, sigm(acc[mt][c][s][h * 2 + 0]), sm[0]);
++                    sm[1] = fmaf(x1, sigm(acc[mt][c][s][h * 2 + 1]), sm[1]);
++                }
++                sm[0] /= (float) HC;
++                sm[1] /= (float) HC;
++                *reinterpret_cast<float2*>(mixed + t * N + d) = make_float2(sm[0], sm[1]);
++                if (mixed16)
++                    *reinterpret_cast<uint32_t*>(mixed16 + t * N + d) =
++                        (uint32_t) act16(sm[0]) | ((uint32_t) act16(sm[1]) << 16);
++                if (mixed_h)
++                    *reinterpret_cast<uint32_t*>(mixed_h + t * N + d) = (uint32_t) hf(sm[0]) | ((uint32_t) hf(sm[1]) << 16);
++            }
++        }
++#endif
++}
++#endif
+ }  // namespace
+ 
+ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
+@@ -1513,9 +1646,20 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const
+     check("gr_upmix");
+     return true;
+ #else
+-    (void) lo16; (void) w_up; (void) R; (void) rs; (void) w_norm; (void) mixed; (void) mixed16; (void) mixed_h;
+-    (void) T; (void) stream;
+-    return false;
++    static int ok_dev[64] = {};   // per device: 0 not asked yet, 1 sm_80+, 2 no
++    int dev = 0;
++    if (T <= 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
++    if (ok_dev[dev] == 0) {
++        int major = 0;
++        ok_dev[dev] = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
++                      strata::cc_major_of(major) >= 8 ? 1 : 2;
++        cudaGetLastError();
++    }
++    if (ok_dev[dev] != 1) return false;
++    gr_upmix_cuda_kernel<<<dim3(N / UC_BD, (unsigned) ((T + UC_BM - 1) / UC_BM)), 256, 0, (cudaStream_t) stream>>>(
++        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
++    check("gr_upmix");
++    return true;
+ #endif
+ }
+ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 23eaf1ddf8..80f39c5b2e 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -267,7 +267,9 @@ inline int bf16x2_mode(bool f16_io) {
+     return f16_io ? 0 : v;
+ }
+ inline bool bf16x2(bool f16_io) { return bf16x2_mode(f16_io) != 0; }
+-// S23 (opt-in STRATA_HC_UPMIX=1): the hyper-connection read's up projection and gr_mix_r as one kernel (gr_upmix, gfx11);
++// S23 (opt-in STRATA_HC_UPMIX=1): the hyper-connection read's up projection and gr_mix_r as one kernel (gr_upmix: gfx11,
++// and CUDA sm_80+ on chunks of 33+ tokens - there, with CUDA 13.3 on an RTX 5090, cuBLAS's up GEMM sums K in the fused
++// kernel's order and the read is the default pair's bits: gr_upmix_parity, STRATA_HC_UPMIX_CHECK);
+ // STRATA_HC_UPMIX_CHECK=N also runs the default pair on the first N reads and reports the difference of `mixed`
+ static int64_t pf_switch_min_t() {   // S23: STRATA_PF_SWITCH_MIN_T=N - the rounding-level prompt switches only on chunks of
+     // N or more tokens (shorter prompts keep the default numerics, and their outputs; the switches pay on long ones)
+@@ -278,6 +280,15 @@ inline bool hc_upmix() {
+     static const bool v = [] { const char* e = std::getenv("STRATA_HC_UPMIX"); return e != nullptr && e[0] == '1'; }();
+     return v;
+ }
++// CUDA: the fused read only on chunks of 33+ tokens - below that cuBLAS's up GEMM takes another kernel, rounding-level
++// apart, so short chunks keep the default pair
++inline int64_t hc_upmix_min_t() {
++#if defined(__HIPCC__)
++    return 0;
++#else
++    return 33;
++#endif
++}
+ inline bool bf16x2_hc(bool f16_io) { return bf16x2_mode(f16_io) == 1; }
+ // S23 (opt-in STRATA_CVEC_FUSE=1): a steered layer's FFN write + control vector + the next half's norm in one pass
+ // over R (gr_write_cvec_norm_rs; bitwise the gr_write + cvec_apply + gr_norm_rs it replaces)
+@@ -2267,7 +2278,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                 if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0)) return false;
+                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                 bool upmixed = false;
+-                if (hc_upmix() && T >= pf_switch_min_t() && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
++                if (hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
+                     wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
+                     static int checks = [] { const char* e = std::getenv("STRATA_HC_UPMIX_CHECK"); return e ? std::atoi(e) : 0; }();
+                     if (checks > 0) {   // the default pair first, kept for the comparison

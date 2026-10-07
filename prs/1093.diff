@@ -1,0 +1,968 @@
+diff --git a/README.md b/README.md
+index a8184b66e3..9f9e9a2a10 100644
+--- a/README.md
++++ b/README.md
+@@ -143,7 +143,9 @@ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add a
+ <sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
+ 
+ - **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
+-  GPU/CPU/RAM, and **About** with the settings and addresses.
++  GPU/CPU/RAM - with one **Load / Unload** split button (the dropdown half sets an idle timer that gives the GPU
++  and the RAM back, so the card goes to other programs; the button is refused, not queued, while a request runs) -
++  and **About** with the settings and addresses.
+ - **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
+   **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
+   - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index eaeadf08d4..008f5115aa 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -484,19 +484,38 @@ server, three server options (all off by default; also as keys in `strata-<model
+ 
+ | Option | Config key | What it does |
+ | --- | --- | --- |
+-| `--idle-unload 600` | `"idle_unload_s": 600` | unload the model after 600 s without requests; the next request loads it again |
++| `--idle-unload 600` | `"idle_unload_s": 600` | unload the model after 600 s without requests; the next request loads it again (the Monitor tab sets it too) |
+ | `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | load an unloaded model only when that much VRAM is free (it waits up to 15 s for memory being given back), else answer **503** "the GPU is in use by another program" instead of starting into what a game left (with several GPUs it checks the first one) |
+ | `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | a command run before the model is loaded again, e.g. one that unloads another server's model |
+ 
+-`POST /unload` unloads it now (`409` while a request is running) and `POST /load` loads it ahead of a request (both
+-with `Content-Type: application/json`, e.g. `curl -X POST -H "Content-Type: application/json" localhost:8080/unload`);
+-`/health` says `"loaded"`, `/v1/models` lists it as `unloaded` (like llama.cpp's router), `/props` sets
++`POST /unload` unloads it now and `POST /load` loads it ahead of a request (both with `Content-Type:
++application/json`, e.g. `curl -X POST -H "Content-Type: application/json" localhost:8080/unload`). Both answer
++**409** `"busy"` while a request is running or waiting: the model controls must not move the engine out from under an
++active client, and a client that has to retry anyway is better served by a refusal than by a reload it did not ask
++for. `/health` says `"loaded"`, `/v1/models` lists it as `unloaded` (like llama.cpp's router), `/props` sets
+ `is_sleeping` and the Monitor shows the state. Unloading ends the engine process - and the image encoder, when images
+-are on; it is started again first, as at a start - so their VRAM and RAM go straight back. The model files stay in
++are on; it is started again first, as at a start - so their VRAM and RAM go straight back. The engine's *live*
++figures go with it: an unload clears `expert_slots`, `expert_cache_mib`, `arena_mib`, `vram_free_mib` and the rest of
++its per-run INFO from `/metrics`, so the Monitor's **Experts in VRAM** row reports what the card is really doing
++(`model unloaded · 36 MiB in use`, read from the driver) instead of the last session's numbers. The facts that
++describe how the engine *would* run - context, KV type, speculation - stay, so About still describes the model while
++nothing is loaded. The model files stay in
+ the OS file cache, so loading again takes seconds while that RAM is not needed elsewhere. Measured on an RTX 5060 Ti
+ 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
+ 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
+ 
++The Monitor tab's Model state card has one **split button** for these two calls: the main segment is **Load** when
++the model is unloaded and **Unload** when it is loaded (it reads **Loading…** / **Unloading…** while it works, and
++is enabled only when nothing runs, as the server refuses a load/unload in the middle of a request); the caret
++segment opens a dropdown that sets `idle_unload_s` on a slider (never to 2 hours) and applies it
++right away - the idle loop reads the value on every turn, so a change from the page needs no restart - and shows the
++active timer as a tag on the caret. The slider covers the minutes in whole steps, but not on a straight line: they are
++a piecewise curve over the track, so the steps are fine near `never` (a minute apart up to 20), twice as coarse to
++45, and coarser again above (about 3 minutes apart at 2 hours). A straight 0-120 minute scale would put `never` one
++pixel from `1 min` and give the common 5-20 minute range a sixth of the track. The labels sit under the thumb
++centres, and `idle_unload_s` is capped at 7200 s on the server as well as on the page. Measured on a 7900 XTX 24 GB with IQ2_XS: `POST /unload` took ~1 s and
++`rocm-smi`'s used VRAM went from 23.7 GiB to 45 MiB, so the card is free for other programs.
++
+ **Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU).** With `"vram_elastic": true`
+ in the config (the engine flag `--vram-elastic`), the expert cache is allocated in 512 MiB segments
+ (`"vram_segment_mib"`), and `POST /v1/vram` with `{"reserve_mib": 8000}` shrinks it between requests until that much
+@@ -570,10 +589,15 @@ print(r.choices[0].message.content)
+   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
+   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
+   Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+-- **A reply stuck on one token is ended (0.1.39, #606).** When a reply repeats the same token 256 times in a row, the
+-  server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
+-  state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
+-  `strata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
++- **A reply stuck on one token is ended, and the engine is replaced (0.1.39, #606).** When a reply repeats the same
++  token 256 times in a row, the server ends it there and says so in its window: a model in a loop, or a broken state
++  that answers one token forever (#606 saw 36,689 tokens of `!`). Such a state is sticky - the next prompt gets the
++  same answer - so the engine is **restarted** (a fresh process, empty caches) and the request ends in an **error**
++  ("the engine's reply repeated one token '!' 256 times in a row and holds no answer - retry this request"), never in
++  the empty message that reads as `"length"` with no text and that an agent client cannot act on. Every agent client
++  retries, so its retry meets a clean engine; with parallel requests (`--batch`) the engine is left alone (restarting
++  it would end the others) and only the error is sent. `"repeat_stop_tokens": N` in `strata-<model>.json` sets the run
++  length; `0` turns the whole thing off (for a request that really wants one token many times).
+ - **Repeated reasoning (opt-in, #728).** The single-token guard above does not see a model that repeats whole
+   passages. `"reasoning_loop_recovery"` in `strata-<model>.json` is `false` (the default), `"stop"` or `"recover"`
+   (`true` means `"recover"`). Every 512 output tokens, at a complete character and parser boundary, the reasoning is
+@@ -665,7 +689,8 @@ print(r.choices[0].message.content)
+   `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`,
+   `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and `--vram-reserve-mib`. An empty field removes the
+   key (its default). Every other key of the file stays as it is, the earlier file is kept as
+-  `strata-<model>.json.bak`, and the model uses the change from its next start. Only Strata's own page can save
++  `strata-<model>.json.bak`, and the model uses the change from its next start - `idle_unload_s` excepted, which
++  the running server applies right away. Only Strata's own page can save
+   (JSON, the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not
+   editable there.
+ - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
+diff --git a/serve/runconfig.py b/serve/runconfig.py
+index 472b00212b..1151dcca80 100644
+--- a/serve/runconfig.py
++++ b/serve/runconfig.py
+@@ -29,7 +29,8 @@
+     ("effort_position", ("enum", ["start", "end"]),
+      "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
+     ("aliases", "names", "Other model names the server lists and answers to (comma-separated)"),
+-    ("idle_unload_s", "num>=0", "Unload the model after this many seconds without requests (0 or empty: never)"),
++    ("idle_unload_s", ("num", 7200), "Unload the model after this many seconds without requests, up to 2 hours "
++     "(0 or empty: never). Applies right away, and is kept for the next start"),
+     ("lazy_load", "bool", "Start without loading the model; the first request loads it (text only)"),
+     ("engine_silence_s", "num>=0", "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
+     ("api_monitor", "bool", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
+@@ -64,10 +65,12 @@ def view(cfg: dict, path: str | Path) -> dict:
+     for key, kind, help_ in EDITABLE:
+         k = kind[0] if isinstance(kind, tuple) else kind
+         out.append({"key": key, "value": value_of(cfg, key), "help": help_,
+-                    "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0") else k,
+-                    **({"choices": kind[1]} if k == "enum" else {})})
++                    "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0", "num") else k,
++                    **({"choices": kind[1]} if k == "enum" else {}),
++                    **({"max": kind[1]} if k == "num" else {})})
+     return {"file": Path(path).name, "keys": out,
+-            "note": "Saved to the run config; used from the next start of the model."}
++            "note": "Saved to the run config. idle_unload_s applies right away; the rest from the next start of "
++                    "the model."}
+ 
+ 
+ def _number(key, v, whole=False, lo=0.0, hi=None, lo_open=False):
+@@ -106,6 +109,8 @@ def check(key: str, v, cfg: dict):
+         return _number(key, v, whole=True)
+     if k == "num>=0":
+         return _number(key, v)
++    if k == "num":
++        return _number(key, v, hi=kind[1])
+     if k == "arg":
+         return _number(key, v, whole=True)
+     rule = kind[1]                                     # a sampling key: the server's own rules
+@@ -162,8 +167,10 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
+ 
+ 
+ def save(path: str | Path, cfg: dict) -> Path:
+-    """The config written whole (a temporary file moved over the old one), the earlier one kept as <name>.bak."""
+-    path = Path(path)
++    """The config written whole (a temporary file moved over the old one), the earlier one kept as <name>.bak.
++    The container's config is a symlink into the /data volume (entrypoint.sh), so the write follows it:
++    os.replace over a symlink leaves a regular file in the image and the volume's copy stale."""
++    path = Path(os.path.realpath(path))
+     bak = path.with_name(path.name + ".bak")
+     shutil.copyfile(path, bak)
+     tmp = path.with_name(path.name + ".tmp")
+diff --git a/serve/server.py b/serve/server.py
+index d6b1fc37e6..4cf4552a74 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -248,6 +248,8 @@ def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+ class EngineDied(RuntimeError):
+     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
+ 
++    hint = "; the next request restarts it"        # what a client is told after the error (DegenerateReply: none)
++
+ 
+ class EngineStarting(RuntimeError):
+     """The engine is (re)starting and has not said READY yet (#344): no context size to plan a request with - a 503,
+@@ -279,6 +281,11 @@ def __init__(self, kind: str, message: str, published: bool = False):
+     @property
+     def status(self) -> int:
+         return self.STATUS[self.kind]
++class DegenerateReply(EngineDied):
++    """#606: the engine answered with one token repeated over and over - not an answer, and it answers the next request
++    the same way.  Service.run restarts the engine (nothing it sent can be taken back) and raises this, so a client
++    that retries - every agent client does - meets a clean engine instead of an empty message it cannot use."""
++    hint = ""
+ 
+ 
+ class EngineStuck(RuntimeError):
+@@ -543,6 +550,14 @@ class StrataEngine:
+     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
+     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+ 
++    # The INFO keys that only mean something while the engine is running (generate.cpp prints them at READY, and
++    # again for every VRAM command). An unload ends the process, which frees its arena and expert cache for real, so
++    # leaving them in `info` made /metrics - and the Monitor's "Experts in VRAM" - claim gigabytes of VRAM were
++    # still held, long after the driver had given them back. Everything else in INFO describes how the engine would
++    # run (context, kv, speculation) and stays, so About still describes the model while nothing is loaded.
++    LIVE_INFO = ("expert_slots", "expert_cache_mib", "expert_slots_primary", "expert_cache_primary_mib",
++                 "vram_free_mib", "arena_mib", "pool_workers", "vram")
++
+     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
+     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
+     @property
+@@ -750,6 +765,8 @@ def unload(self):
+         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
+         self.close()
+         self.unloaded = True
++        for k in self.LIVE_INFO:         # the process is gone, so these are history, not state (see LIVE_INFO)
++            self.info.pop(k, None)
+ 
+     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
+ 
+@@ -2196,6 +2213,7 @@ def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name
+         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
+         # server's model); the next request after an unload starts the engine again
+         self.idle_unload_s = 0
++        self.idle_thread = None                          # the idle-unload loop, started once (set_idle_unload)
+         self.min_free_vram_mib = 0
+         self.before_load = None
+         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
+@@ -2410,12 +2428,24 @@ def _say_died(self, e: Exception) -> None:
+         print(f"[strata] {e}. {note} The next request starts the engine again."
+               f"{' Its log: ' + log if log else ''}", flush=True)
+ 
+-    def load(self):
+-        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
++    def load(self, refuse_busy: bool = False) -> str:
++        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy).
++        "loaded", or with refuse_busy "busy": an explicit load from the page is refused while a request runs or waits
++        - the way /unload and /v1/load already do - instead of queueing behind it."""
+         # a request is on its way: the idle thread must not unload between this and the request's own start
+         self.last_request_at = time.time()
++        # refuse_busy comes before the "already loaded" answer below: with the engine up and generating, that
++        # answer would be true and the page's Load would look like it did something while a request ran.
++        if refuse_busy:
++            if not self.fifo.acquire(blocking=False):
++                return "busy"
++            with self.status_lock:
++                busy = bool(self.status.get("busy") or self.status.get("queued"))
++            self.fifo.release()
++            if busy:
++                return "busy"
+         if self.loaded() and not self._vision_down():
+-            return
++            return "loaded"
+         trace = getattr(self.request_trace, "record", None)
+         waiting = time.perf_counter()
+         with self.fifo:
+@@ -2431,6 +2461,7 @@ def load(self):
+                     with self.status_lock:
+                         trace["load_s"] += round(time.perf_counter() - loading, 3)
+                         trace["state"] = "queued"
++        return "loaded"
+ 
+     def unload(self, idle_for: float | None = None) -> str:
+         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
+@@ -2456,19 +2487,30 @@ def unload(self, idle_for: float | None = None) -> str:
+         finally:
+             self.fifo.release()
+ 
++    def set_idle_unload(self, seconds) -> float:
++        """#564: idle_unload_s from the page's Settings, applied right away: the loop below reads the value on every
++        turn, so a change needs no restart (the run config keeps it for the next start as well).  0 = never."""
++        self.idle_unload_s = float(seconds)
++        if self.idle_unload_s:
++            self.start_idle_unload()
++        return self.idle_unload_s
++
+     def start_idle_unload(self):
+-        if not self.idle_unload_s or not hasattr(self.engine, "unload"):
++        if not self.idle_unload_s or not hasattr(self.engine, "unload") or self.idle_thread is not None:
+             return
+         print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+ 
+         def loop():
+             while True:
+                 time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
++                if not self.idle_unload_s:            # switched off from the page while the loop runs
++                    continue
+                 try:
+                     self.unload(idle_for=self.idle_unload_s)
+                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
+                     print(f"[strata] idle unload: {e}", flush=True)
+-        threading.Thread(target=loop, daemon=True).start()
++        self.idle_thread = threading.Thread(target=loop, daemon=True)
++        self.idle_thread.start()
+ 
+     def set_shared(self, defaults) -> dict:
+         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
+@@ -2609,7 +2651,8 @@ def metrics(self, all_requests=False) -> dict:
+                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
+                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
+                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
+-                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
++                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
++                "idle_unload_s": self.idle_unload_s}
+         if state == "reading" and progress:
+             live["prompt_read"], live["prompt_total"] = progress
+         par = int(getattr(self.engine, "batch", 0) or 0)
+@@ -3081,8 +3124,7 @@ def cut(evs):
+                     elif repeated:
+                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
+                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
+-                              "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
+-                              "same, restart the server and report it (#606)", flush=True)
++                              "strata-<model>.json; 0 turns this off)", flush=True)
+                 except GeneratorExit:                   # the client disconnected mid-stream
+                     finish = "disconnect"
+                     raise
+@@ -3146,7 +3188,9 @@ def cut(evs):
+                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
+                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+-                            if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
++                            # #530: no answer because the thinking filled the budget (a degenerate reply is
++                            # #606's business, and a thinking budget would not help there)
++                            if finish == "length" and parser.state in ("reasoning", "rcall") and not repeated:
+                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
+                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
+                                       "strata-<model>.json for every request) leaves room to answer", flush=True)
+@@ -3163,6 +3207,24 @@ def cut(evs):
+                                 self.status.update(busy=False)
+                                 self.status.pop("tail", None)
+                                 self.status.pop("tool", None)
++                # #606: a degenerate reply is not an answer, and it sticks - the engine answered one token over and
++                # over, and it answers the next request the same way.  What it sent cannot be taken back, but the
++                # engine can be replaced while this request still holds the fifo, so a client that retries (every
++                # agent client does) meets a clean one, and the empty message that reads as "length, no output" -
++                # which no agent can act on - becomes an error it can.
++                if repeated:
++                    if par or not hasattr(self.engine, "restart"):
++                        print("[strata] the engine is left as it is (other requests are running in parallel, or it "
++                              "cannot be restarted): a retry of this request may end the same way", flush=True)
++                    else:
++                        try:
++                            self.engine.restart()             # best effort: whatever it raises, the client still
++                            print("[strata] the engine is running again, so a retry of this request starts clean",
++                                  flush=True)                # gets the error that says what happened
++                        except (RuntimeError, ValueError, OSError) as e:     # EngineStuck, EngineDied, a failed start
++                            print(f"[strata] the engine could not be restarted: {e}", flush=True)
++                    raise DegenerateReply(f"the engine's reply repeated one token {self.tok.decode([run_tok])!r} "
++                                          f"{run_len} times in a row and holds no answer - retry this request")
+         finally:
+             if emb:
+                 Path(emb).unlink(missing_ok=True)
+@@ -3905,8 +3967,8 @@ def do_POST(self):
+                 return
+             if path == "/load":                              # load now, e.g. ahead of a request
+                 try:
+-                    svc.load()
+-                    self._json(200, {"status": "loaded"})
++                    r = svc.load(refuse_busy=True)
++                    self._json(409 if r == "busy" else 200, {"status": r})
+                 except GpuBusy as e:
+                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                 return
+@@ -3988,7 +4050,7 @@ def do_POST(self):
+             except (GpuBusy, EngineStarting) as e:
+                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+             except EngineDied as e:                          # before the answer started (not streamed)
+-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
++                self._json(503, {"error": {"type": "server_error", "message": f"{e}{e.hint}"}})
+             except EngineStuck as e:                         # an unload or restart that could not end the engine
+                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+ 
+@@ -4101,8 +4163,12 @@ def _config_post(self):
+                 self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be written: {e}"}})
+                 return
+             if changed:
++                if "idle_unload_s" in changed:
++                    svc.set_idle_unload(new.get("idle_unload_s") or 0)     # the idle loop reads it: no restart
++                applies = ("idle_unload_s applies right away" if "idle_unload_s" in changed
++                           else "used from the next start")
+                 print(f"[strata] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
+-                      f"(the earlier file: {bak.name}); used from the next start", flush=True)
++                      f"(the earlier file: {bak.name}); {applies}", flush=True)
+             self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
+         def _foreign_origin(self) -> bool:
+             """A web page of another origin sent this.  The Origin must be this server's own address (host and port),
+@@ -4224,7 +4290,10 @@ def _openai(self, req):
+                 chunks = structured_chunks(chunks, validator)
+             chunks = self._capture(chunks, "openai")
+             if not req.get("stream"):
+-                return self._json(200, openai_collect(chunks))
++                try:
++                    return self._json(200, openai_collect(chunks))
++                except EngineDied as e:                      # #606: nothing sent yet, so the status can say why
++                    return self._json(503, {"error": {"type": "server_error", "message": f"{e}{e.hint}"}})
+             self._sse()
+             try:
+                 for c in chunks:
+@@ -4239,7 +4308,7 @@ def _openai(self, req):
+                 cancel.set()                                 # client went away: stop the engine
+                 chunks.close()
+             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
+-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
++                err = {"error": {"type": "server_error", "message": f"{e}{e.hint}"}}
+                 self._note(error=err["error"])
+                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+             except StructuredOutputError as e:
+@@ -4288,8 +4357,7 @@ def events():
+                     return self._json(502, responses_error_body(str(e), "server_error",
+                                                                 code="structured_output_failed"))
+                 except EngineDied as e:
+-                    return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
+-                                                                code="server_error"))
++                    return self._json(503, responses_error_body(f"{e}{e.hint}", "server_error", code="server_error"))
+                 except ValueError as e:                      # the engine's ERR line
+                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                 return self._json(200, result)
+@@ -4319,7 +4387,7 @@ def send(e):
+                 cancel.set()                                 # client went away: stop the engine
+                 items.close()
+             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
+-                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
++                self._responses_failed(asm, f"{e}{e.hint}", "server_error", send)
+             except StructuredOutputError as e:
+                 self._responses_failed(asm, str(e), "structured_output_failed", send)
+             except ValueError as e:                          # the engine's ERR after the stream started
+@@ -4406,7 +4474,11 @@ def _anthropic(self, req):
+             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+             events = self._capture(events, "anthropic")
+             if not req.get("stream"):
+-                return self._json(200, anthropic_collect(events))
++                try:
++                    return self._json(200, anthropic_collect(events))
++                except EngineDied as e:                      # #606: nothing sent yet, so the status can say why
++                    return self._json(503, {"type": "error", "error": {"type": "api_error",
++                                                                        "message": f"{e}{e.hint}"}})
+             self._sse()
+             try:
+                 for item in events:
+@@ -4422,7 +4494,7 @@ def _anthropic(self, req):
+                 cancel.set()
+                 events.close()
+             except EngineDied as e:                          # mid-stream: Anthropic's error event
+-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
++                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}{e.hint}"}}
+                 self._note(error=err["error"])
+                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+             except ValueError as e:                          # the engine's ERR after the stream started
+diff --git a/serve/test_runconfig.py b/serve/test_runconfig.py
+index bb17119698..965344eeb3 100644
+--- a/serve/test_runconfig.py
++++ b/serve/test_runconfig.py
+@@ -153,12 +153,61 @@ def test_without_a_run_config(self):
+         self.assertEqual(self.call("GET")[0], 404)
+         self.assertEqual(self.call("POST", {"set": {"fit_max_tokens": True}})[0], 404)
+ 
++    def test_the_idle_timeout_is_saved_and_applied(self):
++        self.assertEqual(self.svc.idle_unload_s, 0)
++        with contextlib.redirect_stdout(io.StringIO()):
++            status, v = self.call("POST", {"set": {"idle_unload_s": 300}}, {"Origin": f"http://{self.host}"})
++        self.assertEqual(status, 200, v)
++        self.assertEqual(self.saved()["idle_unload_s"], 300.0)
++        self.assertEqual(self.svc.idle_unload_s, 300.0)          # the running server uses it, no restart
++        with contextlib.redirect_stdout(io.StringIO()):
++            status, v = self.call("POST", {"set": {"idle_unload_s": None}})
++        self.assertEqual(status, 200, v)
++        self.assertEqual(self.svc.idle_unload_s, 0)             # 0 / empty: never unload
++        self.assertNotIn("idle_unload_s", self.saved())
++
++    def test_the_idle_timeout_stops_at_two_hours(self):
++        # the slider goes to 2 h; About must not be a way round it
++        self.assertEqual(runconfig.check("idle_unload_s", 7200, {}), 7200)
++        with self.assertRaises(ValueError) as e:
++            runconfig.check("idle_unload_s", 7201, {})
++        self.assertIn("7200", str(e.exception))
++        status, v = self.call("POST", {"set": {"idle_unload_s": 7201}}, {"Origin": f"http://{self.host}"})
++        self.assertEqual(status, 400, v)
++        self.assertNotIn("idle_unload_s", self.saved())         # rejected: nothing written
++        got = {k["key"]: k for k in self.call("GET")[1]["keys"]}
++        self.assertEqual(got["idle_unload_s"]["kind"], "number")
++        self.assertEqual(got["idle_unload_s"]["max"], 7200)    # the About field caps itself too
++
++    def test_the_write_follows_the_symlink(self):
++        # the container's config is a symlink into the /data volume (entrypoint.sh); the page's settings must
++        # land on the volume, not as a new regular file over the link, which the next start would ignore
++        volume = Path(self.dir.name) / "config"
++        volume.mkdir()
++        real = volume / "strata-q2_0.json"
++        real.write_text(json.dumps(CFG, indent=1), encoding="utf-8")
++        self.path.unlink()
++        self.path.symlink_to(real)
++        with contextlib.redirect_stdout(io.StringIO()):
++            self.assertEqual(self.call("POST", {"set": {"idle_unload_s": 300}})[0], 200)
++        self.assertTrue(self.path.is_symlink())
++        self.assertEqual(json.loads(real.read_text())["idle_unload_s"], 300.0)
++        self.assertEqual(json.loads((volume / "strata-q2_0.json.bak").read_text()), CFG)
++
+     def test_the_page_has_the_view(self):
+         web = ROOT / "serve" / "web"
+         html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
+-        for el in ("cfg-card", "cfg-form", "cfg-save", "cfg-msg"):
++        for el in ("cfg-card", "cfg-form", "cfg-save", "cfg-msg", "model-toggle", "idle-btn", "idle-pop",
++                   "idle-slider", "idle-out"):
+             self.assertIn(f'id="{el}"', html)
+         self.assertIn('fetch("config", {method: "POST", headers: headers(true)', js)
++        self.assertIn('fetch(load ? "load" : "unload"', js)
++        self.assertIn("set: {idle_unload_s: v}", js)
++        self.assertIn('class="st-split"', html)          # one split button: the action and the caret
++        self.assertIn('id="idle-slider" min="0" max="1000" step="1"', html)   # a position on the curve, not minutes
++        self.assertIn("const idlePos = (min) =>", js)
++        self.assertIn("const idleMin = (pos) =>", js)
++        self.assertIn('$("idle-slider").value = idlePos(v / 60)', js)         # the thumb follows the server's value
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 590cf05cab..b38dedeaef 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -21,8 +21,9 @@
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
+-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
+-                          StrataEngine, engine_args, layer_split_value, prompt_progress, prompt_tokens_seen,
++from serve.server import (CTX_SLACK, ByteTokenizer, DegenerateReply, EngineDied, EngineStuck, GpuBusy,  # noqa: E402
++                          MockEngine, PP_DONE_TAIL, Service, StrataEngine, engine_args, layer_split_value,
++                          prompt_progress, prompt_tokens_seen,
+                           request_timings, serve, start_failure_hint)
+ from types import SimpleNamespace  # noqa: E402
+ 
+@@ -1556,24 +1557,49 @@ def test_no_profile_in_the_args(self):
+ 
+ 
+ class RepeatStop(unittest.TestCase):
+-    """#606: one token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off."""
++    """#606: one token repeated repeat_stop_tokens times in a row is not an answer, and the engine goes on answering
++    that way - so the engine is restarted and the request ends in an error the client can retry (0 turns it off)."""
+ 
+-    def run_reply(self, script, limit=None):
++    def run_reply(self, script, limit=None, engine=None):
+         tok = ByteTokenizer()
+-        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        eng = engine if engine is not None else MockEngine(tok, script, max_context=CTX)
++        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+         if limit is not None:
+             svc.repeat_stop_tokens = limit
+         ids = tok.encode("hi")
+         with contextlib.redirect_stdout(io.StringIO()) as out:
+-            done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
++            try:
++                done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
++            except DegenerateReply as e:                   # the request ends in the error, not in a done event
++                done = e
+         return done, out.getvalue()
+ 
+     def test_a_long_run_is_ended(self):
+         done, log = self.run_reply("ok " + "!" * 1000 + " never")
+-        self.assertEqual(done["finish"], "length")
+-        self.assertEqual(done["completion_tokens"], 3 + 256)
++        self.assertIsInstance(done, DegenerateReply)
++        self.assertIn("repeated one token '!' 256 times", str(done))
+         self.assertIn("repeated one token ('!') 256 times", log)
+ 
++    def test_the_engine_is_restarted_so_the_clients_retry_finds_a_clean_one(self):
++        tok = ByteTokenizer()
++        engine = UnloadableEngine(tok, "!" * 1000, max_context=CTX)
++        done, log = self.run_reply("!" * 1000, engine=engine)
++        self.assertIsInstance(done, DegenerateReply)
++        self.assertEqual(engine.starts, 1)                 # once per request: the client decides about retrying
++        self.assertTrue(engine.alive())
++        self.assertIn("the engine is running again", log)
++
++    def test_an_engine_that_cannot_be_restarted_still_reports_the_reply(self):
++        class Stuck(UnloadableEngine):
++            def restart(self):
++                raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits")
++
++        tok = ByteTokenizer()
++        done, log = self.run_reply("!" * 1000, engine=Stuck(tok, "!" * 1000, max_context=CTX))
++        self.assertIsInstance(done, DegenerateReply)       # the client learns why, not just that it went wrong
++        self.assertIn("could not be restarted", log)
++        self.assertIn("still releasing GPU/RAM", log)
++
+     def test_short_runs_and_off(self):
+         done, _ = self.run_reply("=" * 255 + " fine")
+         self.assertEqual(done["finish"], "stop")
+@@ -1584,6 +1610,54 @@ def test_short_runs_and_off(self):
+         self.assertEqual(done["finish"], "stop")
+ 
+ 
++class DegenerateOverHttp(unittest.TestCase):
++    """#606 end to end: a client gets an error it can act on (not an empty message that reads as "length, no output")
++    and the engine it can retry against is a fresh one."""
++
++    def setUp(self):
++        tok = ByteTokenizer()
++        self.engine = UnloadableEngine(tok, "!" * 1000, max_context=CTX)
++        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        self.httpd = serve(self.svc, port=0)
++        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
++
++    def tearDown(self):
++        self.httpd.shutdown()
++        self.httpd.server_close()
++
++    def post(self, path, body):
++        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
++                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
++        try:
++            with urllib.request.urlopen(req, timeout=30) as r:
++                return r.status, r.read().decode()
++        except urllib.error.HTTPError as e:
++            with e:
++                return e.code, e.read().decode()
++
++    def test_a_chat_request_is_503_and_the_engine_is_restarted(self):
++        code, raw = self.post("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
++        self.assertEqual(code, 503)
++        self.assertIn("repeated one token '!' 256 times", json.loads(raw)["error"]["message"])
++        self.assertEqual(self.engine.starts, 1)
++        self.assertTrue(self.engine.alive())
++
++    def test_a_streamed_chat_request_ends_in_an_error_event(self):
++        code, raw = self.post("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}],
++                                                      "stream": True})
++        self.assertEqual(code, 200)                          # the headers went out with the first chunk
++        self.assertIn("repeated one token '!' 256 times", raw)
++        self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
++        self.assertEqual(self.engine.starts, 1)
++
++    def test_a_messages_request_is_503_too(self):
++        code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 500,
++                                              "messages": [{"role": "user", "content": "hi"}]})
++        self.assertEqual(code, 503)
++        self.assertIn("repeated one token '!' 256 times", json.loads(raw)["error"]["message"])
++        self.assertEqual(self.engine.starts, 1)
++
++
+ class LayerSplit(unittest.TestCase):
+     """#644: "layer_split" is the first layer of each later GPU; a list is accepted, counts per card are not."""
+ 
+@@ -2498,6 +2572,53 @@ def test_load_endpoint(self):
+         self.assertEqual(self.req("/load", {}), (200, {"status": "loaded"}))
+         self.assertEqual(self.engine.starts, 1)
+ 
++    def test_load_refused_while_a_request_runs_or_waits(self):
++        # the same guard /unload has: the model controls must not move the engine under an active client (#606's
++        # lesson - a reload in the middle of a session is what wedged the engine), and they say so instead of
++        # queueing behind the request
++        self.svc.unload()
++        with self.svc.fifo:
++            self.assertEqual(self.svc.load(refuse_busy=True), "busy")
++            with self.svc.status_lock:                     # a request waiting for the fifo, not holding it yet
++                self.svc.status.update(queued=1)
++                self.assertEqual(self.svc.load(refuse_busy=True), "busy")
++                self.svc.status.update(queued=0)
++        self.assertEqual(self.req("/load", {}), (200, {"status": "loaded"}))
++        self.assertEqual(self.engine.starts, 1)
++
++    def test_unload_clears_the_engines_live_figures_but_keeps_its_config(self):
++        # /metrics used to keep reporting the last session's expert_slots / arena_mib / vram_free_mib after an
++        # unload, so the Monitor's "Experts in VRAM" kept claiming gigabytes the driver had already given back.
++        # lazy=True: no process is started, and close() returns at once when self.proc is None.
++        engine = StrataEngine("strata", ["--max-context", "4096"], lazy=True)
++        engine.info.update({"expert_slots": 13440, "expert_cache_mib": 18442, "arena_mib": 33812,
++                            "vram_free_mib": 608, "pool_workers": 7, "vram": {"vram_free_mib": 608},
++                            "max_context": 4096, "kv": "int8", "spec": 6, "conversation_cache_mib": 0})
++        engine.unload()
++        for gone in StrataEngine.LIVE_INFO:
++            self.assertNotIn(gone, engine.info)
++        for kept in ("max_context", "kv", "spec", "conversation_cache_mib"):
++            self.assertIn(kept, engine.info)
++
++    def test_load_refused_while_busy_even_when_the_engine_is_already_up(self):
++        # the guard has to come before the "already loaded" answer: with the engine up and a request on it, Load
++        # answered "loaded" (200), so the button looked like it had done something while a request was running.
++        # The test above misses this because it starts from an unloaded engine.
++        self.chat()
++        self.assertTrue(self.engine.alive())
++        starts = self.engine.starts
++        with self.svc.fifo:
++            self.assertEqual(self.svc.load(refuse_busy=True), "busy")
++            self.assertEqual(self.req("/load", {}), (409, {"status": "busy"}))
++        self.assertEqual(self.req("/load", {}), (200, {"status": "loaded"}))     # idle and loaded is not busy
++        self.assertEqual(self.engine.starts, starts)
++
++    def test_load_refused_over_http_while_a_request_runs(self):
++        self.svc.unload()
++        with self.svc.fifo:
++            self.assertEqual(self.req("/load", {}), (409, {"status": "busy"}))
++        self.assertFalse(self.engine.alive())               # refused, so still unloaded
++
+     def test_unload_refused_while_a_request_runs(self):
+         with self.svc.fifo:
+             self.assertEqual(self.svc.unload(), "busy")
+@@ -2514,6 +2635,24 @@ def test_idle_unload(self):
+         self.assertFalse(self.engine.alive())
+         self.assertEqual(self.chat()[0], 200)
+ 
++    def test_the_page_sets_the_idle_timeout_and_it_applies_now(self):
++        # the Settings view writes idle_unload_s to the run config; the idle loop reads the value on every turn,
++        # so a change from the page needs no restart
++        self.svc.config_path = str(Path(tempfile.mkdtemp()) / "strata-q2_0.json")
++        Path(self.svc.config_path).write_text("{}", encoding="utf-8")
++        self.assertEqual(self.chat()[0], 200)                             # loaded, a request just ran
++        self.assertEqual(self.req("/metrics")[1]["live"]["idle_unload_s"], 0)
++        with contextlib.redirect_stdout(io.StringIO()):
++            self.assertEqual(self.req("/config", {"set": {"idle_unload_s": 1}})[0], 200)
++        self.assertEqual(self.svc.idle_unload_s, 1.0)
++        self.assertEqual(json.loads(Path(self.svc.config_path).read_text())["idle_unload_s"], 1.0)
++        self.assertEqual(self.req("/metrics")[1]["live"]["idle_unload_s"], 1.0)
++        deadline = time.time() + 10
++        while self.engine.alive() and time.time() < deadline:
++            time.sleep(0.1)
++        self.assertFalse(self.engine.alive())                             # unloaded, no restart
++        self.assertEqual(self.chat()[0], 200)                             # the next request loads it again
++
+     def test_min_free_vram_refuses_to_load(self):
+         self.svc.min_free_vram_mib = 8000
+         self.svc.free_vram_mib = lambda: 2000
+diff --git a/serve/web/app.css b/serve/web/app.css
+index dd9a3e1fe3..10911250ed 100644
+--- a/serve/web/app.css
++++ b/serve/web/app.css
+@@ -85,6 +85,31 @@ main { flex: 1; min-height: 0; display: flex; }
+ .badges { display: flex; gap: var(--st-s-2); flex-wrap: wrap; }
+ .badges .st-badge { opacity: .38; transition: opacity var(--st-dur); }
+ .badges .st-badge.on { opacity: 1; }
++.state-card__head .spacer { flex: 1; }
++.state-actions { display: flex; align-items: center; position: relative; }
++.state-actions .st-btn { height: 34px; padding: 0 14px; font-size: var(--st-fs-sm); }
++.st-split { display: flex; }
++.st-split .st-btn { border-radius: 0; }
++.st-split .st-btn:first-child { border-radius: var(--st-r-md) 0 0 var(--st-r-md); }
++.st-split .st-btn:last-child { border-radius: 0 var(--st-r-md) var(--st-r-md) 0; border-left: 0; }
++.st-split .st-btn--caret { width: auto; padding: 0 6px; gap: 4px; }
++.st-split .st-btn--caret .st-icon { width: 14px; height: 14px; }
++.st-pop { position: absolute; top: calc(100% + 8px); right: 0; z-index: 20; width: 260px; max-width: 86vw;
++          padding: var(--st-s-4); border: 1px solid var(--st-line); border-radius: var(--st-r-lg);
++          background: var(--st-surface); box-shadow: var(--st-sh-pop); display: flex; flex-direction: column;
++          gap: var(--st-s-3); }
++.st-pop[hidden] { display: none; }
++.st-pop__head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--st-s-2); }
++.st-pop__head output { font-size: var(--st-fs-sm); font-weight: var(--st-fw-bold); color: var(--st-accent-text); }
++/* One label per --pos (a slider step), centred under the thumb. The thumb's centre sits --st-inset/2 in from the end
++   of the range element, and the element itself is inset by the 2px margin the UA gives it, which this block does not
++   have: hence the extra 2px. The end labels land in the popup's padding, which is what they are for. */
++.st-pop__ticks { position: relative; height: 1.2em; margin-top: var(--st-s-1); font-size: var(--st-fs-xs);
++                 color: var(--st-ink-muted); }
++.st-pop__ticks span { position: absolute; top: 0; white-space: nowrap;
++                      left: calc(var(--st-inset, 16px) / 2 + 2px + var(--pos) / 1000 * (100% - var(--st-inset, 16px)));
++                      transform: translateX(-50%); }
++.st-pop p { margin: 0; }
+ .state-card__row { display: flex; justify-content: space-between; gap: var(--st-s-4); font-size: var(--st-fs-sm);
+                    font-weight: var(--st-fw-medium); font-variant-numeric: tabular-nums; }
+ .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--st-s-4); }
+diff --git a/serve/web/app.js b/serve/web/app.js
+index ade19016ba..859991cfab 100644
+--- a/serve/web/app.js
++++ b/serve/web/app.js
+@@ -187,7 +187,7 @@ function render(m) {
+   } else if (live.state === "generating") {
+     setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+   } else {
+-    setPill("idle", "Idle");
++    setPill("idle", live.state === "unloaded" ? "Unloaded" : "Idle");
+   }
+   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+@@ -237,6 +237,83 @@ function renderTotals(t) {
+   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
+          `${fmt(t.output_tokens)} written${oSpeed}`;
+ }
++
++// One button for the model: Load when it is unloaded, Unload when it is loaded (POST /load, /unload, as the
++// standalone API Monitor page does), with a dropdown holding the idle timer as a slider (POST /config).
++// The server refuses a load/unload while a request runs, so the button follows the state.
++let idleSet = null, modelOp = false, modelDoing = null, dragging = false;   // the server's idle_unload_s, an operation in flight, the slider mid-drag
++// The slider spans 0..1000 steps but never..2 h in minutes, so the minutes are a piecewise curve over the track:
++// fine near 0 (25 steps a minute to 20 min), coarser to 45 min (10 a minute), coarse above (3⅓ a minute).  A plain
++// 0..120 minute scale puts "never" one pixel from "1 min" and gives the common 5..20 minute range a sixth of the track.
++const idlePos = (min) => {
++  const m = Math.min(120, Math.max(0, min));
++  return Math.round(m <= 20 ? m * 25 : m <= 45 ? 500 + (m - 20) * 10 : 750 + (m - 45) * 10 / 3);
++};
++const idleMin = (pos) => Math.round(pos <= 500 ? pos / 25 : pos <= 750 ? 20 + (pos - 500) / 10 : 45 + (pos - 750) * 3 / 10);
++const idleText = (s) => {
++  if (!s) return "never";
++  if (s % 60) return `${fmt(s, 0)} s`;                    // a value typed in About, off the slider's steps
++  const m = s / 60;
++  return m % 60 === 0 ? `${fmt(m / 60)} h` : `${fmt(m)} min`;
++};
++function renderIdle(live) {
++  const v = live.idle_unload_s;
++  if (v == null) return;                                  // an older server: nothing to show
++  if (dragging) return;                                  // the user is dragging: a poll must not clobber the live display
++  if (v !== idleSet) {
++    idleSet = v;
++    $("idle-slider").value = idlePos(v / 60);              // the slider is a position on the curve above
++  }
++  const t = idleText(idleSet);
++  $("idle-out").textContent = t;
++  $("idle-btn").title = `Unload when idle: ${t}`;
++}
++function setIdlePop(open) {
++  $("idle-pop").hidden = !open;
++  $("idle-btn").setAttribute("aria-expanded", String(open));
++}
++$("idle-btn").onclick = () => setIdlePop($("idle-pop").hidden);
++$("idle-slider").oninput = () => { dragging = true; $("idle-out").textContent = idleText(idleMin(+$("idle-slider").value) * 60); };
++$("idle-slider").onchange = async () => {
++  dragging = false;
++  const v = idleMin(+$("idle-slider").value) * 60;
++  try {
++    const r = await fetch("config", {method: "POST", headers: headers(true),
++                                     body: JSON.stringify({set: {idle_unload_s: v}})});
++    const b = await r.json();
++    if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
++    if (b.changed.length) toast("success", "Idle unload applied", `Now: ${idleText(v)}; kept in ${b.file} for the next start.`);
++    await poll();
++  } catch (e) {
++    toast("error", "Not saved", String(e.message || e), 6000);
++    if (lastMetrics) renderIdle(lastMetrics.live);        // back to the server's value
++  }
++};
++$("idle-slider").addEventListener("pointerup", () => { dragging = false; });   // release clears the drag even when the value ends unchanged (no change event)
++document.addEventListener("click", (e) => {
++  if (!$("idle-pop").hidden && !e.target.closest("#idle-pop") && !e.target.closest("#idle-btn")) setIdlePop(false);
++});
++document.addEventListener("keydown", (e) => { if (e.key === "Escape") setIdlePop(false); });
++async function modelToggle() {
++  const load = (lastMetrics ? lastMetrics.live : {}).state === "unloaded";
++  modelOp = true; modelDoing = load ? "load" : "unload";
++  try {
++    const r = await fetch(load ? "load" : "unload", {method: "POST", headers: headers(true), body: "{}"});
++    const b = await r.json();
++    // 409: a request is running or waiting - the server keeps the model where it is, and says so (#606's lesson)
++    if (!r.ok) throw new Error((b.error || {}).message || (b.status === "busy" ? "a request is running or waiting"
++                                                                             : `HTTP ${r.status}`));
++    toast("success", load ? "Loading the model" : "Model unloaded",
++          load ? "The first start takes a minute or two."
++                : "The GPU and the RAM are free; the next request loads the model again.");
++  } catch (e) {
++    toast("error", load ? "Not loaded" : "Not unloaded", String(e.message || e), 6000);
++  } finally {
++    modelOp = false; modelDoing = null;
++    poll();
++  }
++}
++$("model-toggle").onclick = modelToggle;
+ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+   // model state
+   const on = live.queued > 0 ? "queued" : live.state;
+@@ -257,6 +334,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+     delete prog.dataset.tone;
+     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
+     detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
++  } else if (live.state === "unloaded") {
++    delete prog.dataset.tone;
++    label = "Model unloaded";
++    detail = "the GPU and the RAM are free; the next request loads it again";
+   } else if (last) {
+     delete prog.dataset.tone;
+     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+@@ -264,6 +345,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+   $("state-label").textContent = label;
+   $("state-detail").textContent = detail;
+   $("state-bar").style.width = `${pct}%`;
++  const running = live.state === "reading" || live.state === "generating" || live.queued > 0;
++  const b = $("model-toggle");
++  b.textContent = modelOp ? (modelDoing === "load" ? "Loading…" : "Unloading…")
++                          : (live.state === "unloaded" ? "Load" : "Unload");
++  b.disabled = modelOp || running;
++  renderIdle(live);
+ 
+   // the eight cards
+   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
+@@ -317,8 +404,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
+   $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
+-  $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
+-  $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
++  // Unloaded: the server clears the engine's expert figures, so a bare "-" hides that the VRAM really did go back.
++  // Show what the card is doing instead - that is the answer to "did unloading free it?".
++  if (eng.expert_slots) {
++    $("slots-text").textContent = `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB`;
++  } else if (live.state === "unloaded") {
++    $("slots-text").textContent = hw.gpu_mem_used != null
++      ? `model unloaded · ${fmt(hw.gpu_mem_used / 1048576, 0)} MiB in use`
++      : "model unloaded";
++  } else {
++    $("slots-text").textContent = "–";
++  }
++  $("slots-bar").style.width = eng.expert_slots && hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
+   $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
+   const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
+   $("ram-bar").style.width = `${ramPct}%`;
+@@ -373,7 +470,10 @@ function renderAbout(eng, hw, st) {
+     ["Engine", eng.version ? `v${eng.version}` : "built from source"],
+     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
+     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
+-    ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
++    ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)`
++      : eng.arena_mib == null && eng.vram_free_mib == null && hw.gpu_mem_used != null
++        ? `none - model unloaded, ${fmt(hw.gpu_mem_used / 1048576, 0)} MiB in use`
++        : null],
+     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
+     ["Images", eng.images ? "on" : "off"],
+     ["Experimental speed projection", projectionText(eng.cvec)],
+@@ -452,7 +552,9 @@ async function loadConfig() {
+         opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
+     } else {
+       const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
+-      input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
++      const num = k.kind === "number" ? `type="number" step="any" min="0"` +
++        (k.max == null ? "" : ` max="${esc(k.max)}"`) : 'type="text"';
++      input = `<input class="st-input" id="${id}" ${num} ` +
+         `value="${esc(text)}" placeholder="default" autocomplete="off">`;
+     }
+     return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
+@@ -479,7 +581,9 @@ $("cfg-save").addEventListener("click", async () => {
+     const b = await r.json();
+     if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
+     $("cfg-msg").textContent = b.changed.length
+-      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Start the model again to use it.` : "Nothing changed.";
++      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. ` +
++        (b.changed.includes("idle_unload_s") ? "idle_unload_s applies now, the rest at the next start."
++                                             : "Start the model again to use it.") : "Nothing changed.";
+     loadConfig();
+   } catch (e) {
+     $("cfg-msg").textContent = "";
+diff --git a/serve/web/components.css b/serve/web/components.css
+index 899f525729..ec5ba58f37 100644
+--- a/serve/web/components.css
++++ b/serve/web/components.css
+@@ -112,7 +112,11 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
+ .st-label output{font-variant-numeric:tabular-nums;color:var(--st-ink-muted)}
+ .st-input{height:44px;padding:0 14px;border-radius:var(--st-r-md);border:1.5px solid var(--st-line);background:var(--st-surface);color:var(--st-ink);font:400 var(--st-fs-md) var(--st-font)}
+ .st-input:focus{outline:0;border-color:var(--st-focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--st-focus) 20%,transparent)}
+-.st-slider{width:100%;accent-color:var(--st-accent)}
++/* The thumb is left to the UA. --st-inset is how far the thumb's centre sits in from each end of the element, which
++   is what the idle popup's tick labels need to line up with: the UA gives the range a 2px margin and Chromium draws a
++   12px thumb, so 2 + 12/2 = 8 each side, 16 total. Measured in Chromium 153 at a 226px element (210px of travel).
++   Re-measure both together if you change the UA default or the thumb size. */
++.st-slider{--st-inset:16px;width:100%;accent-color:var(--st-accent)}
+ .st-toggle{position:relative;width:40px;height:24px;border-radius:var(--st-r-pill);border:0;background:var(--st-line);cursor:pointer;transition:background var(--st-dur)}
+ .st-toggle::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.2);transition:transform var(--st-dur) var(--st-ease)}
+ .st-toggle[aria-checked="true"]{background:var(--st-accent)}
+diff --git a/serve/web/index.html b/serve/web/index.html
+index 5c26ad8279..1410e7ff20 100644
+--- a/serve/web/index.html
++++ b/serve/web/index.html
+@@ -82,7 +82,26 @@
+             <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
+             <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
+             <span class="st-badge st-badge--error" data-s="error">Error</span>
++            <span class="st-badge" data-s="unloaded">Unloaded</span>
+           </span>
++          <span class="spacer"></span>
++          <div class="state-actions">
++            <div class="st-split">
++              <button class="st-btn st-btn--secondary" id="model-toggle" disabled>Unload</button>
++              <button class="st-btn st-btn--secondary st-btn--caret" id="idle-btn" aria-expanded="false"
++                      aria-label="Unload when idle" title="Unload when idle">
++                <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chevron"/></svg>
++                </button>
++            </div>
++            <div class="st-pop" id="idle-pop" hidden>
++              <div class="st-pop__head"><span class="card-title">Unload when idle</span>
++                <output id="idle-out">never</output></div>
++              <input class="st-slider" type="range" id="idle-slider" min="0" max="1000" step="1" value="0"
++                     aria-label="Minutes without a request before the model unloads">
++              <div class="st-pop__ticks"><span style="--pos:0">never</span><span style="--pos:375">15 min</span
++                ><span style="--pos:750">45 min</span><span style="--pos:1000">2 h</span></div>
++            </div>
++          </div>
+         </div>
+         <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
+         <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+@@ -175,8 +194,9 @@
+       </div>
+       <div class="st-card cfg-card" id="cfg-card" hidden>
+         <div class="req-head"><span class="card-title">Model settings</span><span class="muted small" id="cfg-file"></span></div>
+-        <p class="muted small">Kept in the model's run config for every client. An empty field is the default. They
+-          take effect the next time the model starts (close Strata's window and start it again).</p>
++        <p class="muted small">Kept in the model's run config for every client. An empty field is the default.
++          <code>idle_unload_s</code> applies right away; the rest the next time the model starts (close Strata's
++          window and start it again).</p>
+         <form class="cfg-form" id="cfg-form"></form>
+         <div class="cfg-actions"><button class="st-btn st-btn--primary" id="cfg-save" type="button">Save</button>
+           <span class="muted small" id="cfg-msg" role="status"></span></div>

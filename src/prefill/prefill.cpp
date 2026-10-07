@@ -784,6 +784,26 @@ constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
 // of the largest holds them all.  That is ~260 KB of the ~680 KB a prompt token cost - which is what lets a chunk
 // grow (every expert is streamed once per chunk, so a bigger chunk streams fewer bytes per token).  The sizes are
 // counted with the same `take` sequence `init` uses; a mismatch makes `init` fail with "do not fit", never overlap.
+struct HcScratch {
+    float *xn, *lo, *gated;
+    uint16_t *xn16, *lo16, *xn16_lo = nullptr, *lo16_lo = nullptr;
+};
+HcScratch take_hc(Alloc& a, size_t T, bool f16_io, bool& ok) {
+    HcScratch h;
+    h.xn = gr_unfused() ? a.take<float>(T * D, ok) : nullptr;
+    h.xn16 = a.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok);
+    h.lo = a.take<float>(T * LR, ok); h.lo16 = a.take<uint16_t>(T * LR, ok);
+    h.gated = a.take<float>(T * D, ok);
+    if (bf16x2_hc(f16_io)) {
+        h.xn16_lo = a.take<uint16_t>(T * D, ok); h.lo16_lo = a.take<uint16_t>(T * LR, ok);
+    }
+    return h;
+}
+uint64_t hc_set_bytes(size_t T, bool f16_io) {
+    Alloc a; a.count_only = true; bool ok = true;
+    take_hc(a, T, f16_io, ok);
+    return a.used;
+}
 uint64_t gdn_set_bytes(size_t T) {
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * C, ok); a.take<float>(T * ZV, ok); a.take<float>(T * 2 * HV, ok); a.take<float>(T * HV, ok);
@@ -1020,13 +1040,10 @@ bool Prefill::carve(size_t T, void* alloc) {
     core::SessionState& ss = *m.ss;
     bool ok = true;
     m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
-    m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
     m.grs = o.take<float>(T * HC, ok);
-    m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
-    m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
+    m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok); m.bo = o.take<float>(T * N, ok);
-    if (bf16x2_hc(m.f16_io)) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
     if (bf16x2(m.f16_io)) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -1035,15 +1052,21 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     {
-        // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
+        // HC's read finishes before attention/MoE starts on m.cs. The fused next-half norm
+        // follows their last consumers; it is disabled before PLE, which also uses the region.
         const bool fz = fused_layout(T, m.src != nullptr);
         m.fused_bufs = fz;
         const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
-        const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
+        const uint64_t region = std::max({hc_set_bytes(T, m.f16_io), gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
                                                                            m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz)});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         m.region = base;
         m.region_bytes = region;
+        Alloc h;
+        h.base = base; h.cap = region; h.owned = &m.owned;
+        const HcScratch hc = take_hc(h, T, m.f16_io, ok);
+        m.xn = hc.xn; m.xn16 = hc.xn16; m.lo = hc.lo; m.lo16 = hc.lo16;
+        m.gated = hc.gated; m.xn16_lo = hc.xn16_lo; m.lo16_lo = hc.lo16_lo;
         Alloc a;
         a.base = base; a.cap = region; a.owned = &m.owned;
         m.qkv = a.take<float>(T * C, ok); m.z = a.take<float>(T * ZV, ok); m.ab = a.take<float>(T * 2 * HV, ok);
@@ -1553,6 +1576,10 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     return bytes_needed_impl(g, ss, chunk, false);
 }
 
+uint64_t Prefill::persistent_bytes_needed() {
+    return Gemm::bf16_cache_reserve_bytes();
+}
+
 // What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
 // page, and the ring is one allocation (carve).  `bytes_needed` stays the borrowed region's sum.
 uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
@@ -1570,22 +1597,17 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
-    // `carve`'s order, buffer for buffer: emb, R, xn, grs, xn16, lo, lo16, gated, inj, mixed, mixed_bf, mixed_h,
-    // bo.  This counted `xn` unconditionally (carve takes it only under STRATA_GR_UNFUSED) and never counted
-    // `grs`.  Net over-count T*(D-HC)*4 bytes: 42 MB at a 1024-token chunk, 252 MB (48 Q8_0 slots) at 6144 - the
-    // prompt path was told it had less room than it did.  Safe - the direction is over-estimating, and `take`
-    // still bounds-checks - but it under-sizes every loan, so every chunk the scan picks is one step smaller.
+    // `carve`'s permanent buffers: emb, R, grs, inj, mixed, mixed_bf, mixed_h, bo.
+    // HC scratch is counted inside the shared region. Keep the legacy ring mode's
+    // conservative D-float reservation in place of HC-float grs.
     if (ring_bytes_on()) {
         f(T * N); f(T * D);
-        if (gr_unfused()) f(T * D);
         f(T * HC);
     } else {   // STRATA_RING_BYTES=0: 0.1.39's count
         f(T * N); f(T * D); f(T * D);
     }
-    o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
+    f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
-    if (bf16x2_hc(f16_io)) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2(f16_io)) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -1593,7 +1615,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     s.idx_dim = g.idx_key_dim;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+    o.take<uint8_t>((size_t) std::max({hc_set_bytes(T, f16_io), gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, true))}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
@@ -1659,7 +1681,8 @@ bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                std::string& err, int64_t ldy = 0, const uint16_t* X_lo = nullptr, int64_t ldx = 0) {
     if (w->kind != core::WeightKind::Bf16InF32 || !w->data) { err = "prefill: " + name + " is not a resident BF16 tensor"; return false; }
-    gm.bf16(X, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 0.0f, ldx);
+    // Resident WeightTable tensors outlive this Prefill; scratch/dequantized and drafter weights do not opt in.
+    gm.bf16_immutable(X, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 0.0f, ldx);
     if (X_lo) gm.bf16(X_lo, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f);
     return true;
 }
@@ -2204,14 +2227,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const float* emb = m.ple_emb + s0 * N;
                     if (pw.key_bf16 != nullptr) {
                         to_bf16(emb, e16, nb * N, m.cs, e16_lo);
-                        m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
+                        m.gemm.bf16_immutable(e16, pw.key_bf16, key, nb, HD, N);
                         if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
                     } else {
                         to_f16(emb, e16, nb * N, m.cs);
                         m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
                         to_bf16(emb, e16, nb * N, m.cs, e16_lo);
                     }
-                    m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
+                    m.gemm.bf16_immutable(e16, pw.value_bf16, val, nb, N, N);
                     if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
                     try {
                         strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
@@ -3583,6 +3606,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                      (long long) kv_prefetches);
     }
     stats_.ms_total += ms_since(t_start);
+    m.gemm.report_bf16_cache();
     if (pt.on) {
         pt.fold();
         double total = 0.0;

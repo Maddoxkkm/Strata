@@ -1,0 +1,257 @@
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index d385aa107c..e4c8dab305 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -1374,16 +1374,22 @@ test images.
+ 
+ ## Short prompts: let the CPU share the experts (opt-in, `STRATA_PREFILL_CPU_SHARE`)
+ 
+-A prompt chunk below 1,024 tokens (an agent's tool result, a test's output, a short follow-up) streams every routed
+-expert that is not in VRAM over PCIe, while the CPU pool that decodes sits idle and the RAM arena already holds those
+-experts. `STRATA_PREFILL_CPU_SHARE=auto` hands the pool the experts few of the chunk's tokens route to, measures per
+-layer how long each side takes and gives the CPU the share at which both end together (`STRATA_PREFILL_CPU_SHARE=0.4`
+-fixes a share). It is off unless you set it, and then the output is byte-identical to the build without it.
++A prompt chunk of a few thousand tokens (an agent's tool result, a test's output, a short follow-up) streams every routed
++expert that is not in VRAM over PCIe, while the CPU pool that decodes sits idle and RAM already holds those experts.
++`STRATA_PREFILL_CPU_SHARE=auto` hands the pool the experts few of the chunk's tokens route to, measures per layer how
++long each side takes and gives the CPU the share at which both end together (`STRATA_PREFILL_CPU_SHARE=0.4` fixes a
++share). It is off unless you set it, and then the output is byte-identical to the build without it.
++
++With it on, chunks below 3,072 tokens are staged after their routing (only those can hand the CPU a share) instead of
++streaming every expert from 1,024 tokens on; `STRATA_PREFILL_CPU_SHARE_MAX=1024` keeps the old limit. The CPU takes
++experts it reads from RAM as they are: the arena, the page-locked copy of the resident RAM mode, or the mapped
++`experts.bin`'s pages in the file cache (`--mmap-experts`), not only page-locked ones. Serve without `--batch`; on a
++layer split every stage has the pool and one stage at a time takes it for a chunk.
+ 
+ When on, the CPU's rows are computed in the CPU's own activation format, so the output changes in the last bits (first
+ token KL against off: mean 0.006, max 0.026 nats over 22 prompts; about half of the 32-token greedy answers on 500 and
+-1,000-token prompts are identical, the rest part at a near tie after about 23 tokens). Prompts of 2K tokens and longer
+-read the same either way (their chunks are above the limit). Serve without `--batch`, one GPU.
++1,000-token prompts are identical, the rest part at a near tie after about 23 tokens). Chunks of 3,072 tokens and more
++read the same either way.
+ 
+ Prompt time, medians of 10 interleaved pairs (off / auto, ms, `--expert-cache 1500`):
+ 
+@@ -1393,6 +1399,18 @@ Prompt time, medians of 10 interleaved pairs (off / auto, ms, `--expert-cache 15
+ | RTX 3060, Core Ultra 7 265, IQ3_XXS | 1,620 / 1,159 (-28%) | 2,196 / 1,770 (-19%) | unchanged |
+ | Tesla P100, Xeon E5-2690 v4, IQ3_XXS | 4,805 / 3,126 (-35%) | 6,821 / 5,085 (-25%) | unchanged |
+ 
++Up to 3,072 tokens and with mapped experts, fresh prompts read after an 8K prewarm, medians of 5 interleaved rounds
++(off / auto, ms; Ryzen 9 5900XT, 96 GB DDR4-3200, Windows 11, `--mmap-experts`, q4_0 KV; before this the share took no
++expert here: none was page-locked):
++
++| machine | 512 tokens | 1,000 tokens | 2,000 tokens | 3,000 tokens |
++|---|---|---|---|---|
++| RTX 5070 Ti (PCIe 3.0 x8), Swift 1.5 IQ3_XXS (huihui-ai's build) | 3,322 / 1,706 (-49%) | 3,990 / 2,357 (-41%) | 5,413 / 3,354 (-38%) | 5,525 / 4,309 (-22%) |
++| RTX 3060 + RTX 5070 Ti (layers 0-11 / 12-47, both PCIe 3.0 x8), IQ3_S | 3,452 / 2,037 (-41%) | 4,506 / 2,680 (-41%) | 6,376 / 3,869 (-39%) | 6,733 / 5,138 (-24%) |
++
++A coding agent's recorded conversation on the two cards (a 100K-token start, then 8 turns of 1-5K tokens of code, 128
++tokens written a turn, the same tokens read by both): 137.4 s off, 130.6 s auto (reading 121.1 -> 114.3 s).
++
+ ---
+ 
+ ## Experimental speed projection (EXPERIMENTAL, off by default)
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 03c4374d49..22fba8dbf8 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -168,10 +168,16 @@ class Prefill {
+     /// The CPU expert pool (decode's, idle while a prompt is read). With STRATA_PREFILL_CPU_SHARE set, a chunk below
+     /// stream_all_min() tokens - an agent's tool output - hands it the non-resident experts routed by at most MAXT of
+     /// its tokens, fewest first, up to a share of the experts it would stream (`auto`: measured, where both sides end
+-    /// together). The CPU reads them from RAM while the rest come over PCIe; their rows go to Dm's tail, as a peer's
+-    /// do. Not bit-identical to the GPU's rows (the CPU's own activation format). Unset (default) or null: every
+-    /// expert on the GPU. Only for a pool no other thread runs meanwhile (no batch slots). Set before `init`.
++    /// together). The CPU reads them from RAM (the arena, the page-locked copy, or the mapped experts.bin's pages)
++    /// while the rest come over PCIe; their rows go to Dm's tail, as a peer's do. Not bit-identical to the GPU's rows
++    /// (the CPU's own activation format). Unset (default) or null: every expert on the GPU. Only for a pool no other
++    /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
++    /// for a chunk. Set before `init`.
+     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
++    /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
++    /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
++    /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
++    static void arm_cpu_share(bool applies);
+ 
+ private:
+     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 23eaf1ddf8..a71edd648f 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -135,10 +135,13 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
+ // The chunk size from which every expert streams: 1024 since 0.1.30 (was 2048).  Measured on the 5070, Q2_0 / IQ2_XS,
+ // fixed cache: 1,500-token prompts 621 -> 785 / 612 -> 735 tok/s, 2,000 727 -> 934 / 712 -> 892, 4,000 (its last
+ // chunk) 779 -> 912 / 766 -> 844, the same output.  Below ~1,000 tokens the output changed on Q2_0 (a smaller chunk
+-// takes other kernels), so 1024 is the floor.  STRATA_PREFILL_STREAM_MIN overrides (A/B).
++// takes other kernels), so 1024 is the floor.  STRATA_PREFILL_STREAM_MIN overrides (A/B).  With the CPU share armed
++// (Prefill::arm_cpu_share) it is the share's own limit instead: the share applies to staged chunks only.
++int64_t g_stream_min_share = 0;
+ inline int64_t stream_all_min() {
+-    static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) 1024; }();
+-    return v;
++    static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
++    if (env >= 0) return env;
++    return g_stream_min_share > 0 ? g_stream_min_share : (int64_t) 1024;
+ }
+ // STRATA_PREFILL_CPU_SHARE (opt-in; set_cpu_pool): a chunk below stream_all_min() hands the decode CPU pool - idle
+ // while a prompt is read - the non-resident experts few of its tokens route to, instead of streaming them over PCIe.
+@@ -158,6 +161,19 @@ inline double cpu_share_env() {   // -1: measured
+     return v;
+ }
+ inline bool cpu_share_on() { return cpu_share_env() != 0.0; }
++// STRATA_PREFILL_CPU_SHARE_MAX (default 3072, at least 1024): with the share on, chunks below it are staged after their
++// routing - so they can hand the CPU its share - instead of streaming every expert the cards do not hold.  The share pays
++// on chunks up to ~3K tokens, where few tokens route to many of the streamed experts; 1024 keeps the old limit.
++inline int64_t cpu_share_max() {
++    static const int64_t v = [] {
++        const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX");
++        return e ? std::max<int64_t>(1024, (int64_t) std::atoll(e)) : (int64_t) 3072;
++    }();
++    return v;
++}
++// On a layer split every stage may have the pool (set_cpu_pool), and the stages read different chunks at the same time:
++// one stage at a time takes it for a chunk, the other reads its chunk with the GPU alone.
++std::atomic<bool> g_cpu_pool_busy{false};
+ double g_pinned_share = 1.0;
+ // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
+ // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
+@@ -900,6 +916,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
+         err = "prefill: the stage's layer range is wrong";
+         return false;
+     }
++    // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
++    arm_cpu_share(cpu_pool_ != nullptr);
+     for (int b = 0; next_ != nullptr && b < 2; ++b)
+         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+             err = "prefill: the layer split's hand-off buffers";
+@@ -1640,6 +1658,9 @@ int64_t Prefill::ring_max_slots() {
+ 
+ int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
+ void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
++void Prefill::arm_cpu_share(bool applies) {
++    if (applies && cpu_share_on()) g_stream_min_share = cpu_share_max();
++}
+ 
+ bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
+ 
+@@ -1988,6 +2009,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
+         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
+         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
++        // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
++        // of the chunk, after the last layer's CPU thread is joined)
++        struct PoolHold {
++            bool held = false;
++            ~PoolHold() { if (held) g_cpu_pool_busy.store(false, std::memory_order_release); }
++        } pool_hold;
++        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all) {
++            bool expect = false;
++            pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
++        }
+         const bool ps_on = stream_all && m.pp && m.pp->ps_frac > 0.0;
+         if (m.pp && !ps_on) m.pp->ps_flag.clear();
+         // multi-GPU: the peer's ring - issue its copies up to `limit` / give entries back (the peer device is current)
+@@ -2693,7 +2724,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
+                         if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
+                         else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+-                        const bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr &&
++                        const bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr &&
+                                                lay.native && !m.pp && !lay.fmt.empty();
+                         if (cpu_maybe) {
+                             const size_t want = (size_t) T * N;
+@@ -2749,19 +2780,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
+                                     continue;
+                                 ++nstream;
+-                                if (c <= strata::kernels::cpu::MAXT && m.src->pinned(l, e)) cand.emplace_back(c, e);
++                                // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
++                                // short-lived buffer (the arena's unpinned part, the mapped experts.bin's pages)
++                                if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
++                                    cand.emplace_back(c, e);
+                             }
+                             std::sort(cand.begin(), cand.end());
+                             const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
+                             const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) nstream));
+                             n_stream = nstream;
+-                            if (take > 0) {
+-                                on_cpu.assign((size_t) m.g->n_expert, 0);
+-                                for (size_t i = 0; i < take; ++i) {
+-                                    on_cpu[(size_t) cand[i].second] = 1;
+-                                    rows_cpu += cand[i].first;
++                            // The CPU thread touches no ExpertSource (its blob() counts reads without a lock, and its
++                            // calls race with this thread's own blob_stable()/pinned() ones): the pointers are taken
++                            // here, and an expert without a stable blob stays on the GPU.
++                            for (size_t i = 0; i < cand.size() && n_cpu < (int64_t) take; ++i) {
++                                const int32_t e = cand[i].second;
++                                const uint8_t* b = m.src->blob_stable(l, e);
++                                if (b == nullptr) continue;
++                                if (on_cpu.empty()) {
++                                    on_cpu.assign((size_t) m.g->n_expert, 0);
++                                    cpu_blob.assign((size_t) m.g->n_expert, nullptr);
+                                 }
+-                                n_cpu = (int64_t) take;
++                                on_cpu[(size_t) e] = 1;
++                                cpu_blob[(size_t) e] = b;
++                                rows_cpu += cand[i].first;
++                                ++n_cpu;
+                             }
+                         }
+                         // multi-GPU: the rows of the experts the peer computes go last, as one block [rows_local, T*K)
+@@ -2854,14 +2896,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 if (m.cpu_ev[0] == nullptr) { cudaEventCreate(&m.cpu_ev[0]); cudaEventCreate(&m.cpu_ev[1]); }
+                                 cudaEventRecord(m.cpu_ev[0], m.cs);
+                             }
+-                            // The thread touches no ExpertSource (its blob() counts reads without a lock, and its calls
+-                            // race with this thread's own blob_stable()/pinned() ones): the pointers are taken here.
+-                            cpu_blob.assign((size_t) m.g->n_expert, nullptr);
+-                            for (int32_t e = 0; e < m.g->n_expert; ++e)
+-                                if (on_cpu[(size_t) e] && (cpu_blob[(size_t) e] = m.src->blob_stable(l, e)) == nullptr) {
+-                                    err = "prefill: a CPU expert has no blob";
+-                                    return false;
+-                                }
+                             cpu_fut = std::async(std::launch::async, [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, src_h, l, T, r0c, this]() -> bool {
+                                 const auto t0 = std::chrono::steady_clock::now();
+                                 constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index a78d08860f..bbd1ac4c81 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -6036,6 +6036,10 @@ int main(int argc, char** argv) {
+         // confirms every emitted token against the real model regardless of where the draft came from.
+         const bool use_mtp = !o.mtp.empty();
+         strata::prefill::Prefill sp;
++        // the pool is idle while a prompt is read unless batch slots decode between its parts; with
++        // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
++        const bool share_pool = o.batch <= 0 && !o.no_pool;
++        strata::prefill::Prefill::arm_cpu_share(share_pool);
+         void* borrow = nullptr;
+         uint64_t borrow_bytes = 0;
+         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
+@@ -6322,6 +6326,7 @@ int main(int argc, char** argv) {
+                     sb = st.cache.device_slot(pf_parts[i + 1].first);
+                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
+                 }
++                if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
+                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
+                                 err, sb, sbb)) {
+                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
+@@ -6329,8 +6334,7 @@ int main(int argc, char** argv) {
+                 }
+             }
+             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+-            // the pool is idle while a prompt is read unless batch slots decode between its parts
+-            if (!multi_gpu && o.batch <= 0 && !o.no_pool) sp.set_cpu_pool(&pool);
++            if (share_pool) sp.set_cpu_pool(&pool);
+             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
+                 return err.find("do not fit") != std::string::npos ? 2 : 1;
+             return 0;
+@@ -10866,6 +10870,7 @@ int main(int argc, char** argv) {
+     int64_t pos_start = 0;
+     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
+     strata::prefill::Prefill prefill;
++    strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool);   // before the chunk below sizes the loan
+     bool kvg_started = false;   // the elastic K/V took this run's cells
+     double prefill_batched_ms = 0;
+     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
