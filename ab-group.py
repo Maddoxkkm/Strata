@@ -21,12 +21,13 @@ CFG = ROOT / "strata-iq2_xs.json"
 TOKENS = str(ROOT / "logs" / "prompt-ids.txt")
 
 VARIANTS_FILE = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "logs" / "ab-variants.json"
-if VARIANTS_FILE.exists():          # data-driven: [(label, exe, [args], [[env,val],...]), ...]
-    VARIANTS = [(v[0], v[1], v[2], [tuple(e) for e in v[3]]) for v in json.loads(VARIANTS_FILE.read_text())]
+if VARIANTS_FILE.exists():   # [label, exe, [args], [[env,val],...], tokens?]
+    VARIANTS = [(v[0], v[1], v[2], [tuple(e) for e in v[3]], (v[4] if len(v) > 4 else None))
+                for v in json.loads(VARIANTS_FILE.read_text())]
 else:
     VARIANTS = [
-        ("control",                "logs/binaries/strata-base.exe",  [], []),
-        ("control+unbuf=1",        "logs/binaries/strata-base.exe",  [], [("STRATA_UNBUFFERED_LOAD", "1")]),
+        ("control",                "logs/binaries/strata-base.exe",  [], [], None),
+        ("control+unbuf=1",        "logs/binaries/strata-base.exe",  [], [("STRATA_UNBUFFERED_LOAD", "1")], None),
     ]
 
 
@@ -35,9 +36,10 @@ def stop_server():
                     str(ROOT / "stop-strata.ps1")], cwd=str(ROOT), capture_output=True, text=True)
 
 
-def run(label, exe, extra_args, extra_env):
+def run(label, exe, extra_args, extra_env, tokens=None):
     cfg = json.loads(CFG.read_text(encoding="utf-8-sig"))
     cfg["exe"] = str(ROOT / exe)
+    prompt_file = tokens or TOKENS
     env = dict(os.environ)
     env.update({k: str(v) for k, v in (cfg.get("env") or {}).items()})
     for k, v in extra_env:
@@ -45,7 +47,7 @@ def run(label, exe, extra_args, extra_env):
     libs = [str(p) for p in cfg.get("lib_dirs", [])]
     if libs:
         env["PATH"] = os.pathsep.join(libs + [env.get("PATH", "")])
-    cmd = [cfg["exe"], *cfg["args"], *extra_args, "--tokens-file", TOKENS, "--stats"]
+    cmd = [cfg["exe"], *cfg["args"], *extra_args, "--tokens-file", str(prompt_file), "--stats"]
     reads = []
     stop = threading.Event()
 
@@ -86,11 +88,11 @@ def run(label, exe, extra_args, extra_env):
 if __name__ == "__main__":
     stop_server()
     rows = []
-    for label, exe, extra_args, extra_env in VARIANTS:
+    for label, exe, extra_args, extra_env, tokens in VARIANTS:
         if not (ROOT / exe).exists():
             print(f"  {label}: MISSING {exe}", flush=True)
             continue
-        r = run(label, exe, extra_args, extra_env)
+        r = run(label, exe, extra_args, extra_env, tokens)
         rows.append(r)
         print(f"  {label:<24} prefill {r.get('prefill', float('nan')):>7.1f} tok/s | decode "
               f"{r.get('decode', float('nan')):>5.1f} tok/s | host {r.get('host_s', 0):>5.1f} s | "
