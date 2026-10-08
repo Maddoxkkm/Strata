@@ -156,3 +156,37 @@ Applied onto `tuned-1403` as `strata-1403-cpushare.exe` (build 24 s):
 
 So the two that paid are in: **#1416 for short prompts** and **#1451** as hygiene. #1434's route is viable but
 loses the power reading we already have.
+
+## 10. Streaming KV: how much resident window this box can afford
+
+Streaming is the arrangement we want (it is what makes a 512K context cheap): the context's K/V lives in pinned RAM
+and only the attention's window sits in VRAM, so the VRAM goes to experts instead. `--kv-resident N` sets that
+window; **`0` means "keep every cell in VRAM"** (`src/core/layer.cpp:516`) and turns streaming off. Same 4K prompt,
+two rounds each, everything else unchanged:
+
+| KV arrangement | prefill | host | experts from files |
+|---|---|---|---|
+| **`--kv-resident 32768` (streaming, current)** | **948.4 / 931.4 (~940 tok/s)** | 2.2 s | **72%** |
+| `--kv-resident 65536` | 947.7 / 931.7 (~940 tok/s) | 2.0-2.3 s | 73% |
+| `--kv-resident 131072` | 880.8 / 875.1 (~878 tok/s) | 2.5-2.6 s | 75-76% |
+| `--kv-resident 0` (**no streaming**, all in VRAM) | 772.3 / 711.5 (~742 tok/s) | 3.0 s | **87%** |
+
+Reading it:
+- **Full residency costs ~12%** (940 -> 742 tok/s): with `--max-context 524288` the KV wants ~6.19 GiB of VRAM
+  whatever the live prompt length, and that comes straight out of the expert cache (72% -> 87% of experts read from
+  files). Streaming a 4K prompt costs almost nothing, so paying 6 GiB to avoid it is a bad trade here.
+- **The current window is at the plateau.** 32,768 and 65,536 are the same (~940); 131,072 starts to cost (~6.6%),
+  which is where the bigger window begins displacing expert slots.
+- So `--kv-resident 32768` stays, which also matches the author's own AMD page (`docs/AMD_HIP.md:284` uses exactly
+  `--kv int8 --kv-resident 32768`).
+- Streaming's price is RAM, not VRAM: ~13.7 KB per context token for int8 (6.19 GiB at 512K cells, confirmed live).
+  `--kv k8v4` would cut that to 4.78 GiB (23% less, ~1.4 GiB more RAM for the expert complement); it is verified
+  correct here but was a speed wash, so int8 stays.
+- `--kv-grow` (the elastic K/V, "the whole K/V in VRAM, no streaming") is a separate feature and is **gated off when
+  `--resident-budget-gib` is used** (`generate.cpp:1865` sets `resident_cpu_experts`, which `generate.cpp:3715`
+  requires to be false), so it cannot be combined with the flag that fixed our prefill.
+
+Post-sweep the server was restarted on the unchanged config and re-verified: `KV streaming: 32768 of 524288 cells
+per QSA layer in VRAM, the K/V in 6.19 GiB of pinned RAM`, RAM budget 12.56 GiB, fidelity **5/5**. One early answer
+read `39` for 17*23 at a 48-token budget and did not reproduce at the same budget (`finish_reason: stop`, `391`) -
+a truncated tail, not corruption; the 5-prompt suite passes.
