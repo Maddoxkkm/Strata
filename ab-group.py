@@ -78,7 +78,17 @@ def run(label, exe, extra_args, extra_env, tokens=None):
     if pre:
         _, toks, chunks, ms, rate, streamed, dma, host_ms, resident = (None, *pre.groups())
         tot = int(streamed) + int(resident)
-        out.update(prefill=float(rate), host_s=float(host_ms) / 1000, from_files=100 * int(streamed) / max(tot, 1))
+        out.update(prefill=float(rate), host_s=float(host_ms) / 1000, dma=int(dma),
+                   from_files=100 * int(streamed) / max(tot, 1))
+    bud = re.search(r"RAM budget ([\d.]+) GiB", text)
+    pin = re.search(r"resident ([\d.]+) GiB, pinned ([\d.]+) GiB", text)
+    cpy = re.search(r"prompt copies ([\d.]+) MB", text)
+    if bud:
+        out.update(budget=float(bud.group(1)))
+    if pin:
+        out.update(resident=float(pin.group(1)), pinned=float(pin.group(2)))
+    if cpy:
+        out.update(prompt_copies_mb=float(cpy.group(1)))
     if dec:
         out.update(decode=float(dec.group(3)))
     out.update(unbuffered=unb, disk_peak=max(reads) if reads else 0)
@@ -94,9 +104,9 @@ if __name__ == "__main__":
             continue
         r = run(label, exe, extra_args, extra_env, tokens)
         rows.append(r)
-        print(f"  {label:<24} prefill {r.get('prefill', float('nan')):>7.1f} tok/s | decode "
-              f"{r.get('decode', float('nan')):>5.1f} tok/s | host {r.get('host_s', 0):>5.1f} s | "
-              f"{r.get('from_files', 0):>3.0f}% from files | disk {r.get('disk_peak', 0):>5.0f} MB/s | "
-              f"unbuffered={r.get('unbuffered')}", flush=True)
+        print(f"  {label:<26} prefill {r.get('prefill', float('nan')):>7.1f} tok/s | host {r.get('host_s', 0)*1000:>6.0f} ms | "
+              f"DMA {r.get('dma', 0):>5} | decode {r.get('decode', float('nan')):>5.1f} tok/s | "
+              f"budget {r.get('budget', 0):>5.1f} GiB pinned {r.get('pinned', 0):>4.1f} | "
+              f"{r.get('from_files', 0):>3.0f}% from files | disk {r.get('disk_peak', 0):>5.0f} MB/s", flush=True)
     (ROOT / "logs" / "ab-group.json").write_text(json.dumps(rows, indent=1))
     print("\nwrote logs/ab-group.json")

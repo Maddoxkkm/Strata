@@ -190,3 +190,61 @@ Post-sweep the server was restarted on the unchanged config and re-verified: `KV
 per QSA layer in VRAM, the K/V in 6.19 GiB of pinned RAM`, RAM budget 12.56 GiB, fidelity **5/5**. One early answer
 read `39` for 17*23 at a 48-token budget and did not reproduce at the same budget (`finish_reason: stop`, `391`) -
 a truncated tail, not corruption; the 5-prompt suite passes.
+
+## 11. Where prefill and decode time actually goes (and what is left to get)
+
+Measured with the engine's own `--stats` counters, with the server stopped so the CLI run owns the GPU. `ab-group.py`
+now parses the staging fields (`host` ms, `by DMA`, budget, pinned), and `io-profile.py` runs the phases while
+sampling the physical disk.
+
+**The phase split, 4K prompt:** the read phase is 4,338.9 ms (942.4 tok/s); the whole prompt pass is 6,352.8 ms
+(643.65 tok/s). Inside the read phase, **host staging of the 16,048 streamed experts is 2,349.3 ms - 37% of the
+prefill** - and `0 by DMA`. Prompt copies 11,172.9 MB; the pass reads 21,443 blobs.
+
+**The drive is not the wall.** Through the prefill it averaged 1,357 MB/s (peak 2,823) against ~3.4 GB/s unbuffered
+capability, and the PCIe probe says 28.4 GB/s. With `0 by DMA` in every arm, every streamed byte goes
+file -> host buffer -> copy, so the only per-byte lever is having fewer bytes to stage.
+
+**Prefill sweep** (4K prompt, one pass per arm; compare by *budget*, since free RAM drifted between arms):
+
+| arm | budget | prefill | host staging |
+|---|---|---|---|
+| baseline (4 GiB headroom) | 11.2 GiB | 872.3 tok/s | 2,351 ms |
+| **`STRATA_RESIDENT_HEADROOM_GIB=2`** | **13.6 GiB** | **952.9** | **2,036 ms** |
+| `STRATA_RESIDENT_HEADROOM_GIB=1` | 15.0 GiB | 943.9 | 1,998 ms |
+| `STRATA_IO_THREADS=64` / `=16` | 12.5 / 12.4 | 931.4 / 931.2 | 2,113 / 2,236 ms |
+| `STRATA_PREFILL_AUTO_MAX=8192` | 12.7 GiB | 891.5 | 2,051 ms |
+| `STRATA_IO_PF_AHEAD=0` | 12.4 GiB | **823.8** (worst) | 2,086 ms |
+| `STRATA_RESIDENT_PIN=0` | 12.3 GiB | 921.0 | 2,229 ms |
+
+**Adopted: `STRATA_RESIDENT_HEADROOM_GIB=2`** (backup `logs/strata-iq2_xs.json.pre-headroom`) - the 4 GiB headroom
+was costing 2.4 GiB of resident experts; giving it back is **+9% prefill and 315 ms less staging**. 2 GiB, not 1,
+because leaving only 1 GiB free invites paging. Prefetch-ahead must stay on. I/O threads, chunk size and pinning
+are neutral (`pinned 0.0` in every arm - the driver never grants the lock here). Custom attention/GEMM kernels would
+not help staging; that is the other 32% of prefill and a separate project.
+
+**Decode: the CPU is 50-73% of it, and its knobs are already right.** The pool costs 8-18 ms/token of a 14-25 ms/token
+decode (41.6 GB/s effective). Interleaved arms, 160-token decodes:
+
+| arm | decode |
+|---|---|
+| baseline | 70.5 / 72.1 tok/s |
+| `--pool-workers 15` (SMT) | **58.6** (-19%) |
+| `--pool-workers 16` | **46.2** (-36%) |
+| `--pool-tasks 8` / `--pcie-frac 0.3` / `--pool-affinity all` / `--host-core last` | 71.7 / 71.2 / 69.5 / 71.0 (noise) |
+
+The pool is bandwidth-bound, so hyperthreads contend: the default (7 workers + the host drain on 8 physical cores)
+is the right shape. **AVX-512 is already in use** - the expert kernel is a dedicated `/arch:AVX512` TU
+(VNNI `_mm256_dpbusd_epi32`, VBMI `_mm256_multishift_epi64_epi8`) behind a runtime feature check that passes.
+
+**Decode warms up.** 16 tok -> 35.0 tok/s (pool 17.0 ms/token, 8 positions); 64 -> 55.5; 160 -> 61.3; 400 -> 66.0
+(pool 8.2 ms/token, 202 positions). The first tokens after a long prompt cost about twice as much per token.
+
+**`--adapt-every 0` is a short-answer setting, not a default.** It skips the periodic rebalance ("every
+`adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into the cache"); at 160 tokens it
+is **+26%** (82.7 vs 65.6 median, two interleaved rounds), but at 400 tokens it **loses** (54.0 vs 58.6, one arm
+48.8) even though it does *less* pool work per token - the frozen profile set accumulates misses instead. Left off.
+
+So: prefill had ~9% for free and it is now on; decode's CPU-side configuration is tapped out, and further gains need
+algorithmic work (faster IQ2 pool kernels, or computing fewer experts on the CPU via a better cache policy). That
+also demotes #1324's LRU: it targets the ~8% file-read share of decode.
