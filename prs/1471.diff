@@ -1,0 +1,905 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 995765af93..0a83547761 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -447,9 +447,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/remote_expert_opt.cu
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
++    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/idle_cache.cpp src/core/conversation_file.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
++  if(STRATA_BUILD_TESTS)
++    add_executable(idle_cache_test tests/cuda/idle_cache_test.cpp)
++    target_link_libraries(idle_cache_test PRIVATE strata_engine)
++    add_test(NAME idle_cache_test COMMAND idle_cache_test)
++    set_tests_properties(idle_cache_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
++  endif()
+   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
+     add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)
+     target_include_directories(exchange_storage_test PRIVATE include)
+diff --git a/docs/IDLE_SESSION.md b/docs/IDLE_SESSION.md
+new file mode 100644
+index 0000000000..e6524806e7
+--- /dev/null
++++ b/docs/IDLE_SESSION.md
+@@ -0,0 +1,38 @@
++# Idle session offload
++
++For a single CUDA GPU, the serving engine can save its session state to disk
++while keeping model weights loaded. This releases the session's physical VRAM
++and host checkpoint payloads between requests. It is disabled by default.
++
++Add these engine arguments:
++
++```
++--cache-idle-seconds 180 --cache-expire-seconds 3600 --cache-disk-dir /path/to/cache
++```
++
++Both intervals are measured from the end of the last generation. Expiry must
++exceed the idle interval. The directory needs room for the whole allocated
++session, including unused context capacity. CUDA virtual memory support and
++fully resident KV are required; batch, pipeline, multi-GPU, remote experts and
++elastic KV are rejected when this option is enabled.
++
++The engine saves between requests after pending GPU work completes. It flushes
++the snapshot before releasing memory. A failed write retains the in-memory
++cache and retries later. Restoring remaps the same virtual addresses so captured
++graphs remain valid. Missing, expired or corrupt snapshots discard the cached
++conversation; the next generation reads its prompt again. Failure to remap GPU
++memory terminates the engine. A save already in progress delays a new request.
++
++Snapshots are temporary, process-local caches, not conversation exports. They
++contain conversation state and should be stored in a private directory. Normal
++shutdown removes them; startup removes expired files belonging to this feature.
++`/v1/status` exposes `cache.state`, disk size, released bytes and operation time.
++
++Validation on Windows, RTX 2080 Ti, CUDA, IQ3_XXS and INT8 KV at 4096 context:
++the real HTTP lifecycle covered save/restore with a cache hit, corruption and
++expiry with prompt reread, and cancellation followed by another generation.
++The snapshot was 309,197,048 bytes; one measured save took about 5.3 seconds and
++restore about 367 ms. These are local measurements, not throughput claims.
++The native `idle_cache_test` checks exact multi-region restores and graph replay
++after remapping, constants, invalid snapshots and cleanup. Other GPU backends
++and hardware have not been runtime-tested.
+diff --git a/include/strata/core/idle_cache.hpp b/include/strata/core/idle_cache.hpp
+new file mode 100644
+index 0000000000..58ec33edf1
+--- /dev/null
++++ b/include/strata/core/idle_cache.hpp
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include "strata/core/vmm.hpp"
++#include <cstddef>
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++// Keeps graph-bound addresses reserved while their physical VRAM is absent.
++// Disabled allocations use cudaMalloc, preserving the normal allocation path.
++class IdleDeviceArena {
++public:
++    ~IdleDeviceArena();
++    IdleDeviceArena() = default;
++    IdleDeviceArena(const IdleDeviceArena&) = delete;
++    IdleDeviceArena& operator=(const IdleDeviceArena&) = delete;
++    bool allocate(size_t bytes, bool pageable, std::string& err);
++    bool map(std::string& err);
++    bool unmap(std::string& err);
++    bool remember_constant(const void* ptr, size_t bytes, std::string& err);
++    bool fresh(std::string& err);
++    void release();
++    void* data() const { return reinterpret_cast<void*>(address_); }
++    size_t size() const { return bytes_; }
++    size_t physical_bytes() const { return allocated_; }
++    bool resident() const { return mapped_; }
++private:
++    struct Constant { size_t offset; std::vector<uint8_t> bytes; };
++    uintptr_t address_ = 0;
++    VmmRange range_;
++    size_t bytes_ = 0, allocated_ = 0;
++    int device_ = 0;
++    bool pageable_ = false, mapped_ = false;
++    std::vector<Constant> constants_;
++};
++
++// One process-local snapshot. Metadata/pointers never come from the file: the
++// caller supplies the expected regions. Invalid files are a cache miss.
++class IdleSnapshot {
++public:
++    ~IdleSnapshot();
++    bool init(const std::string& directory, int expiry_seconds, std::string& err);
++    bool save(const std::vector<IdleDeviceArena*>& arenas,
++              const std::vector<std::vector<uint8_t>*>& hosts, std::string& err, int expires_in_seconds = -1);
++    bool restore(const std::vector<IdleDeviceArena*>& arenas,
++                 const std::vector<std::vector<uint8_t>*>& hosts, std::string& err);
++    bool erase(std::string& err);
++    const std::filesystem::path& path() const { return path_; }
++    uint64_t disk_bytes() const { return disk_bytes_; }
++    uint64_t host_bytes() const;
++private:
++    std::filesystem::path path_;
++    uint64_t nonce_ = 0, disk_bytes_ = 0;
++    int expiry_seconds_ = 0;
++    std::vector<size_t> host_sizes_;
++};
++
++} // namespace strata::core
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index d2266e55c7..302033f593 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -23,6 +23,7 @@
+ #include "strata/core/session.hpp"
+ #include "strata/kernels/sampler.hpp"
+ 
++#include "strata/core/idle_cache.hpp"
+ #include <cuda_runtime.h>
+ 
+ #include <cstdint>
+@@ -35,6 +36,8 @@ class NativeHead;
+ 
+ class MtpDrafter {
+ public:
++    void set_idle_cache(bool on) { idle_cache_ = on; }
++    IdleDeviceArena& idle_arena() { return idle_arena_; }
+     MtpDrafter() = default;
+     ~MtpDrafter();
+     MtpDrafter(const MtpDrafter&) = delete;
+@@ -234,6 +237,8 @@ class MtpDrafter {
+     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
+     bool owns_weights_ = true;
+     bool owns_draft_head_ = true;
++    bool idle_cache_ = false;
++    IdleDeviceArena idle_arena_;
+     void* state_arena_ = nullptr;
+     QsaState st_;
+     void* arena_ = nullptr;
+diff --git a/serve/server.py b/serve/server.py
+index d3b31c90ad..05b5246a54 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -594,6 +594,7 @@ def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str |
+         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+         self.last = {}
++        self.cache = {"state": "disabled"}
+         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+         self.prefill_tok_s_mean = None
+         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
+@@ -726,6 +727,17 @@ def _pump(self):
+         slot_q = self.slot_q
+         line = None
+         for line in proc.stdout:
++            if line.startswith("CACHE "):
++                cache = {}
++                for field in line.split()[1:]:
++                    k, _, v = field.partition("=")
++                    try:
++                        cache[k] = float(v) if "." in v else int(v)
++                    except ValueError:
++                        cache[k] = v
++                if self.proc is proc:
++                    self.cache = cache
++                continue
+             # checked before batch routing: a fatal line is never a slot's own
+             if line.startswith(FATAL_PREFIXES):
+                 # release_gpu_waits invalidates the verifier, even if the native
+@@ -2916,6 +2928,7 @@ def scaled(v, unit, digits=0):
+             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
+             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
+             "cache_max_tokens": ctx,
++            "cache": dict(getattr(self.engine, "cache", {"state": "disabled"})),
+             "context": {"native": ctx, "max_positions": ctx},
+             # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
+             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
+diff --git a/serve/test_idle_cache_status.py b/serve/test_idle_cache_status.py
+new file mode 100644
+index 0000000000..509b3a527e
+--- /dev/null
++++ b/serve/test_idle_cache_status.py
+@@ -0,0 +1,25 @@
++import io
++import queue
++import unittest
++from types import SimpleNamespace
++
++from serve.server import StrataEngine
++
++
++class IdleStatus(unittest.TestCase):
++    def test_idle_events_do_not_enter_the_request_queue(self):
++        engine = StrataEngine.__new__(StrataEngine)
++        engine.proc = SimpleNamespace(stdout=io.StringIO(
++            "CACHE state=disk released_vram_bytes=1048576 operation_ms=12.5\n"
++            "DONE 1 1 0 0 stop\n"))
++        engine.lines, engine.slot_q = queue.Queue(), []
++        engine._pump()
++        self.assertEqual(engine.cache, {"state": "disk", "released_vram_bytes": 1048576,
++                                        "operation_ms": 12.5})
++        self.assertTrue(engine.lines.get_nowait().startswith("DONE "))
++        self.assertIsNone(engine.lines.get_nowait())
++        self.assertTrue(engine.lines.empty())
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/src/core/idle_cache.cpp b/src/core/idle_cache.cpp
+new file mode 100644
+index 0000000000..7692415707
+--- /dev/null
++++ b/src/core/idle_cache.cpp
+@@ -0,0 +1,249 @@
++#include "strata/core/idle_cache.hpp"
++#include <cuda_runtime.h>
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <random>
++#include <system_error>
++#if defined(_WIN32)
++#include <io.h>
++#include <process.h>
++#else
++#include <unistd.h>
++#endif
++
++namespace strata::core {
++namespace {
++bool runtime(cudaError_t r, std::string& err) {
++    if (r == cudaSuccess) return true;
++    err = std::string("idle cache CUDA: ") + cudaGetErrorString(r);
++    return false;
++}
++FILE* open_file(const std::filesystem::path& p, bool write) {
++#if defined(_WIN32)
++    return _wfopen(p.c_str(), write ? L"wb" : L"rb");
++#else
++    return std::fopen(p.c_str(), write ? "wb" : "rb");
++#endif
++}
++struct File {
++    FILE* f;
++    ~File() { if (f) std::fclose(f); }
++};
++constexpr size_t chunk_bytes = 8u << 20;
++constexpr uint64_t magic = 0x31454c4449564b53ull; // SKVIDLE1
++uint64_t hash_bytes(const uint8_t* p, size_t n) {
++    uint64_t h = 1469598103934665603ull;
++    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
++    return h;
++}
++int64_t unix_seconds() {
++    return std::chrono::duration_cast<std::chrono::seconds>(
++        std::chrono::system_clock::now().time_since_epoch()).count();
++}
++bool put(FILE* f, uint64_t x) { return std::fwrite(&x, sizeof x, 1, f) == 1; }
++bool get(FILE* f, uint64_t expected) {
++    uint64_t x = 0;
++    return std::fread(&x, sizeof x, 1, f) == 1 && x == expected;
++}
++} // namespace
++
++IdleDeviceArena::~IdleDeviceArena() { release(); }
++
++bool IdleDeviceArena::allocate(size_t bytes, bool pageable, std::string& err) {
++    if (address_ || bytes == 0) { err = "idle arena: invalid allocation"; return false; }
++    bytes_ = bytes;
++    pageable_ = pageable;
++    if (!runtime(cudaGetDevice(&device_), err)) return false;
++    if (!pageable) {
++        void* p = nullptr;
++        if (!runtime(cudaMalloc(&p, bytes), err)) return false;
++        address_ = reinterpret_cast<uintptr_t>(p);
++        allocated_ = bytes;
++        mapped_ = true;
++        return true;
++    }
++    if (!vmm_available() || !range_.reserve(bytes)) { err = "idle cache requires CUDA virtual memory support"; return false; }
++    address_ = reinterpret_cast<uintptr_t>(range_.base());
++    allocated_ = range_.chunks() * vmm_granularity();
++    if (!map(err)) { release(); return false; }
++    return true;
++}
++
++bool IdleDeviceArena::map(std::string& err) {
++    if (mapped_) return true;
++    if (!pageable_ || !address_) { err = "idle arena: no reserved address"; return false; }
++    if (!range_.map_range(0, range_.chunks(), [] { return VmmChunk{0}; })) {
++        err = "idle arena: cannot map the session memory"; return false;
++    }
++    mapped_ = true;
++    return true;
++}
++
++bool IdleDeviceArena::unmap(std::string& err) {
++    if (!pageable_) { err = "idle arena was not allocated with VMM"; return false; }
++    for (int64_t i = 0; i < range_.chunks(); ++i) {
++        if (!range_.mapped(i)) continue;
++        const VmmChunk h = range_.unmap(i);
++        if (!h) { err = "idle arena: could not unmap a session page"; return false; }
++        vmm_chunk_free(h);
++    }
++    mapped_ = false;
++    return true;
++}
++
++bool IdleDeviceArena::remember_constant(const void* p, size_t n, std::string& err) {
++    const auto a = reinterpret_cast<uintptr_t>(p);
++    if (!mapped_ || a < address_ || n > bytes_ || a - address_ > bytes_ - n) {
++        err = "idle arena constant outside allocation"; return false;
++    }
++    Constant c{static_cast<size_t>(a - address_), std::vector<uint8_t>(n)};
++    if (!runtime(cudaMemcpy(c.bytes.data(), p, n, cudaMemcpyDeviceToHost), err)) return false;
++    constants_.push_back(std::move(c));
++    return true;
++}
++
++bool IdleDeviceArena::fresh(std::string& err) {
++    if (!map(err) || !runtime(cudaMemset(data(), 0, bytes_), err)) return false;
++    for (const auto& c : constants_)
++        if (!runtime(cudaMemcpy(static_cast<uint8_t*>(data()) + c.offset, c.bytes.data(), c.bytes.size(), cudaMemcpyHostToDevice), err)) return false;
++    return runtime(cudaDeviceSynchronize(), err);
++}
++
++void IdleDeviceArena::release() {
++    if (pageable_) range_.release();
++    else if (address_) cudaFree(data());
++    address_ = 0; bytes_ = allocated_ = 0; mapped_ = false;
++    constants_.clear();
++}
++
++IdleSnapshot::~IdleSnapshot() { std::string ignored; erase(ignored); }
++
++bool IdleSnapshot::init(const std::string& directory, int expiry_seconds, std::string& err) {
++    try {
++        const auto root = std::filesystem::absolute(std::filesystem::u8path(directory));
++        std::filesystem::create_directories(root);
++        // Only this feature's expired files; no recursive cleanup or model data.
++        for (const auto& e : std::filesystem::directory_iterator(root)) {
++            const auto name = e.path().filename().string();
++            if (e.is_symlink() || !e.is_regular_file() || name.rfind("strata-kv-idle-", 0) != 0 ||
++                (e.path().extension() != ".bin" && e.path().extension() != ".tmp")) continue;
++            File f{open_file(e.path(), false)};
++            uint64_t h[3]{};
++            const bool valid_header = f.f && std::fread(h, sizeof h, 1, f.f) == 1 && h[0] == magic;
++            const bool expired = valid_header ? h[2] <= static_cast<uint64_t>(unix_seconds()) :
++                std::filesystem::file_time_type::clock::now() - e.last_write_time() >= std::chrono::seconds(expiry_seconds);
++            if (f.f) { std::fclose(f.f); f.f = nullptr; }
++            if (expired) { std::error_code ec; std::filesystem::remove(e.path(), ec); }
++        }
++        std::random_device r;
++        nonce_ = (static_cast<uint64_t>(r()) << 32) ^ r();
++        expiry_seconds_ = expiry_seconds;
++        path_ = root / ("strata-kv-idle-" + std::to_string(nonce_) + ".bin");
++        return true;
++    } catch (const std::exception& e) { err = e.what(); return false; }
++}
++
++uint64_t IdleSnapshot::host_bytes() const {
++    uint64_t n = 0;
++    for (auto x : host_sizes_) n += x;
++    return n;
++}
++
++bool IdleSnapshot::save(const std::vector<IdleDeviceArena*>& arenas,
++                        const std::vector<std::vector<uint8_t>*>& hosts, std::string& err, int expires_in_seconds) {
++    auto temp = path_; temp.replace_extension(".tmp");
++    File f{open_file(temp, true)};
++    if (!f.f) { err = "cannot create idle cache snapshot"; return false; }
++    bool ok = true;
++    host_sizes_.clear();
++    for (auto* h : hosts) host_sizes_.push_back(h->size());
++    std::vector<uint8_t> buffer(chunk_bytes);
++    uint64_t written = 5 * sizeof(uint64_t);
++    ok = put(f.f, magic) && put(f.f, nonce_) && put(f.f, static_cast<uint64_t>(unix_seconds() +
++         (expires_in_seconds < 0 ? expiry_seconds_ : expires_in_seconds))) &&
++         put(f.f, arenas.size()) && put(f.f, hosts.size());
++    auto region = [&](const void* p, size_t bytes, bool device) {
++        if (!ok) return;
++        ok = put(f.f, bytes); written += sizeof(uint64_t);
++        for (size_t off = 0; ok && off < bytes;) {
++            const size_t n = std::min(chunk_bytes, bytes - off);
++            const uint8_t* src = static_cast<const uint8_t*>(p) + off;
++            if (device) {
++                ok = runtime(cudaMemcpy(buffer.data(), src, n, cudaMemcpyDeviceToHost), err);
++                src = buffer.data();
++            }
++            if (ok) ok = put(f.f, hash_bytes(src, n)) && std::fwrite(src, 1, n, f.f) == n;
++            off += n; written += n + sizeof(uint64_t);
++        }
++    };
++    for (auto* a : arenas) region(a->data(), a->size(), true);
++    for (auto* h : hosts) region(h->data(), h->size(), false);
++    if (ok) ok = std::fflush(f.f) == 0;
++#if defined(_WIN32)
++    if (ok) ok = _commit(_fileno(f.f)) == 0;
++#else
++    if (ok) ok = fsync(fileno(f.f)) == 0;
++#endif
++    if (std::fclose(f.f) != 0) ok = false;
++    f.f = nullptr;
++    std::error_code ec;
++    if (ok) { std::filesystem::rename(temp, path_, ec); ok = !ec; }
++    if (!ok) {
++        std::filesystem::remove(temp, ec);
++        if (err.empty()) err = "idle cache snapshot write/commit failed";
++        return false;
++    }
++    disk_bytes_ = written;
++    return true;
++}
++
++bool IdleSnapshot::restore(const std::vector<IdleDeviceArena*>& arenas,
++                           const std::vector<std::vector<uint8_t>*>& hosts, std::string& err) {
++    File f{open_file(path_, false)};
++    uint64_t expiry = 0;
++    bool ok = f.f && get(f.f, magic) && get(f.f, nonce_) && std::fread(&expiry, sizeof expiry, 1, f.f) == 1 &&
++              expiry > static_cast<uint64_t>(unix_seconds()) &&
++              get(f.f, arenas.size()) && get(f.f, hosts.size()) && hosts.size() == host_sizes_.size();
++    std::vector<uint8_t> buffer(chunk_bytes);
++    auto region = [&](void* p, size_t bytes, bool device) {
++        if (!ok) return;
++        ok = get(f.f, bytes);
++        for (size_t off = 0; ok && off < bytes;) {
++            const size_t n = std::min(chunk_bytes, bytes - off);
++            uint64_t hash = 0;
++            ok = std::fread(&hash, sizeof hash, 1, f.f) == 1 && std::fread(buffer.data(), 1, n, f.f) == n &&
++                 hash_bytes(buffer.data(), n) == hash;
++            if (ok) {
++                auto* dst = static_cast<uint8_t*>(p) + off;
++                if (device) ok = runtime(cudaMemcpy(dst, buffer.data(), n, cudaMemcpyHostToDevice), err);
++                else std::memcpy(dst, buffer.data(), n);
++            }
++            off += n;
++        }
++    };
++    for (auto* a : arenas) region(a->data(), a->size(), true);
++    for (size_t i = 0; ok && i < hosts.size(); ++i) {
++        hosts[i]->resize(host_sizes_[i]);
++        region(hosts[i]->data(), hosts[i]->size(), false);
++    }
++    if (ok) ok = std::fgetc(f.f) == EOF && !std::ferror(f.f);
++    if (!ok && err.empty()) err = "idle snapshot missing, truncated, or checksum mismatch";
++    return ok;
++}
++
++bool IdleSnapshot::erase(std::string& err) {
++    if (path_.empty()) return true;
++    std::error_code ec;
++    std::filesystem::remove(path_, ec);
++    if (ec) { err = "cannot delete idle cache snapshot: " + ec.message(); return false; }
++    auto temp = path_; temp.replace_extension(".tmp");
++    std::filesystem::remove(temp, ec);
++    if (ec) { err = "cannot delete incomplete idle cache snapshot: " + ec.message(); return false; }
++    disk_bytes_ = 0;
++    host_sizes_.clear();
++    return true;
++}
++} // namespace strata::core
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index e73ce24a09..7e47504afd 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -149,7 +149,7 @@ MtpDrafter::~MtpDrafter() {
+     if (sh_join_) cudaEventDestroy(sh_join_);
+     if (owns_weights_ && dense_) cudaFree(dense_);
+     if (owns_weights_ && experts_) cudaFree(experts_);
+-    if (state_arena_) cudaFree(state_arena_);
++    idle_arena_.release();
+     if (arena_) cudaFree(arena_);
+     if (head_logits_) cudaFree(head_logits_);
+     if (owns_draft_head_ && dhead_) { strata::kernels::native_q6_k_unpack(dhead_); cudaFree(dhead_); }
+@@ -336,20 +336,23 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
+     qsa_set_kv_hybrid(false);
+     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
+-    if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
++    if (!idle_arena_.allocate(sb, idle_cache_, err)) return false;
++    state_arena_ = idle_arena_.data();
+     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
+         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
+         cudaGetLastError();
+-        cudaFree(state_arena_);
++        idle_arena_.release();
+         st_ = QsaState{};
+         ring = -1;   // fully resident
+         sb = qsa_state_bytes(g, max_cells, false, ring);
+-        if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
++        if (!idle_arena_.allocate(sb, idle_cache_, err)) return false;
++        state_arena_ = idle_arena_.data();
+         if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
+     }
+     qsa_set_kv_int8(kv_int8_was);
+     qsa_set_kv_hybrid(kv_hybrid_was);
++    if (idle_cache_ && !idle_arena_.remember_constant(st_.page_table, (size_t) st_.n_pages * sizeof(int32_t), err)) return false;
+     qsa_state_zero(st_, g, nullptr);
+     cudaDeviceSynchronize();
+     vram_ += sb;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ce8e004744..b0c9481f4a 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "strata/platform/memory.hpp"
+ #include "strata/core/arch_defaults.hpp"
++#include "strata/core/idle_cache.hpp"
+ #include "strata/core/dma_batch.hpp"
+ #include "strata/core/device.hpp"
+ #include "strata/core/remote_expert_opt.hpp"
+@@ -377,6 +378,8 @@ struct Options {
+     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
+     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
+     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
++    int cache_idle_seconds = 0, cache_expire_seconds = 3600;
++    std::string cache_disk_dir;
+     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+     std::string dump_residual;
+     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
+@@ -662,6 +665,9 @@ void usage() {
+                  "  --ple-inflight N     outstanding SSD reads (default 256)\n"
+                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
+                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
++                 "  --cache-idle-seconds N  offload the idle session to disk, keeping model weights (0 = off)\n"
++                 "  --cache-expire-seconds N  discard the idle snapshot after N seconds (default 3600)\n"
++                 "  --cache-disk-dir DIR    process-local idle snapshots (one CUDA GPU, resident K/V)\n"
+                  "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
+                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
+                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
+@@ -1629,6 +1635,16 @@ int main(int argc, char** argv) {
+         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
+         else if (a == "--kv") o.kv = next("--kv");
+         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
++        else if (a == "--cache-idle-seconds" || a == "--cache-expire-seconds") {
++            const char* value = next(a.c_str()); char* end = nullptr;
++            const long seconds = std::strtol(value, &end, 10);
++            if (end == value || *end || seconds < 0 || seconds > 604800) {
++                std::fprintf(stderr, "strata: cache timer must be an integer in 0..604800 seconds\n"); return 2;
++            }
++            if (a == "--cache-idle-seconds") o.cache_idle_seconds = (int) seconds;
++            else o.cache_expire_seconds = (int) seconds;
++        }
++        else if (a == "--cache-disk-dir") o.cache_disk_dir = next("--cache-disk-dir");
+         else if (a == "--kv-grow") o.kv_grow = true;
+         else if (a == "--no-kv-grow") o.kv_grow = false;
+         else if (a == "--stream-token") o.stream_token = true;
+@@ -1968,6 +1984,25 @@ int main(int argc, char** argv) {
+         }
+     }
+     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
++    const bool idle_cache_enabled = o.cache_idle_seconds > 0;
++    strata::core::IdleSnapshot idle_snapshot;
++    if (idle_cache_enabled) {
++        bool remote = false;
++        for (size_t i = 0; i < o.expert_cache_remote.size(); ++i)
++            remote = remote || o.expert_cache_remote[i] > 0 || o.expert_cache_remote_auto[i];
++        const char* grow = std::getenv("STRATA_KV_GROW");
++        if (!o.serve || multi_gpu || remote || o.peer_device >= 0 || o.batch || o.pipeline_windows ||
++            o.kv_resident > 0 || o.kv_grow || (grow && grow[0] != '0' && grow[0] != '\0') ||
++            o.cache_disk_dir.empty() || o.cache_expire_seconds <= o.cache_idle_seconds ||
++            !strata::core::vmm_available()) {
++            std::fprintf(stderr, "strata: idle session offload needs --serve, one CUDA VMM GPU, resident K/V, "
++                                 "no batch/pipeline/kv-grow, a cache directory, and expiry > idle seconds\n"); return 2;
++        }
++        std::string why;
++        if (!idle_snapshot.init(o.cache_disk_dir, o.cache_expire_seconds, why)) {
++            std::fprintf(stderr, "strata: %s\n", why.c_str()); return 2;
++        }
++    }
+     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
+     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
+         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
+@@ -2722,6 +2757,7 @@ int main(int argc, char** argv) {
+     }
+ 
+     strata::core::SessionState ss;
++    strata::core::IdleDeviceArena session_memory;
+     void* sbuf = nullptr;   // allocated after the layer-split search, sized to CUDA0's own layer range (the carve)
+     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
+     // calls - `session_capture`, `session_replay`, `session_token` and `session_loop` - were handed `nullptr`,
+@@ -3715,10 +3751,11 @@ int main(int argc, char** argv) {
+             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
+             strata::core::ExpertCache::set_vmm(on);
+         }
+-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
++        if (!session_memory.allocate(strata::core::session_bytes(g, o.max_context, K, 0, hi0), idle_cache_enabled, err)) {
+             std::fprintf(stderr, "strata generate: session state allocation failed\n");
+             return 1;
+         }
++        sbuf = session_memory.data();
+         if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+             std::fprintf(stderr, "strata generate: session_init failed\n");
+             return 1;
+@@ -3859,7 +3896,22 @@ int main(int argc, char** argv) {
+ 
+     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
+     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
++    if (idle_cache_enabled) {
++        bool ok = true;
++        for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
++            const auto& q = ss.qsa_states[i];
++            ok = ok && session_memory.remember_constant(q.page_table, (size_t) q.n_pages * sizeof(int32_t), err);
++        }
++        if (g.n_qsa_layers() > 0) {
++            const size_t rope_bytes = (size_t) o.max_context * (size_t) (strata::kernels::qsa_real_shapes().n_rot / 2) * sizeof(float);
++            ok = ok && session_memory.remember_constant(ss.qsa_states[ss.qsa_primary()].cos_tab, rope_bytes, err) &&
++                 session_memory.remember_constant(ss.qsa_states[ss.qsa_primary()].sin_tab, rope_bytes, err);
++        }
++        if (!ok) { std::fprintf(stderr, "strata cache: %s\n", err.c_str()); return 1; }
++    }
++
+     strata::core::MtpDrafter mtp;
++    mtp.set_idle_cache(idle_cache_enabled);
+     // the draft layer's geometry (the canonical model's MTP head), `static` because MtpDrafter keeps a reference; the batch
+     // slots' draft-KV copies use this one too
+     static const strata::core::ModelGeometry draft_geometry{};
+@@ -7804,14 +7856,127 @@ int main(int argc, char** argv) {
+             in_eof = true;
+             in_cv.notify_one();
+         }).detach();
+-        auto next_line = [&](std::string& out) -> bool {
+-            std::unique_lock<std::mutex> lk(in_mu);
+-            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+-            if (in_lines.empty()) return false;
+-            out = std::move(in_lines.front());
+-            in_lines.pop_front();
++        std::vector<strata::core::IdleDeviceArena*> idle_arenas{&session_memory};
++        if (mtp.idle_arena().data()) idle_arenas.push_back(&mtp.idle_arena());
++        Clock::time_point idle_since = Clock::now(), idle_retry = Clock::now();
++        bool idle_seen_request = false, idle_on_disk = false, idle_expired = false;
++        uint64_t idle_host_released = 0;
++        auto idle_hosts = [&]() {
++            std::vector<std::vector<uint8_t>*> hosts;
++            for (auto& c : checks) { hosts.push_back(&c.gdn); hosts.push_back(&c.ple); hosts.push_back(&c.tails); hosts.push_back(&c.dead); hosts.push_back(&c.block_pos); }
++            return hosts;
++        };
++        auto idle_clear = [&]() {
++            live_ok = false;
++            std::vector<int32_t>().swap(live);
++            std::vector<ImgKey>().swap(live_imgs);
++            std::vector<ConvCheckpoint>().swap(checks);
++        };
++        auto idle_report = [&](const char* state, double ms = 0.0) {
++            if (!idle_cache_enabled) return;
++            uint64_t freed = 0;
++            for (auto* a : idle_arenas) if (!a->resident()) freed += a->physical_bytes();
++            std::printf("CACHE state=%s idle_seconds=%d expire_seconds=%d disk_bytes=%llu "
++                        "released_vram_bytes=%llu released_host_bytes=%llu tokens=%zu operation_ms=%.1f\n",
++                        state, o.cache_idle_seconds, o.cache_expire_seconds,
++                        (unsigned long long) idle_snapshot.disk_bytes(), (unsigned long long) freed,
++                        (unsigned long long) idle_host_released, live.size(), ms);
++            std::fflush(stdout);
++        };
++        idle_report("resident");
++        // Runs only on the engine thread, between requests, after the last async commit.
++        auto idle_tick = [&](bool allow_save) -> bool {
++            if (!idle_cache_enabled || !idle_seen_request) return true;
++            const auto now = Clock::now();
++            const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - idle_since).count();
++            if (age < o.cache_idle_seconds || now < idle_retry) return true;
++            std::string why;
++            if (age >= o.cache_expire_seconds) {
++                if (!idle_expired) {
++                    if (!ver.wait_commit(why) || cudaDeviceSynchronize() != cudaSuccess) return false;
++                    idle_clear();
++                    for (auto* a : idle_arenas) if (!a->unmap(why)) {
++                        std::fprintf(stderr, "strata cache: %s\n", why.c_str()); return false;
++                    }
++                    idle_on_disk = false;
++                    idle_expired = true;
++                }
++                if (!idle_snapshot.erase(why)) {
++                    std::fprintf(stderr, "strata cache: %s; retrying deletion\n", why.c_str());
++                    idle_retry = now + std::chrono::seconds(30);
++                }
++                idle_report("expired");
++                // No periodic traffic once deletion is complete; a new request resets this.
++                if (idle_snapshot.disk_bytes() == 0) idle_seen_request = false;
++                return true;
++            }
++            if (!allow_save || idle_on_disk || idle_expired || (!live_ok && checks.empty())) return true;
++            if (!ver.wait_commit(why) || cudaDeviceSynchronize() != cudaSuccess) return false;
++            auto hosts = idle_hosts();
++            const auto t0 = Clock::now();
++            idle_report("saving");
++            bool saved = false;
++            try { saved = idle_snapshot.save(idle_arenas, hosts, why, o.cache_expire_seconds - (int) age); }
++            catch (const std::exception& e) { why = e.what(); }
++            if (!saved) {
++                // Keep every in-memory byte on write failure; don't retry on every timer tick.
++                std::fprintf(stderr, "strata cache: save failed (%s); memory cache retained\n", why.c_str());
++                idle_retry = now + std::chrono::seconds(30);
++                idle_report("resident");
++                return true;
++            }
++            idle_host_released = idle_snapshot.host_bytes();
++            for (auto* a : idle_arenas) if (!a->unmap(why)) {
++                std::fprintf(stderr, "strata cache: %s\n", why.c_str()); return false;
++            }
++            for (auto* h : hosts) std::vector<uint8_t>().swap(*h);
++            idle_on_disk = true;
++            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
++            std::fprintf(stderr, "strata cache: saved %llu bytes to %s in %.1f ms; model remains resident\n",
++                         (unsigned long long) idle_snapshot.disk_bytes(), idle_snapshot.path().string().c_str(), ms);
++            idle_report("disk", ms);
+             return true;
+         };
++        auto idle_wake = [&]() -> bool {
++            if (!idle_cache_enabled || (!idle_on_disk && !idle_expired)) return true;
++            const auto t0 = Clock::now();
++            idle_report("restoring");
++            for (auto* a : idle_arenas) if (!a->map(err)) return false;
++            bool restored = false;
++            if (idle_on_disk) {
++                try { restored = idle_snapshot.restore(idle_arenas, idle_hosts(), err); }
++                catch (const std::exception& e) { err = e.what(); }
++                if (!restored) std::fprintf(stderr, "strata cache: %s; discarding cache and reading prompt again\n", err.c_str());
++            }
++            if (!restored) {
++                idle_clear();
++                for (auto* a : idle_arenas) if (!a->fresh(err)) return false;
++            }
++            std::string why;
++            if (!idle_snapshot.erase(why)) std::fprintf(stderr, "strata cache: %s\n", why.c_str());
++            idle_on_disk = idle_expired = false;
++            idle_host_released = 0;
++            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
++            std::fprintf(stderr, "strata cache: %s in %.1f ms\n", restored ? "restored exactly" : "fresh session", ms);
++            idle_report("resident", ms);
++            return true;
++        };
++        auto next_line = [&](std::string& out) -> bool {
++            for (;;) {
++                std::unique_lock<std::mutex> lk(in_mu);
++                if (!idle_cache_enabled) in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
++                else in_cv.wait_for(lk, std::chrono::seconds(1), [&] { return !in_lines.empty() || in_eof; });
++                if (in_eof && in_lines.empty()) return false;
++                // Expiration also runs when a request arrives after a suspended PC resumes.
++                const bool have_input = !in_lines.empty();
++                lk.unlock();
++                if (!idle_tick(!have_input)) return false;
++                lk.lock();
++                if (!in_lines.empty()) {
++                    out = std::move(in_lines.front()); in_lines.pop_front(); return true;
++                }
++            }
++        };
+         sp.should_stop = [&] { return stop_req.load(); };
+         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
+         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
+@@ -8486,6 +8651,9 @@ int main(int argc, char** argv) {
+                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
+                 save_profile("periodic");
+             if (line == "QUIT") break;
++            if (!idle_wake()) {
++                std::printf("FATAL idle restore: %s\n", err.c_str()); std::fflush(stdout); return 1;
++            }
+             // the watchdog watches a request from here until this iteration ends, whichever way it ends
+             struct BusyScope {
+                 BusyScope() {
+@@ -8714,6 +8882,10 @@ int main(int argc, char** argv) {
+                 continue;
+             }
+             const bool geni = line.rfind("GENI ", 0) == 0;
++            struct IdleRequestDone {
++                Clock::time_point& since; bool& seen; bool request;
++                ~IdleRequestDone() { if (request) { since = Clock::now(); seen = true; } }
++            } idle_done{idle_since, idle_seen_request, geni || line.rfind("GEN ", 0) == 0};
+             if (!geni && line.rfind("GEN ", 0) != 0) {
+                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
+                 continue;
+@@ -11930,7 +12102,7 @@ int main(int argc, char** argv) {
+     cudaFree(d_logits);
+     cudaFree(d_emb);
+     cudaFree(d_parts);
+-    cudaFree(sbuf);
++    session_memory.release();
+     cudaFree(arena);
+     return 0;
+ }
+diff --git a/tests/cuda/idle_cache_test.cpp b/tests/cuda/idle_cache_test.cpp
+new file mode 100644
+index 0000000000..5a6f320746
+--- /dev/null
++++ b/tests/cuda/idle_cache_test.cpp
+@@ -0,0 +1,91 @@
++#include "strata/core/idle_cache.hpp"
++#include <cuda_runtime.h>
++#include <cstdio>
++#include <fstream>
++#include <stdexcept>
++#include <vector>
++using strata::core::IdleDeviceArena;
++using strata::core::IdleSnapshot;
++static void check(bool b, const char* msg) { if (!b) throw std::runtime_error(msg); }
++int main() {
++    if (!strata::core::vmm_available()) return 77;
++    try {
++        std::string err;
++        IdleDeviceArena a, b;
++        check(a.allocate((9u << 20) + 31, true, err), err.c_str());
++        check(b.allocate(65536, true, err), err.c_str());
++        std::vector<uint8_t> expected(a.size()), second(b.size(), 43), host(1234567, 71), empty;
++        for (size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<uint8_t>(i * 13 + 7);
++        check(cudaMemcpy(a.data(), expected.data(), a.size(), cudaMemcpyHostToDevice) == cudaSuccess, "upload a");
++        check(cudaMemcpy(b.data(), second.data(), b.size(), cudaMemcpyHostToDevice) == cudaSuccess, "upload b");
++        check(a.remember_constant(a.data(), 64, err), err.c_str());
++        check(!a.remember_constant(static_cast<uint8_t*>(a.data()) + a.size(), 1, err), "bounds"); err.clear();
++        cudaGraph_t graph = nullptr;
++        cudaGraphExec_t exec = nullptr;
++        cudaStream_t stream = nullptr;
++        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess, "stream");
++        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess, "capture");
++        const auto grerr = cudaMemsetAsync(b.data(), 89, b.size(), stream);
++        check(grerr == cudaSuccess, cudaGetErrorString(grerr));
++        check(cudaStreamEndCapture(stream, &graph) == cudaSuccess, "capture end");
++        check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess, "graph instantiate");
++        IdleSnapshot snap;
++        check(snap.init("idle-cache-test-files", 3600, err), err.c_str());
++        const std::vector<IdleDeviceArena*> arenas{&a, &b};
++        const std::vector<std::vector<uint8_t>*> hosts{&host, &empty};
++        const auto address = a.data();
++        for (int cycle = 0; cycle < 3; ++cycle) {
++            check(snap.save(arenas, hosts, err), err.c_str());
++            check(snap.host_bytes() == host.size(), "host byte count");
++            check(std::filesystem::file_size(snap.path()) == snap.disk_bytes(), "disk byte count");
++            check(a.unmap(err) && b.unmap(err), err.c_str());
++            check(!a.resident() && !b.resident(), "physically released");
++            std::vector<uint8_t>().swap(host);
++            check(a.map(err) && b.map(err), err.c_str());
++            check(a.data() == address, "address stable");
++            check(snap.restore(arenas, hosts, err), err.c_str());
++            std::vector<uint8_t> out(a.size());
++            check(cudaMemcpy(out.data(), a.data(), out.size(), cudaMemcpyDeviceToHost) == cudaSuccess, "read restored");
++            check(out == expected && host == std::vector<uint8_t>(1234567, 71), "snapshot exact");
++            check(cudaGraphLaunch(exec, nullptr) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess, "graph after remap");
++            out.resize(b.size());
++            check(cudaMemcpy(out.data(), b.data(), out.size(), cudaMemcpyDeviceToHost) == cudaSuccess, "graph output");
++            check(out == std::vector<uint8_t>(out.size(), 89), "graph still uses correct address");
++            check(snap.erase(err), err.c_str());
++        }
++        check(snap.save(arenas, hosts, err), err.c_str());
++        { std::fstream f(snap.path(), std::ios::in | std::ios::out | std::ios::binary); f.seekp(256); f.put('!'); }
++        check(!snap.restore(arenas, hosts, err), "corruption rejected"); err.clear();
++        check(snap.erase(err), err.c_str());
++        check(snap.save(arenas, hosts, err), err.c_str());
++        std::filesystem::resize_file(snap.path(), 19);
++        check(!snap.restore(arenas, hosts, err), "truncation rejected"); err.clear();
++        check(snap.erase(err), err.c_str());
++        check(!snap.restore(arenas, hosts, err), "missing file rejected"); err.clear();
++        check(snap.save(arenas, hosts, err, 0), err.c_str());
++        check(!snap.restore(arenas, hosts, err), "expired snapshot rejected"); err.clear();
++        const std::filesystem::path abandoned = "idle-cache-test-files/strata-kv-idle-abandoned.tmp";
++        { std::ofstream f(abandoned); f << 'x'; }
++        std::filesystem::last_write_time(abandoned, std::filesystem::file_time_type::clock::now() - std::chrono::hours(2));
++        IdleSnapshot cleanup;
++        check(cleanup.init("idle-cache-test-files", 3600, err), err.c_str());
++        check(!std::filesystem::exists(snap.path()), "expired abandoned snapshot cleaned on startup");
++        check(!std::filesystem::exists(abandoned), "incomplete abandoned snapshot cleaned on startup");
++        check(snap.erase(err), err.c_str());
++        check(a.unmap(err) && a.fresh(err), err.c_str());
++        std::vector<uint8_t> fresh(a.size());
++        check(cudaMemcpy(fresh.data(), a.data(), fresh.size(), cudaMemcpyDeviceToHost) == cudaSuccess, "fresh copy");
++        for (size_t i = 0; i < fresh.size(); ++i) check(fresh[i] == (i < 64 ? expected[i] : 0), "fresh keeps only constants");
++        check(!a.allocate(8, true, err), "double allocation rejected"); err.clear();
++        IdleDeviceArena normal;
++        check(normal.allocate(4096, false, err), err.c_str());
++        check(!normal.unmap(err), "normal allocation protected"); err.clear();
++        IdleSnapshot invalid;
++        { std::ofstream f("idle-cache-test-files/not-a-directory"); f << 'x'; }
++        check(!invalid.init("idle-cache-test-files/not-a-directory/sub", 3600, err), "invalid directory rejected");
++        std::filesystem::remove("idle-cache-test-files/not-a-directory");
++        cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
++        std::puts("PASS: VMM graph replay, 3 exact multi-region restores, constants, corruption, truncation, missing file, expired-file cleanup, allocation and path failures");
++        return 0;
++    } catch (const std::exception& e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
++}

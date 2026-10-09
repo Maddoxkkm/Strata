@@ -1,644 +1,646 @@
-kind,name,field,category,default,shape,desc,in_usage,docs,reads,source
-engine_cli,--adapt-async,adapt_async,adapt (cache tier),0,1,--serve with the resident RAM mode (opt-in): the adaptive tier's swaps,True,,,src/program/generate.cpp:1743
-engine_cli,--adapt-decay,adapt_decay,adapt (cache tier),0.7f,,,False,,,src/program/generate.cpp:1742
-engine_cli,--adapt-every,adapt_every,adapt (cache tier),4,,"arithmetic write the same file (use with --spec-follow, --adapt-every 0)",True,,,src/program/generate.cpp:1741
-engine_cli,--adapt-swaps,adapt_swaps,adapt (cache tier),96,,--peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps),True,,,src/program/generate.cpp:1834
-engine_cli,--batch,batch,prompt / serve,0,,N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8,True,,,src/program/generate.cpp:1729
-engine_cli,--batch-groups,batch_groups,prompt / serve,1,G,--batch with a layer split: the slots in G groups pipelined through the GPUs,True,,,src/program/generate.cpp:1732
-engine_cli,--batch-mtp,batch_mtp,inputs & paths,false,,"--batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP",True,,,src/program/generate.cpp:1733
-engine_cli,--check-logits,check_logits,kernel experiments (A/B),false,,copy and check all logits in the stream-token path,True,,,src/program/generate.cpp:1635
-engine_cli,--control-vector,control_vector,other,,,FILE = scale 1).  --serve: requests switch it (cvec=0|1),True,,,src/program/generate.cpp:1796
-engine_cli,--control-vector-layer-range,control_vector_layer_range,other,,A B,the layers it follows (inclusive; default 1 .. the last),True,,,src/program/generate.cpp:1812
-engine_cli,--control-vector-scaled,control_vector_scaled,other,,,"FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's",True,,,src/program/generate.cpp:1797
-engine_cli,--conversation-cache-mib,conversation_cache_mib,prompt / serve,0,N,--serve: RAM budget for parked conversations (default 0 = off),True,,,src/program/generate.cpp:1764
-engine_cli,--conversation-cache-min-free-mib,conversation_cache_min_free_mib,prompt / serve,2560,N,--serve: physical RAM floor when parking or restoring a,True,,,src/program/generate.cpp:1765
-engine_cli,--coupled-draft,coupled_draft,speculation,strata::core::coupled_draft_env(),,enable coupled draft sampling for MTP drafter under sampling (STRATA_SPEC_COUPLED),True,,,src/program/generate.cpp:1690
-engine_cli,--cpu-oracle-q8-0,cpu_oracle_q8_0,kernel experiments (A/B),false,,experimental pinned CPU expert quantization and dot reduction,True,,,src/program/generate.cpp:1649
-engine_cli,--cvec-dir,cvec_dir,other,,,per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project),True,,,src/program/generate.cpp:1822
-engine_cli,--cvec-mode,cvec_mode,other,1,,add|project  h += s v (default) or h -= s (h.v) v with v unit,True,,,src/program/generate.cpp:1816
-engine_cli,--dump-final-r,dump_final_r,measurement / dumps,,,,False,,,src/program/generate.cpp:1727
-engine_cli,--dump-halves,dump_halves,measurement / dumps,,PATH,write both halves' block_out and inject per layer: the half bisection,True,,,src/program/generate.cpp:1621
-engine_cli,--dump-layers,dump_layers,measurement / dumps,,PATH,"write R after EVERY layer, per position: the C1 bisection ladder",True,,,src/program/generate.cpp:1620
-engine_cli,--dump-logits,dump_logits,measurement / dumps,,PATH,write one line of raw logits per position,True,,,src/program/generate.cpp:1610
-engine_cli,--dump-mixed,dump_mixed,measurement / dumps,,PATH,"write the post-attention residual (n_embd, f32)",True,,,src/program/generate.cpp:1619
-engine_cli,--dump-residual,dump_residual,measurement / dumps,,,"PATH write the final R (hc x n_embd, f32) for head bisection",True,,,src/program/generate.cpp:1618
-engine_cli,--dump-routing,dump_routing,measurement / dumps,,PATH,write the routed expert ids and weights per layer per position (P0.S8),True,,,src/program/generate.cpp:1622
-engine_cli,--embd-gguf,embd_gguf,inputs & paths,,PATH,the token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py:,True,,,src/program/generate.cpp:1652
-engine_cli,--eos-ids,eos_ids,sampling,"{248044, 248046}",,,False,,,src/program/generate.cpp:1829
-engine_cli,--expert-cache,expert_cache,KV & memory,0,N,R4: keep N expert blobs resident in VRAM and compute their rows on the,True,,,src/program/generate.cpp:1696
-engine_cli,--expert-cache-cpu-order,expert_cache_cpu_order,KV & memory,false,,experimental GPU expert reduction matching CPU order,True,,,src/program/generate.cpp:1835
-engine_cli,--expert-cache-per-layer,expert_cache_per_layer,KV & memory,false,,R4.2g: give each layer its OWN slots instead of letting the first,True,,,src/program/generate.cpp:1836
-engine_cli,--expert-cache-remote-placement,expert_cache_remote_placement,KV & memory,"""stripe""",,stripe|layer  distribute expert ranks or whole,True,,,src/program/generate.cpp:1707
-engine_cli,--expert-profile,expert_profile,inputs & paths,,,P,True,,,src/program/generate.cpp:1843
-engine_cli,--expert-profile-save,expert_profile_save,inputs & paths,,P,"--serve, #477: save what the adaptive tier learned (the experts in",True,,,src/program/generate.cpp:1844
-engine_cli,--expert-profile-save-every,expert_profile_save_every,inputs & paths,,,MIN minutes (default 10;,True,,,src/program/generate.cpp:1845
-engine_cli,--gpu,gpu,multi-GPU,,LIST,"run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every",True,,,src/program/generate.cpp:1574
-engine_cli,--gpu-only-full,gpu_only_full,multi-GPU,false,,"MEASURE: replay pre+post for all 48 layers plus the LM head, no pool.",True,,,src/program/generate.cpp:1659
-engine_cli,--gpu-stages,gpu_stages,multi-GPU,false,,R0.9: capture the layer as three graphs (mixer / ffn+router / post),True,,,src/program/generate.cpp:1847
-engine_cli,--gr-fp32-activations,gr_fp32_activations,kernel experiments (A/B),false,,experimental CUDA-oracle GR activation precision,True,,,src/program/generate.cpp:1636
-engine_cli,--gr-native-mmvf,gr_native_mmvf,inputs & paths,false,,experimental pinned GR norm/projections; implies FP32 activations,True,,,src/program/generate.cpp:1637
-engine_cli,--graph-only,graph_only,measurement / dumps,false,,.,True,,,src/program/generate.cpp:1658
-engine_cli,--greedy,greedy,sampling,true,,argmax (the default),True,,,src/program/generate.cpp:1605
-engine_cli,--host-core,host_core,CPU pool,,WHERE,"The host thread's core: first (the default: the first physical core, as always) or",True,,,src/program/generate.cpp:1671
-engine_cli,--keep-canonical,keep_canonical,kernel experiments (A/B),false,,A/B: also load canonical copies of natively served tensors (more VRAM),True,,,src/program/generate.cpp:1874
-engine_cli,--kv,kv,KV & memory,"""fp16""",,"k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell",True,,,src/program/generate.cpp:1630
-engine_cli,--kv-grow,kv_grow,KV & memory,false,,the K/V takes VRAM only for the cells the requests reach and the expert,True,,,src/program/generate.cpp:1632
-engine_cli,--kv-resident,kv_resident,KV & memory,0,N,KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the,True,,,src/program/generate.cpp:1631
-engine_cli,--layer-split,layer_split,multi-GPU,,,or,True,,,src/program/generate.cpp:1747
-engine_cli,--logits-stride,logits_stride,other,1,N,store every Nth row plus final input (default 1); N>1 requires --max-new 1,True,,,src/program/generate.cpp:1611
-engine_cli,--lookup-chain,lookup_chain,speculation,0,K,"opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue",True,,,src/program/generate.cpp:1778
-engine_cli,--lookup-chain-min,lookup_chain_min,speculation,3,M,the shortest context match --lookup-chain extends on (default 3),True,,,src/program/generate.cpp:1779
-engine_cli,--max-context,max_context,context & rope,4096,N,KV/state capacity (default 4096),True,,,src/program/generate.cpp:1595
-engine_cli,--max-new,max_new,other,16,N,tokens to generate (default 16),True,,,src/program/generate.cpp:1594
-engine_cli,--mmap-experts,mmap_experts,KV & memory,false,,for the same placement.,True,,,src/program/generate.cpp:1848
-engine_cli,--mtp,mtp,inputs & paths,,,"--batch-mtp          --batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP",True,,,src/program/generate.cpp:1738
-engine_cli,--mtp-draft-vocab,mtp_draft_vocab,inputs & paths,,FILE,opt-in: the draft head's token subset (default <mtp>/draft_vocab.bin),True,,,src/program/generate.cpp:1795
-engine_cli,--mtp-hnorm,mtp_hnorm,inputs & paths,,,pooled|stream  the draft layer's hidden-input norm: one RMS over all four streams,True,,,src/program/generate.cpp:1780
-engine_cli,--mtp-max-t,mtp_max_t,inputs & paths,0,M,cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes),True,,,src/program/generate.cpp:1777
-engine_cli,--mtp-q4,mtp_q4,inputs & paths,,,all|proj|head  opt-in: the draft layer's projections and/or draft head as 4-bit copies,True,,,src/program/generate.cpp:1788
-engine_cli,--mtp-window,mtp_window,inputs & paths,32768,,,False,,,src/program/generate.cpp:1739
-engine_cli,--native,native,inputs & paths,,SHARD1,"every full-context native path at once (plan v0.3 P1): stream-token,",True,,,src/program/generate.cpp:1650
-engine_cli,--native-bf16,native_bf16,inputs & paths,false,,experimental CUDA-oracle SSM/router/indexer BF16 projections,True,,,src/program/generate.cpp:1638
-engine_cli,--native-bf16-extra,native_bf16_extra,inputs & paths,false,,experimental CUDA-oracle PLE/shared gate BF16 projections,True,,,src/program/generate.cpp:1639
-engine_cli,--native-dense-gguf,native_dense_gguf,inputs & paths,,,PATH native GDN/QSA/shared projections; repeat for each source model shard,True,,,src/program/generate.cpp:1653
-engine_cli,--native-flash-attn-short,native_flash_attn_short,inputs & paths,false,,diagnostic pinned vector attention; --max-context <=256,True,,,src/program/generate.cpp:1643
-engine_cli,--native-gdn,native_gdn,inputs & paths,false,,experimental pinned CUDA GDN norms/gates/recurrence,True,,,src/program/generate.cpp:1642
-engine_cli,--native-head-gguf,native_head_gguf,inputs & paths,,PATH,native Q5_K head from model shard 1; requires --stream-token,True,,,src/program/generate.cpp:1651
-engine_cli,--native-moe-combine,native_moe_combine,inputs & paths,false,,experimental pinned CUDA routed/shared combination,True,,,src/program/generate.cpp:1641
-engine_cli,--native-ple-key,native_ple_key,inputs & paths,false,,experimental native PLE key; requires --native-dense-gguf,True,,,src/program/generate.cpp:1640
-engine_cli,--native-ple-postops,native_ple_postops,inputs & paths,false,,experimental pinned PLE postprojection arithmetic,True,,,src/program/generate.cpp:1647
-engine_cli,--native-qsa,native_qsa,inputs & paths,false,,experimental pinned QSA normalization and output gate,True,,,src/program/generate.cpp:1645
-engine_cli,--native-qsa-indexer,native_qsa_indexer,inputs & paths,false,,experimental pinned indexer key cache and pooling,True,,,src/program/generate.cpp:1644
-engine_cli,--native-rope,native_rope,inputs & paths,false,,experimental pinned text-only CUDA rotary arithmetic,True,,,src/program/generate.cpp:1646
-engine_cli,--native-router,native_router,inputs & paths,false,,experimental pinned CUDA 512-expert top-10 routing,True,,,src/program/generate.cpp:1648
-engine_cli,--no-capture,no_capture,measurement / dumps,false,,run the layers directly instead of replaying graphs,True,,,src/program/generate.cpp:1654
-engine_cli,--no-coupled-draft,no_coupled_draft,speculation,,,disable coupled draft sampling (propose argmax drafts),True,,,src/program/generate.cpp:1691
-engine_cli,--no-fast-attn,no_fast_attn,kernel experiments (A/B),false,,,False,,,src/program/generate.cpp:1877
-engine_cli,--no-fast-select,no_fast_select,kernel experiments (A/B),false,,,False,,,src/program/generate.cpp:1880
-engine_cli,--no-fused-gdn,no_fused_gdn,kernel experiments (A/B),false,,,False,,,src/program/generate.cpp:1879
-engine_cli,--no-fused-gr,no_fused_gr,kernel experiments (A/B),false,,A/B: the six-kernel hyper-connection read and a separate write (native),True,,,src/program/generate.cpp:1876
-engine_cli,--no-hit-poke,no_hit_poke,kernel experiments (A/B),false,,R4.2d's A/B arm.  The hit path pokes the driver once right after its,True,,,src/program/generate.cpp:1842
-engine_cli,--no-host-worker,no_host_worker,other,false,,"R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the",True,,,src/program/generate.cpp:1688
-engine_cli,--no-kv-grow,no_kv_grow,KV & memory,,,,False,,,src/program/generate.cpp:1633
-engine_cli,--no-ple,no_ple,other,false,,explicit diagnostic ablation of the PLE layer,True,,,src/program/generate.cpp:1624
-engine_cli,--no-ple-prefetch,no_ple_prefetch,file I/O,false,,"A/B arm: read the PLE table's sixteen rows one at a time, instead of",True,,,src/program/generate.cpp:1689
-engine_cli,--no-pool,no_pool,CPU pool,false,,skip the CPU expert pool (the GPU-only floor),True,,,src/program/generate.cpp:1655
-engine_cli,--no-prefill-borrow,no_prefill_borrow,prompt / serve,false,,,False,,,src/program/generate.cpp:1723
-engine_cli,--no-publish-kernel,no_publish_kernel,kernel experiments (A/B),false,,,False,,,src/program/generate.cpp:1878
-engine_cli,--no-spec-split,no_spec_split,speculation,,,,False,,,src/program/generate.cpp:1828
-engine_cli,--no-split-rows,no_split_rows,kernel experiments (A/B),false,,,False,,,src/program/generate.cpp:1722
-engine_cli,--no-token-graph,no_token_graph,kernel experiments (A/B),false,,A/B: two graphs per layer (the host launches each) instead of one per token,True,,,src/program/generate.cpp:1875
-engine_cli,--pack,pack,inputs & paths,"""pack/full""",DIR,the pack directory (default pack/full),True,,,src/program/generate.cpp:1575
-engine_cli,--pcie-frac,pcie_frac,file I/O,-1.0,,,False,,,src/program/generate.cpp:1740
-engine_cli,--pcie-mode,pcie_mode,file I/O,"""auto""",,,False,,,src/program/generate.cpp:1750
-engine_cli,--peer-adapt-swaps,peer_adapt_swaps,KV & memory,-1,N,peer cache swaps per adaptation step (default: --adapt-swaps),True,,,src/program/generate.cpp:1840
-engine_cli,--peer-device,peer_device,KV & memory,-1,N,a second GPU as an adaptive expert-cache tier (rows over P2P; it also,True,,,src/program/generate.cpp:1837
-engine_cli,--peer-prefill-rows,peer_prefill_rows,KV & memory,-1,N,prompt rows per layer the peer computes (default half of chunk x top-k;,True,,,src/program/generate.cpp:1841
-engine_cli,--peer-reserve-mib,peer_reserve_mib,KV & memory,600,N,VRAM the peer tier leaves free on its card (default 600),True,,,src/program/generate.cpp:1838
-engine_cli,--peer-slots,peer_slots,KV & memory,0,N,expert slots on the peer (default: what fits),True,,,src/program/generate.cpp:1839
-engine_cli,--pipeline-windows,pipeline_windows,multi-GPU,0,,N --serve with a layer split on two GPUs (opt-in): one conversation's verify windows,True,,,src/program/generate.cpp:1775
-engine_cli,--ple-delay-us,ple_delay_us,file I/O,0,U,fault injection: each row read completes no earlier than U us,True,,,src/program/generate.cpp:1628
-engine_cli,--ple-gguf,ple_gguf,inputs & paths,,PATH,"the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,",True,,,src/program/generate.cpp:1623
-engine_cli,--ple-inflight,ple_inflight,file I/O,256,N,outstanding SSD reads (default 256),True,,,src/program/generate.cpp:1627
-engine_cli,--ple-io,ple_io,file I/O,"""direct""",,direct|mmap|ram  n-gram table reads (plan v0.3 P2). direct (default): unbuffered SSD,True,,,src/program/generate.cpp:1625
-engine_cli,--ple-row-cache,ple_row_cache,file I/O,1 << 20,N,"bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)",True,,,src/program/generate.cpp:1626
-engine_cli,--ple-sync-submit,ple_sync_submit,file I/O,false,,A/B arm: submit table reads on the token thread (default: an I/O thread),True,,,src/program/generate.cpp:1629
-engine_cli,--pool-affinity,pool_affinity,CPU pool,,,"MODE Worker CPU affinity: all (default: one worker per physical core, as",True,,,src/program/generate.cpp:1678
-engine_cli,--pool-tasks,pool_tasks,CPU pool,0,N,Batched CPU expert tasks per GU/Down phase (0..4096). Default 0 =,True,,,src/program/generate.cpp:1661
-engine_cli,--pool-workers,pool_workers,CPU pool,0,N,R2.2: CPU expert pool worker count.  Default 0 = every physical core,True,,,src/program/generate.cpp:1660
-engine_cli,--prefill,prefill_chunk,prompt / serve,0,CHUNK,batched prompt processing in chunks of CHUNK tokens (needs --native); auto =,True,,,src/program/generate.cpp:1712
-engine_cli,--prefill-until,prefill_until,prompt / serve,0,,,False,,,src/program/generate.cpp:1726
-engine_cli,--prompt-cache,prompt_cache,prompt / serve,6,,and --prompt-cache-every > 0),True,,,src/program/generate.cpp:1753
-engine_cli,--prompt-cache-every,prompt_cache_every,prompt / serve,16384,N,"--serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)",True,,,src/program/generate.cpp:1770
-engine_cli,--prompt-cache-root,prompt_cache_root,prompt / serve,2048,,,False,,,src/program/generate.cpp:1771
-engine_cli,--prompt-cache-tail,prompt_cache_tail,prompt / serve,false,,"--serve, single GPU: one extra checkpoint near the prompt's end, at an existing",True,,,src/program/generate.cpp:1769
-engine_cli,--remote-expert-opt,remote_expert_opt,other,false,,enable remote-expert decode optimizations (serve mode),True,,,src/program/generate.cpp:1706
-engine_cli,--resident-budget-gib,resident_budget_gib,KV & memory,,,,False,,,src/program/generate.cpp:1861
-engine_cli,--resident-cpu-experts,resident_cpu_experts,KV & memory,false,,"with mmap and a static profile, keep the experts the GPU cache does not",True,,,src/program/generate.cpp:1850
-engine_cli,--resident-experts,resident_experts,KV & memory,,,the low-RAM PC's resident mode (setup): --mmap-experts --resident-cpu-experts,True,,,src/program/generate.cpp:1851
-engine_cli,--rope-freq-base,rope_freq_base,context & rope,0,N,the raw ggml knobs: the frequency base (0 = the model's 1e7) and,True,,,src/program/generate.cpp:1598
-engine_cli,--rope-freq-scale,rope_freq_scale,context & rope,0,F,the angle shrink (0 = 1/--rope-scale),True,,,src/program/generate.cpp:1599
-engine_cli,--rope-scale,rope_scale,context & rope,0,F,the extension factor for linear/yarn (default: the model file's,True,,,src/program/generate.cpp:1597
-engine_cli,--rope-scaling,rope_scaling,context & rope,,T,"extend the context past the trained one: none, linear",True,,,src/program/generate.cpp:1596
-engine_cli,--seed,seed,sampling,0,S,enable sampling with this Philox seed,True,,,src/program/generate.cpp:1606
-engine_cli,--serve,serve,prompt / serve,false,,--adapt-async 1      --serve with the resident RAM mode (opt-in): the adaptive tier's swaps,True,,,src/program/generate.cpp:1751
-engine_cli,--session-min-free-mib,session_min_free_mib,prompt / serve,4096,N,--serve: disk space a SAVE must leave free (default 4096; 0 = no check),True,,,src/program/generate.cpp:1766
-engine_cli,--shared-expert-arena,shared_expert_arena,inputs & paths,,FILE,Linux: back the resident arena with one MAP_SHARED file.,True,,,src/program/generate.cpp:1849
-engine_cli,--shared-late,shared_late,kernel experiments (A/B),false,,A/B: shared expert after the CPU pool (default: overlapped with it),True,,,src/program/generate.cpp:1873
-engine_cli,--short-read,short_read,prompt / serve,64,N,--serve: read at most N fresh text tokens through the decode windows instead,True,,,src/program/generate.cpp:1774
-engine_cli,--slots,batch,prompt / serve,0,,--batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8,True,,,src/program/generate.cpp:1730
-engine_cli,--spec,spec,speculation,0,,; not --serve),True,,,src/program/generate.cpp:1728
-engine_cli,--spec-corrupt,spec_corrupt,speculation,0,,,False,,,src/program/generate.cpp:1735
-engine_cli,--spec-follow,spec_follow,speculation,,,", --adapt-every 0)",True,,,src/program/generate.cpp:1736
-engine_cli,--spec-min-p,spec_min_p,speculation,0.0,P,how sure the draft layer must be to extend a verify window by another guess,True,,,src/program/generate.cpp:1744
-engine_cli,--spec-oracle,spec_oracle,speculation,,,,False,,,src/program/generate.cpp:1734
-engine_cli,--spec-split,spec_split,speculation,false,,,False,,,src/program/generate.cpp:1746
-engine_cli,--split-device,split_device,multi-GPU,,,,False,,,src/program/generate.cpp:1748
-engine_cli,--split-skip-if-fits,split_skip_if_fits,other,false,,,False,,,src/program/generate.cpp:1749
-engine_cli,--stage-timing,stage_timing,measurement / dumps,false,,cannot give.  Prints and exits.,True,,,src/program/generate.cpp:1657
-engine_cli,--stats,stats,measurement / dumps,false,,print the per-stage breakdown,True,,,src/program/generate.cpp:1872
-engine_cli,--stop-eos,stop_eos,sampling,false,,,False,,,src/program/generate.cpp:1745
-engine_cli,--stream-token,stream_token,kernel experiments (A/B),false,,enqueue token work on the session stream (experimental),True,,,src/program/generate.cpp:1634
-engine_cli,--suffix-draft,suffix_draft,speculation,3,,"lets it grow by 2, up to 8, where a repeat is likely)",True,,,src/program/generate.cpp:1776
-engine_cli,--sync-every-layer,sync_every_layer,measurement / dumps,false,,debug: synchronise after every layer,True,,,src/program/generate.cpp:1656
-engine_cli,--tail-role-token,tail_role_token,prompt / serve,-1,,ID --serve: a turn of this role right before the last turn is left out of,True,,,src/program/generate.cpp:1773
-engine_cli,--temperature,temperature,sampling,1.0f,,--top-k N --top-p F --temperature F,True,,,src/program/generate.cpp:1609
-engine_cli,--tokens,tokens,inputs & paths,,LIST,the prompt as comma-separated token IDS (required),True,,,src/program/generate.cpp:1576
-engine_cli,--tokens-file,tokens_file,inputs & paths,,PATH,"pretokenized prompt, commas or whitespace (alternative to --tokens)",True,,,src/program/generate.cpp:1582
-engine_cli,--top-k,top_k,sampling,20,,N --top-p F --temperature F,True,,,src/program/generate.cpp:1607
-engine_cli,--top-p,top_p,sampling,0.95f,,--top-k N --top-p F --temperature F,True,,,src/program/generate.cpp:1608
-engine_cli,--trim-stage-weights,trim_stage_weights,multi-GPU,false,,an explicit --layer-split: each GPU loads only its own layers' dense weights,True,,,src/program/generate.cpp:1731
-engine_cli,--turn-token,turn_token,prompt / serve,248045,ID,"--serve: the token that opens a chat turn (default 248045, <|im_start|>)",True,,,src/program/generate.cpp:1772
-engine_cli,--vision,vision,prompt / serve,false,,--serve takes images too (GENI requests; embeddings from strata-vision),True,,,src/program/generate.cpp:1752
-engine_cli,--vram-elastic,vram_elastic,KV & memory,false,,"--serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,",True,,,src/program/generate.cpp:1724
-engine_cli,--vram-reserve-later-mib,vram_reserve_later_mib,KV & memory,-1,,,False,,,src/program/generate.cpp:1710
-engine_cli,--vram-reserve-mib,vram_reserve_mib,KV & memory,700,,,False,,,src/program/generate.cpp:1709
-engine_cli,--vram-segment-mib,vram_segment_mib,KV & memory,512,,"--vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,",True,,,src/program/generate.cpp:1725
-engine_cli,--window-hashes,window_hashes,speculation,,,"PATH per verify window, a line with its index, position, size, a 64-bit hash of",True,,,src/program/generate.cpp:1737
-engine_cli,--yarn-attn-factor,yarn_attn_factor,context & rope,1.0,,--yarn-ext-factor F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F,True,,,src/program/generate.cpp:1602
-engine_cli,--yarn-beta-fast,yarn_beta_fast,context & rope,32.0,,--yarn-ext-factor F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F,True,,,src/program/generate.cpp:1603
-engine_cli,--yarn-beta-slow,yarn_beta_slow,context & rope,1.0,,--yarn-ext-factor F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F,True,,,src/program/generate.cpp:1604
-engine_cli,--yarn-ext-factor,yarn_ext_factor,context & rope,-1.0,,F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F,True,,,src/program/generate.cpp:1601
-engine_cli,--yarn-orig-ctx,yarn_orig_ctx,context & rope,0,N,the trained context the correction targets (0 = 262144),True,,,src/program/generate.cpp:1600
-env,STRATA_ADAPT_JOB_CPU,,program,presence flag,,,False,,2,src/program/generate.cpp:1277
-env,STRATA_ADAPT_LAG,,program,integer; value; code default 1,,,False,docs,2,src/program/generate.cpp:1221
-env,STRATA_ADAPT_NOWAIT,,program,opt-in (needs 1),,,False,docs,2,src/program/generate.cpp:1211
-env,STRATA_ALLOWED_HOSTS,,server.py,presence flag,,,False,,1,serve/server.py:5480
-env,STRATA_API_KEY,,results,presence flag,,,False,,7,bench/results/2026-09-29-rtx3090-epyc-milan/data/strata-bench.py:250
-env,STRATA_ARENA_ALIAS_CHECK,,include,on by default (0 turns off),,,False,docs,1,sycl/include/strata/sycl_queue.hpp:167
-env,STRATA_ARENA_LOCK,,core,presence flag,,,False,,6,src/core/pinned.cu:414
-env,STRATA_ARENA_MMAP,,core,opt-in (needs 1),,,False,docs,6,src/core/expert_source.cpp:3797
-env,STRATA_ARENA_PIN_GIB,,core,presence flag,,,False,docs,2,src/core/pinned.cu:300
-env,STRATA_ARENA_RELEASE,,program,presence flag,,,False,docs,2,src/program/generate.cpp:5494
-env,STRATA_ARGMAX_MULTI,,kernels,presence flag,,,False,docs,2,src/kernels/cuda/sampler.cu:1256
-env,STRATA_ATTN_LANECELL,,kernels,opt-in (needs 1),,,False,docs,2,src/kernels/cuda/qsa_decode_attn.cu:548
-env,STRATA_ATTN_PRE75,,kernels,presence flag,,,False,docs,2,src/kernels/cuda/qsa_decode_attn.cu:490
-env,STRATA_BATCH_DECODE_SHARE,,program,presence flag,,,False,docs,2,src/program/generate.cpp:9524
-env,STRATA_BATCH_MTP,,program,presence flag,,,False,docs,4,src/program/generate.cpp:3789
-env,STRATA_BATCH_TRACE,,server.py,presence flag,,,False,,1,serve/server.py:538
-env,STRATA_BF16_TC,,prefill,presence flag,,,False,docs,2,src/prefill/gemm.cu:545
-env,STRATA_BF16_TC_CACHE,,prefill,presence flag,,,False,docs,1,src/prefill/gemm.cu:574
-env,STRATA_BF16_TC_CACHE_MIB,,prefill,presence flag,,,False,docs,1,src/prefill/gemm.cu:576
-env,STRATA_CACHE_MESSAGE_BOUNDARY,,program,presence flag,,,False,docs,2,src/program/generate.cpp:9676
-env,STRATA_CFG,,results,presence flag,,,False,,1,bench/results/2026-10-06-community-rtx4090-opt-ins/conc_bench.py:34
-env,STRATA_CHUNKED_FILL,,include,presence flag,,,False,,1,sycl/include/strata/sycl_queue.hpp:22
-env,STRATA_CKPT_REREAD,,program,opt-in (presence),,,False,,4,src/program/generate.cpp:9169
-env,STRATA_COMMIT_SYNC,,core,presence flag,,,False,,2,src/core/verify.cpp:2216
-env,STRATA_CPU_YMM,,kernels,presence flag,,,False,,1,src/kernels/cpu/expert.cpp:153
-env,STRATA_CUDA,,other,presence flag,,,False,,1,setup.py:4577
-env,STRATA_CVEC_FUSE,,prefill,opt-in (needs 1),,,False,docs,2,src/prefill/prefill.cpp:319
-env,STRATA_CVEC_FUSE_CHECK,,prefill,integer; value; code default 0,,,False,,2,src/prefill/prefill.cpp:3576
-env,STRATA_DBG_DRAFT,,src,opt-in (presence),,the window the drafter built and what the target said,False,,1,sycl/src/program/generate.cpp:12279
-env,STRATA_DBG_FORCE_SLOW_LAYER,,prefill,opt-in (needs 1),,,False,,2,src/prefill/prefill.cpp:2711
-env,STRATA_DBG_GDN,,kernels,opt-in (needs 1),,,False,,1,src/kernels/cuda/verify_kernels.cu:944
-env,STRATA_DBG_NAN,,core,opt-in (presence),,debug: the state the prompt leaves for the token path,False,docs,8,src/core/verify.cpp:2065
-env,STRATA_DEBUG,,mcp.py,presence flag,,,False,,3,serve/mcp.py:131
-env,STRATA_DECODE_TIMING,,program,opt-in (presence),,,False,docs,2,src/program/generate.cpp:9803
-env,STRATA_DEC_BATCH,,core,integer; on by default (0 turns off),,,False,docs,6,src/core/expert_source.cpp:3169
-env,STRATA_DEFERRED_REGISTER,,core,presence flag,,,False,,2,src/core/expert_source.cpp:3879
-env,STRATA_DENSE_MMQ,,prefill,presence flag,,,False,docs,2,src/prefill/gemm.cu:844
-env,STRATA_DF_BRANCH,,core,presence flag,,,False,,1,src/core/verify.cpp:584
-env,STRATA_DF_PDL,,kernels,integer; opt-in (presence); value; code default 1,,opt-in until the A/B says otherwise,False,,3,src/kernels/pdl_parity.cpp:252
-env,STRATA_DF_PLE,,core,presence flag,,,False,,1,src/core/verify.cpp:840
-env,STRATA_DF_QB_Q4,,core,presence flag,,,False,,1,src/core/verify.cpp:1042
-env,STRATA_DISJOINT_ADAPT,,program,integer; opt-in (presence),,,False,docs,2,src/program/generate.cpp:4848
-env,STRATA_DMA_BATCH,,strata,presence flag,,,False,docs,2,include/strata/core/dma_batch.hpp:32
-env,STRATA_DRAFT_TIMING,,prefill,opt-in (presence),,debug: where this pass's time goes,False,,2,src/prefill/prefill.cpp:1297
-env,STRATA_DUMP_FIRST_LOGITS,,program,presence flag,,,False,,2,src/program/generate.cpp:11632
-env,STRATA_DUMP_SEL,,src,presence flag,,,False,docs,1,sycl/src/prefill/prefill.cpp:3135
-env,STRATA_EARLY_REMOTE_CONTEXTS,,program,presence flag,,,False,,2,src/program/generate.cpp:2378
-env,STRATA_EMULATE_CC,,strata,presence flag,,,False,,1,include/strata/core/emulate.hpp:17
-env,STRATA_EXCHANGE_ROTATE,,core,presence flag,,,False,docs,2,src/core/expert_source.cpp:2670
-env,STRATA_EXECV,,other,presence flag,,,False,,1,setup.py:4124
-env,STRATA_EXPERIMENTAL_GFX1103,,other,opt-in (needs 1),,,False,,1,setup.py:1647
-env,STRATA_EXPERIMENTAL_SM60,,other,opt-in (needs 1),,,False,,2,setup.py:806
-env,STRATA_EXPERT_V2,,kernels,opt-in (needs 1),,,False,docs,2,src/kernels/cuda/iq_kernels.cu:3412
-env,STRATA_EXPERT_V2K,,kernels,opt-in (needs 1),,,False,,2,src/kernels/cuda/iq_kernels.cu:3426
-env,STRATA_EXP_MODE,,kernels,integer; value; code default 7,,,False,docs,2,src/kernels/cuda/iq_kernels.cu:3378
-env,STRATA_FETCH_PVM,,core,presence flag,,,False,,2,src/core/expert_source.cpp:1386
-env,STRATA_FETCH_THREADS,,program,integer; opt-in (presence),,,False,docs,2,src/program/generate.cpp:4057
-env,STRATA_FILE_RELEASE,,core,presence flag,,,False,docs,4,src/core/expert_source.cpp:2049
-env,STRATA_FILL_AHEAD,,program,presence flag,,,False,docs,2,src/program/generate.cpp:4567
-env,STRATA_FILL_SERIAL,,src,presence flag,,,False,docs,1,sycl/src/program/generate.cpp:4530
-env,STRATA_FORCE_AVX2,,kernels,opt-in (needs 1),,,False,,2,src/kernels/cpu/expert_layout.cpp:42
-env,STRATA_FORCE_ISA,,kernels,presence flag,,,False,docs,1,src/kernels/cpu/expert_layout.cpp:28
-env,STRATA_FUSED_SWIGLU_Q81,,kernels,presence flag,,,False,,2,src/kernels/cuda/shared_expert.cu:207
-env,STRATA_FUSE_HEAD_GR,,core,presence flag,,,False,,4,src/core/mtp.cpp:903
-env,STRATA_GDN_CHUNKED,,prefill,integer; opt-in (presence),,,False,docs,1,src/prefill/kernels.cu:1978
-env,STRATA_GDN_COMMIT_SPLIT,,kernels,presence flag,,,False,,2,src/kernels/cuda/verify_kernels.cu:940
-env,STRATA_GDN_CONVL2,,prefill,integer,,,False,docs,2,src/prefill/kernels.cu:1908
-env,STRATA_GDN_CONV_SERIAL,,prefill,opt-in (presence),,the old walk (A/B),False,,2,src/prefill/kernels.cu:1904
-env,STRATA_GDN_HEAD,,prefill,integer; opt-in (presence),,,False,docs,2,src/prefill/kernels.cu:1997
-env,STRATA_GDN_KEYHEAD,,prefill,integer; opt-in (presence),,,False,docs,2,src/prefill/kernels.cu:697
-env,STRATA_GDN_NOY,,prefill,integer,,,False,docs,2,src/prefill/kernels.cu:1956
-env,STRATA_GDN_PIPELINE,,prefill,integer; on by default (0 turns off),,,False,,2,src/prefill/kernels.cu:1974
-env,STRATA_GDN_PP,,prefill,integer; value; code default 0,,,False,docs,2,src/prefill/kernels.cu:1949
-env,STRATA_GDN_REC_HEADS,,prefill,opt-in (presence),,the one-block-per-head kernel (A/B),False,,4,src/prefill/kernels.cu:1970
-env,STRATA_GDN_SPLIT,,kernels,opt-in (needs 1),,,False,docs,2,src/kernels/cuda/verify_kernels.cu:921
-env,STRATA_GFX1151_DEFAULTS,,core,presence flag,,,False,docs,1,src/core/arch_defaults.cpp:15
-env,STRATA_GGUF_PLAN_READ,,src,opt-in (needs 1),,,False,,1,sycl/src/prefill/prefill.cpp:2485
-env,STRATA_GGUF_PY,,_paths.py,presence flag,,,False,,1,tools/_paths.py:16
-env,STRATA_GROUPED_PAIR_MIN_HITS,,kernels,presence flag,,,False,,2,src/kernels/cuda/s2_expert_grouped.cu:540
-env,STRATA_GROUP_COPY,,prefill,presence flag,,,False,,2,src/prefill/prefill.cpp:1025
-env,STRATA_GR_DOWN_DIRECT,,src,integer; on by default (0 turns off),,,False,docs,1,sycl/src/kernels/cuda/fused_gr.dp.cpp:597
-env,STRATA_GR_DOWN_MAX4,,kernels,integer,,,False,docs,2,src/kernels/cuda/fused_gr.cu:845
-env,STRATA_GR_DOWN_SLICED,,src,integer; on by default (0 turns off),,,False,docs,1,sycl/src/kernels/cuda/fused_gr.dp.cpp:583
-env,STRATA_GR_FAST,,kernels,integer; value; code default true,,,False,docs,1,src/kernels/cuda/fused_gr.cu:1614
-env,STRATA_GR_NORM_SPLIT,,src,integer; on by default (0 turns off),,,False,,1,sycl/src/kernels/cuda/fused_gr.dp.cpp:377
-env,STRATA_GR_SPLIT,,kernels,opt-in (needs 1),,,False,docs,1,src/kernels/cuda/fused_gr.cu:1727
-env,STRATA_GR_UNFUSED,,prefill,opt-in (needs 1),,,False,,2,src/prefill/prefill.cpp:336
-env,STRATA_GR_V3,,kernels,integer; opt-in (presence),,,False,docs,4,src/kernels/gr_parity.cpp:342
-env,STRATA_HCD_EXACT,,prefill,opt-in (needs 1),,,False,docs,2,src/prefill/prefill.cpp:314
-env,STRATA_HC_CHECK,,src,presence flag,,,False,docs,1,sycl/src/kernels/cuda/fused_gr.dp.cpp:2192
-env,STRATA_HC_Q8,,core,opt-in (needs 1),,,False,docs,2,src/core/native_dense.cpp:42
-env,STRATA_HC_Q8_INJECT,,core,opt-in (needs 1),,,False,,2,src/core/native_dense.cpp:327
-env,STRATA_HC_SPLIT,,kernels,presence flag,,,False,,4,src/kernels/cuda/fused_gr.cu:926
-env,STRATA_HC_UPMIX,,prefill,opt-in (needs 1),,,False,docs,2,src/prefill/prefill.cpp:296
-env,STRATA_HC_UPMIX_CHECK,,prefill,integer; value; code default 0,,,False,,2,src/prefill/prefill.cpp:2371
-env,STRATA_HEAD_MIX_MULTI,,core,presence flag,,,False,,4,src/core/mtp.cpp:910
-env,STRATA_HIPBLASLT_TUNING,,prefill,presence flag,,,False,docs,4,src/prefill/gemm.cu:195
-env,STRATA_HIPBLASLT_VERBOSE,,prefill,opt-in (presence),,,False,docs,6,src/prefill/gemm.cu:150
-env,STRATA_HIP_ADAPT_KERNEL_COPY,,program,presence flag,,,False,docs,2,src/program/generate.cpp:168
-env,STRATA_HIP_PROMPT_F16,,prefill,presence flag,,,False,docs,2,src/prefill/gemm.cu:367
-env,STRATA_HIP_ROUTER_FAST,,kernels,presence flag,,,False,,2,src/kernels/cuda/router_top10.cu:429
-env,STRATA_HIP_ROUTER_OLD,,kernels,opt-in (presence),,,False,docs,2,src/kernels/cuda/router_top10.cu:431
-env,STRATA_HIP_WMMA,,kernels,presence flag,,,False,docs,5,src/kernels/cuda/qsa_prompt_attn.cu:1404
-env,STRATA_HOST_CORE,,program,presence flag,,,False,docs,2,src/program/generate.cpp:1902
-env,STRATA_HOST_UNCACHED,,include,presence flag,,,False,,1,sycl/include/strata/sycl_queue.hpp:65
-env,STRATA_IDX_FP16_CHECK,,prefill,opt-in (presence),,,False,,2,src/prefill/prefill.cpp:2577
-env,STRATA_INDEXER_PER_TOKEN,,prefill,opt-in (presence),,,False,,2,src/prefill/prefill.cpp:2522
-env,STRATA_IO_PF_AHEAD,,core,integer,,,False,docs,1,src/core/expert_source.cpp:580
-env,STRATA_IO_PF_STAGE,,core,presence flag,,,False,docs,2,src/core/expert_source.cpp:582
-env,STRATA_IO_PF_THREADS,,program,presence flag,,,False,docs,1,src/program/generate.cpp:4084
-env,STRATA_IO_PREFETCH,,program,integer; opt-in (presence),,,False,docs,1,src/program/generate.cpp:4083
-env,STRATA_IO_PREFETCH_DEPTH,,program,integer; opt-in (presence),,,False,docs,1,src/program/generate.cpp:4882
-env,STRATA_IO_STATS,,program,integer; opt-in (presence),,,False,docs,1,src/program/generate.cpp:4110
-env,STRATA_IO_THREADS,,platform,presence flag,,,False,docs,2,src/platform/direct_file.cpp:63
-env,STRATA_IQ256_GATHER,,kernels,presence flag,,,False,docs,1,src/kernels/cpu/expert_layout.cpp:203
-env,STRATA_IQ3S_MT1,,kernels,opt-in (presence),,,False,docs,1,src/kernels/cpu/native_expert.cpp:106
-env,STRATA_IQ_GATHER,,kernels,opt-in (presence),,,False,,1,src/kernels/cpu/iq_avx512.cpp:33
-env,STRATA_IQ_MT_MIN,,kernels,integer; value; code default 2,,,False,docs,3,src/kernels/native_expert_parity.cpp:538
-env,STRATA_IQ_PREFETCH,,kernels,presence flag,,,False,docs,2,src/kernels/cpu/iq_avx2.cpp:185
-env,STRATA_IQ_STAGE_GRID,,kernels,presence flag,,,False,docs,2,src/kernels/cuda/iq_kernels.cu:1976
-env,STRATA_IQ_STAGE_GRID_MMVQ,,kernels,presence flag,,,False,,2,src/kernels/cuda/iq_kernels.cu:1983
-env,STRATA_ISA_FLOOR,,other,presence flag,,,False,,1,setup.py:650
-env,STRATA_KEEP_EMPTY_TURNS,,frontend.py,opt-in (needs 1); string compare,,,False,,1,serve/frontend.py:60
-env,STRATA_KEEP_MAPPING,,program,presence flag,,,False,docs,1,src/program/generate.cpp:6091
-env,STRATA_KEY,,results,presence flag,,,False,,5,bench/results/2026-10-04-community-2x-rtx3060/bench-0.1.39.py:41
-env,STRATA_KQ256,,kernels,integer; opt-in (presence),,,False,docs,2,src/kernels/cpu/native_expert.cpp:131
-env,STRATA_KV_GROW,,program,presence flag,,,False,docs,2,src/program/generate.cpp:3711
-env,STRATA_KV_GROW_FLOOR,,program,integer; opt-in (presence),,,False,,2,src/program/generate.cpp:5778
-env,STRATA_KV_GROW_HOLD,,program,integer; opt-in (presence),,,False,,1,src/program/generate.cpp:9148
-env,STRATA_KV_GROW_INIT,,program,presence flag,,,False,,2,src/program/generate.cpp:3723
-env,STRATA_KV_GROW_STEP,,program,integer; opt-in (presence),,,False,,2,src/program/generate.cpp:5776
-env,STRATA_KV_HOST_DMA,,prefill,opt-in (needs 1),,,False,docs,2,src/prefill/prefill.cpp:2472
-env,STRATA_KV_MAIN_OFF,,core,opt-in (presence),,,False,,2,src/core/layer.cpp:642
-env,STRATA_KV_PREFETCH,,prefill,presence flag,,,False,docs,2,src/prefill/prefill.cpp:1854
-env,STRATA_KV_RING_OFF,,core,opt-in (presence),,,False,,2,src/core/layer.cpp:641
-env,STRATA_KV_ROT,,program,presence flag,,,False,docs,4,src/program/generate.cpp:2117
-env,STRATA_KV_STAGE_OWN,,prefill,opt-in (presence),,,False,,2,src/prefill/prefill.cpp:752
-env,STRATA_LAYER_SPLIT_GATE,,program,opt-in (presence),,,False,,1,src/program/generate.cpp:3437
-env,STRATA_LAYER_SPLIT_PROBE,,program,presence flag,,,False,,1,src/program/generate.cpp:4690
-env,STRATA_LFUSE,,core,opt-in (needs 1),,,False,docs,2,src/core/verify.cpp:66
-env,STRATA_LFUSE_GATE,,core,on by default (0 turns off),,,False,,2,src/core/verify.cpp:67
-env,STRATA_LFUSE_PAIR,,core,on by default (0 turns off),,,False,,2,src/core/verify.cpp:68
-env,STRATA_LOGPOS,,program,presence flag,,,False,docs,4,src/program/generate.cpp:9352
-env,STRATA_LOGPOS_EXTRA,,program,presence flag,,,False,,2,src/program/generate.cpp:9384
-env,STRATA_LOGPOS_TOPK,,core,presence flag,,,False,docs,2,src/core/verify.cpp:2198
-env,STRATA_LOOKAHEAD,,program,integer; on by default (0 turns off),,,False,docs,2,src/program/generate.cpp:4868
-env,STRATA_LOOKAHEAD_K,,program,presence flag,,,False,docs,2,src/program/generate.cpp:4879
-env,STRATA_LOOKUP_CHAIN_FIXED,,program,opt-in (presence),,no policy gate,False,,4,src/program/generate.cpp:9794
-env,STRATA_MAXTOK,,results,presence flag,,,False,,2,bench/results/2026-10-04-community-2x-rtx3060/bench-0.1.39.py:46
-env,STRATA_MIRROR_MIB,,src,presence flag,,,False,docs,1,sycl/src/program/generate.cpp:4706
-env,STRATA_MMQ_RESIDENT_SORT_NE,,prefill,presence flag,,,False,,1,src/prefill/mmq_resident_sort.hpp:17
-env,STRATA_MMVF_ROWS,,kernels,opt-in (needs 1),,,False,docs,4,src/kernels/cuda/native_bf16.cu:270
-env,STRATA_MMVQ_A2,,src,integer; on by default (0 turns off),,,False,docs,1,sycl/src/kernels/cuda/native_mmvq.dp.cpp:1535
-env,STRATA_MMVQ_IL,,core,on by default (0 turns off),,,False,,1,src/core/verify.cpp:73
-env,STRATA_MMVQ_PF,,src,integer,,,False,,1,sycl/src/kernels/cuda/native_mmvq.dp.cpp:1690
-env,STRATA_MMVQ_RPW,,src,integer,,default: the shared kernel (measured equal at warm clocks),False,,1,sycl/src/kernels/cuda/native_mmvq.dp.cpp:2001
-env,STRATA_MMVQ_SG,,src,integer,,,False,docs,1,sycl/src/kernels/cuda/native_mmvq.dp.cpp:165
-env,STRATA_MMVQ_WAVE,,kernels,presence flag,,,False,docs,4,src/kernels/mmvq_multi_parity.cpp:245
-env,STRATA_MMVQ_WIDE,,src,integer; on by default (0 turns off),,,False,docs,2,sycl/src/kernels/mmvq_bench.cpp:35
-env,STRATA_MMVQ_WIDE_32,,src,integer; on by default (0 turns off),,,False,docs,1,sycl/src/kernels/cuda/native_mmvq.dp.cpp:1960
-env,STRATA_MMVQ_WIDE_K,,src,integer; on by default (0 turns off),,,False,docs,1,sycl/src/kernels/cuda/native_mmvq.dp.cpp:1871
-env,STRATA_MMVQ_WIDE_MAXC,,src,integer,,,False,,1,sycl/src/kernels/cuda/native_mmvq.dp.cpp:3434
-env,STRATA_MMVQ_WIDE_MIN,,src,integer,,,False,,1,sycl/src/kernels/cuda/native_mmvq.dp.cpp:3433
-env,STRATA_MMVQ_WIDE_RPW,,src,integer,,,False,,1,sycl/src/kernels/cuda/native_mmvq.dp.cpp:1694
-env,STRATA_MODEL,,results,presence flag,,,False,,2,bench/results/2026-10-04-community-2x-rtx3060/bench-0.1.39.py:42
-env,STRATA_MTP_BATCH,,prefill,opt-in (presence),,,False,,2,src/prefill/prefill.cpp:1229
-env,STRATA_MTP_BATCH_F16,,prefill,opt-in (needs 1),,,False,,2,src/prefill/prefill.cpp:1266
-env,STRATA_MTP_BATCH_RING,,prefill,on by default (0 turns off),,,False,,2,src/prefill/prefill.cpp:1234
-env,STRATA_MTP_CATCHUP_ALL,,core,presence flag,,,False,,2,src/core/mtp.cpp:62
-env,STRATA_MTP_FULL_HEAD,,core,opt-in (needs 1),,,False,,2,src/core/mtp.cpp:508
-env,STRATA_MTP_PREFILL_SYNC,,core,integer,,,False,,2,src/core/mtp.cpp:1217
-env,STRATA_MTP_PRIORITY,,core,integer; on by default (0 turns off),,,False,,2,src/core/mtp.cpp:471
-env,STRATA_MTP_REVISION,,mtp_fetch.py,presence flag,,,False,,1,tools/mtp_fetch.py:33
-env,STRATA_MTP_SHARED_BRANCH,,core,presence flag,,,False,,2,src/core/mtp.cpp:920
-env,STRATA_MTP_TOP2,,core,opt-in (needs 1),,,False,,2,src/core/mtp.cpp:514
-env,STRATA_MULTI_BLOCK_ARGMAX,,kernels,presence flag,,,False,,2,src/kernels/cuda/verify_kernels.cu:828
-env,STRATA_NORM_ROPE,,kernels,presence flag,,AMD: opt in until rope_parity check 6 passes there,False,,2,src/kernels/cuda/native_rope.cu:180
-env,STRATA_NO_ARENA_THP,,core,opt-in (presence); string compare,,,False,docs,4,src/core/pinned.cu:256
-env,STRATA_NO_AVXVNNI,,kernels,integer; opt-in (presence),,,False,docs,1,src/kernels/cpu/expert_layout.cpp:253
-env,STRATA_NO_BATCH_KV_STEP,,core,presence flag,,,False,,2,src/core/mtp.cpp:785
-env,STRATA_NO_IQ256,,kernels,presence flag,,,False,docs,3,src/kernels/cpu/native_expert.cpp:126
-env,STRATA_NO_IQ4NL,,kernels,presence flag,,,False,,1,src/kernels/cpu/native_expert.cpp:168
-env,STRATA_NO_IQ512,,kernels,presence flag,,,False,,1,src/kernels/cpu/native_expert.cpp:118
-env,STRATA_NO_LARGEPAGES,,core,opt-in (presence),,,False,,10,src/core/pinned.cu:89
-env,STRATA_NO_MMVQ_ROWS2,,kernels,presence flag,,,False,,2,src/kernels/cuda/native_mmvq.cu:1277
-env,STRATA_NO_MULTI_GR,,core,presence flag,,,False,,5,src/core/mtp.cpp:976
-env,STRATA_NO_NORM_ROPE,,kernels,presence flag,,,False,,2,src/kernels/cuda/native_rope.cu:177
-env,STRATA_NO_Q8K_AVX2,,kernels,presence flag,,,False,,1,src/kernels/cpu/native_expert.cpp:77
-env,STRATA_NVCC,,other,presence flag,,,False,,2,setup.py:1203
-env,STRATA_OLD_GROUPED,,kernels,presence flag,,,False,,2,src/kernels/cuda/s2_expert_grouped.cu:527
-env,STRATA_ONE_TOKEN_COMMIT,,core,presence flag,,,False,,2,src/core/verify.cpp:144
-env,STRATA_OWNED_PRICE,,program,opt-in (presence); string compare,,,False,docs,2,src/program/generate.cpp:4204
-env,STRATA_PARALLEL_SOLO,,server.py,presence flag,,,False,,1,serve/server.py:1141
-env,STRATA_PARTIAL_PIN,,core,presence flag,,,False,docs,2,src/core/expert_source.cpp:2381
-env,STRATA_PARTIAL_PIN_GIB,,core,presence flag,,,False,docs,2,src/core/expert_source.cpp:2387
-env,STRATA_PA_FAST,,kernels,opt-in (needs 1),,,False,docs,2,src/kernels/cuda/qsa_prompt_attn.cu:1431
-env,STRATA_PEER_DIRECT,,core,integer; on by default (0 turns off),,,False,,1,src/core/peer_experts.cpp:188
-env,STRATA_PEER_HOT,,program,presence flag,,,False,,2,src/program/generate.cpp:3095
-env,STRATA_PEER_HOT_AT,,program,presence flag,,,False,,2,src/program/generate.cpp:3097
-env,STRATA_PF_BK64,,prefill,on by default (0 turns off),,,False,,1,src/prefill/wmma_gemm.cu:693
-env,STRATA_PF_FUSED,,prefill,presence flag,,,False,docs,4,src/prefill/moe_fused.cu:657
-env,STRATA_PF_FUSED_KQ,,prefill,presence flag,,,False,,2,src/prefill/moe_fused_iq.cu:991
-env,STRATA_PF_FUSED_NATIVE,,prefill,presence flag,,,False,,2,src/prefill/moe_fused_iq.cu:1040
-env,STRATA_PF_FUSED_TILE,,prefill,presence flag,,,False,docs,2,src/prefill/moe_fused_iq.cu:1027
-env,STRATA_PF_GEMM,,prefill,opt-in (needs 1),,,False,docs,4,src/prefill/gemm.cu:812
-env,STRATA_PF_HCDOWN,,prefill,opt-in (needs 1),,,False,,2,src/prefill/prefill.cpp:306
-env,STRATA_PF_OCC,,prefill,presence flag,,,False,,4,src/prefill/moe_fused.cu:588
-env,STRATA_PF_PAD,,prefill,opt-in (needs 1),,,False,docs,4,src/prefill/gemm.cu:933
-env,STRATA_PF_PEER_COMPACT,,prefill,presence flag,,,False,,2,src/prefill/prefill.cpp:1557
-env,STRATA_PF_PEER_OUT_PIPE,,prefill,presence flag,,=0: one copy after the last group (the A/B),False,,2,src/prefill/prefill.cpp:1541
-env,STRATA_PF_PEER_RING,,prefill,integer; opt-in (presence),,,False,,2,src/prefill/prefill.cpp:1575
-env,STRATA_PF_PEER_STREAM,,prefill,presence flag,,,False,,2,src/prefill/prefill.cpp:1571
-env,STRATA_PF_STEP_SYNC,,prefill,opt-in (needs 1),,,False,docs,2,src/prefill/prefill.cpp:2264
-env,STRATA_PF_SWITCH_MIN_T,,kernels,integer; value; code default (int64_t) 0,,,False,docs,8,src/kernels/cuda/qsa_prompt_attn.cu:1432
-env,STRATA_PIN_GUARD,,core,presence flag,,,False,docs,1,src/core/expert_source.cpp:2300
-env,STRATA_PIN_RESERVE_GIB,,core,presence flag,,,False,docs,1,src/core/expert_source.cpp:2293
-env,STRATA_PIPELINE_ADAPT_ASYNC,,program,presence flag,,,False,docs,1,src/program/generate.cpp:5980
-env,STRATA_PIPELINE_DEBUG,,program,on by default (0 turns off),,,False,docs,2,src/program/generate.cpp:241
-env,STRATA_PLE_BATCH,,core,opt-in (needs 1),,,False,docs,6,src/core/verify.cpp:796
-env,STRATA_PLE_GGUF,,kernels,presence flag,,,False,,2,src/kernels/ple_parity.cpp:257
-env,STRATA_PLE_TRACE,,src,opt-in (presence),,,False,docs,1,sycl/src/ngram/ple_reader.cpp:97
-env,STRATA_POOL_SPIN_US,,kernels,presence flag,,a test knob; see kSpinBeforeSleep,False,,1,src/kernels/cpu/pool.cpp:439
-env,STRATA_POOL_TRACE,,core,opt-in (presence),,,False,,2,src/core/expert_source.cpp:3033
-env,STRATA_PORT,,results,presence flag,,,False,,1,bench/results/2026-10-06-community-rtx4090-opt-ins/conc_bench.py:35
-env,STRATA_PREBUILT_URL,,other,presence flag,,,False,,2,setup.py:4421
-env,STRATA_PREFILL_AUTO_MAX,,program,presence flag,,,False,docs,2,src/program/generate.cpp:1716
-env,STRATA_PREFILL_BF16X2,,prefill,presence flag,,,False,docs,2,src/prefill/prefill.cpp:282
-env,STRATA_PREFILL_CPU_SHARE,,prefill,presence flag,,,False,docs,1,src/prefill/prefill.cpp:158
-env,STRATA_PREFILL_CPU_SHARE_MAX,,prefill,presence flag,,,False,docs,1,src/prefill/prefill.cpp:171
-env,STRATA_PREFILL_DUMP_R,,prefill,presence flag,,"debug: the final residuals, every 64th",False,,2,src/prefill/prefill.cpp:3652
-env,STRATA_PREFILL_DUMP_R_ALL,,prefill,presence flag,,,False,,2,src/prefill/prefill.cpp:3665
-env,STRATA_PREFILL_EQUAL,,program,opt-in (needs 1),,,False,docs,2,src/program/generate.cpp:5633
-env,STRATA_PREFILL_FIRST,,src,presence flag,,,False,docs,1,sycl/src/prefill/prefill.cpp:2164
-env,STRATA_PREFILL_GROUP_GATHER,,prefill,presence flag,,,False,,2,src/prefill/prefill.cpp:3342
-env,STRATA_PREFILL_HELP,,prefill,integer; opt-in (presence),,,False,docs,2,src/prefill/prefill.cpp:1396
-env,STRATA_PREFILL_HELP_FRAC,,prefill,presence flag,,,False,docs,2,src/prefill/prefill.cpp:1408
-env,STRATA_PREFILL_ISSUER,,prefill,presence flag,,,False,,2,src/prefill/prefill.cpp:2198
-env,STRATA_PREFILL_LEND_PCT,,program,presence flag,,,False,,4,src/program/generate.cpp:3301
-env,STRATA_PREFILL_MMQ,,prefill,presence flag,,,False,docs,2,src/prefill/prefill.cpp:895
-env,STRATA_PREFILL_RING,,prefill,presence flag,,,False,docs,2,src/prefill/prefill.cpp:250
-env,STRATA_PREFILL_STREAM_AHEAD,,prefill,presence flag,,,False,,1,src/prefill/prefill.cpp:106
-env,STRATA_PREFILL_STREAM_ALL,,src,opt-in (needs 1); value; code default 0) : -1,,,False,docs,1,sycl/src/prefill/prefill.cpp:220
-env,STRATA_PREFILL_STREAM_MIN,,prefill,integer; value; code default (int64_t) -1; value; code default (int64_t) 1024,,,False,,2,src/prefill/prefill.cpp:144
-env,STRATA_PREFILL_SYNC,,src,opt-in (presence),,,False,docs,1,sycl/src/prefill/prefill.cpp:1958
-env,STRATA_PREFILL_TIMING,,prefill,opt-in (presence),,,False,docs,4,src/prefill/prefill.cpp:1763
-env,STRATA_PROMPT_ATTN_OLD,,prefill,opt-in (presence),,,False,docs,2,src/prefill/prefill.cpp:2645
-env,STRATA_PROMPT_ATTN_Q4,,kernels,presence flag,,,False,,2,src/kernels/cuda/qsa_prompt_attn.cu:1498
-env,STRATA_PROMPT_ATTN_V1,,kernels,opt-in (presence),,,False,,2,src/kernels/cuda/qsa_prompt_attn.cu:1515
-env,STRATA_PROMPT_ATTN_XMX,,src,integer; value; code default 0,,,False,docs,1,sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp:367
-env,STRATA_Q2_BITPLANE,,kernels,presence flag,,,False,docs,1,src/kernels/cpu/q2_avx2.cpp:147
-env,STRATA_Q6P_GRID,,kernels,presence flag,,,False,,2,src/kernels/cuda/native_mmvq.cu:1776
-env,STRATA_Q6P_SELFTEST,,kernels,opt-in (needs 1),,,False,,2,src/kernels/cuda/native_mmvq.cu:1974
-env,STRATA_Q6_PACKED,,kernels,presence flag,,,False,docs,2,src/kernels/cuda/native_mmvq.cu:1936
-env,STRATA_Q8_PACKED,,kernels,presence flag,,,False,docs,2,src/kernels/cuda/native_mmvq.cu:1901
-env,STRATA_QFUSE,,core,integer; opt-in (needs 1); opt-in (presence),,,False,docs,3,src/core/arch_defaults_test.cpp:52
-env,STRATA_QSA_CLUSTER,,kernels,presence flag,,,False,docs,2,src/kernels/cuda/qsa_select.cu:1305
-env,STRATA_QSA_DUMP,,prefill,opt-in (presence),,,False,,2,src/prefill/prefill.cpp:2623
-env,STRATA_QSA_DUMP_LAST,,prefill,integer,,,False,,4,src/prefill/prefill.cpp:2624
-env,STRATA_QSA_EARLY_EXIT,,kernels,integer; on by default (0 turns off),,,False,,2,src/kernels/cuda/qsa_select.cu:1103
-env,STRATA_QSA_WARP,,kernels,presence flag,,,False,docs,4,src/kernels/cuda/qsa_prompt_attn.cu:1475
-env,STRATA_READ_AHEAD,,platform,integer; on by default (0 turns off),,,False,docs,2,src/platform/memory.cpp:152
-env,STRATA_REFILL_BLOCKING,,program,opt-in (presence),,,False,,2,src/program/generate.cpp:232
-env,STRATA_REFILL_SERIAL,,program,opt-in (presence),,,False,,2,src/program/generate.cpp:9441
-env,STRATA_REMOTE_SPIN,,core,presence flag,,,False,,2,src/core/remote_experts.cpp:78
-env,STRATA_REMOTE_ZEROCOPY,,core,presence flag,,,False,,2,src/core/remote_experts.cpp:209
-env,STRATA_REPO,,results,presence flag,,,False,,1,bench/results/2026-10-06-community-rtx4090-opt-ins/conc_bench.py:33
-env,STRATA_REQUEST_LINES,,server.py,presence flag,,,False,,1,serve/server.py:619
-env,STRATA_RESIDENT_HEADROOM_GIB,,program,float; opt-in (presence),,,False,docs,4,src/program/generate.cpp:1858
-env,STRATA_RESIDENT_PIN,,program,opt-in (presence),,,False,docs,4,src/program/generate.cpp:1856
-env,STRATA_RING_BYTES,,prefill,on by default (0 turns off),,,False,docs,2,src/prefill/prefill.cpp:240
-env,STRATA_RING_TIMEOUT_S,,src,presence flag,,,False,,1,sycl/src/core/verify.cpp:157
-env,STRATA_ROCM_INDEX,,other,presence flag,,,False,,1,setup.py:1668
-env,STRATA_ROCM_VERSION,,other,presence flag,,,False,,1,setup.py:1642
-env,STRATA_ROPE_TABLE,,kernels,presence flag,,,False,,2,src/kernels/cuda/native_rope.cu:154
-env,STRATA_ROUTER_BLOCK,,kernels,presence flag,,,False,,2,src/kernels/cuda/router_top10.cu:462
-env,STRATA_ROUTE_PER_TOKEN,,core,presence flag,,,False,docs,2,src/core/layer.cpp:399
-env,STRATA_ROUTE_PROJ_PER_TOKEN,,core,presence flag,,,False,,2,src/core/layer.cpp:411
-env,STRATA_RSS_TRACE,,program,opt-in (presence),,,False,,2,src/program/generate.cpp:218
-env,STRATA_RUNS,,results,presence flag,,,False,,2,bench/results/2026-10-04-community-2x-rtx3060/bench-0.1.39.py:45
-env,STRATA_S2_SWIGLU_Q8,,kernels,presence flag,,,False,,2,src/kernels/cuda/s2_expert_grouped.cu:1155
-env,STRATA_SCORES_MULTI,,kernels,integer; on by default (0 turns off),,,False,,2,src/kernels/cuda/qsa_select.cu:1100
-env,STRATA_SCRUB_PREFIX,,results,presence flag,,,False,,1,bench/results/2026-10-02-community-rtx2080ti-11gb/common.py:121
-env,STRATA_SELECT_OLD,,prefill,opt-in (presence),,,False,,2,src/prefill/prefill.cpp:2544
-env,STRATA_SELECT_SIMT,,kernels,presence flag,,,False,,1,src/kernels/cuda/qsa_select.cu:1159
-env,STRATA_SELECT_WMMA,,kernels,presence flag,,,False,docs,2,src/kernels/cuda/qsa_select.cu:1126
-env,STRATA_SEL_OVERLAP,,prefill,opt-in (presence),,,False,,2,src/prefill/prefill.cpp:2555
-env,STRATA_SESSION_BUFFERED,,core,presence flag,,,False,docs,2,src/core/conversation_file.cpp:340
-env,STRATA_SESSION_GOLDEN_PRINT,,core,presence flag,,,False,,1,src/core/conversation_file_test.cpp:179
-env,STRATA_SHARD1,,canonical_xcheck.py,presence flag,,,False,,1,tools/canonical_xcheck.py:46
-env,STRATA_SH_FORK_LATE,,core,presence flag,,,False,,2,src/core/verify.cpp:1242
-env,STRATA_SH_STREAM,,core,on by default (0 turns off),,,False,docs,2,src/core/verify.cpp:112
-env,STRATA_SKIP_SHA256,,other,opt-in (needs 1),,,False,,1,setup.py:2637
-env,STRATA_SNAPSHOT_FULL_CAPTURE,,program,presence flag,,,False,docs,2,src/program/generate.cpp:9120
-env,STRATA_SNAPSHOT_VERIFY,,program,opt-in (presence),,,False,,4,src/program/generate.cpp:7180
-env,STRATA_SOURCE,,other,presence flag,,,False,,2,setup.py:124
-env,STRATA_SPEC_COUPLED,,strata,presence flag,,,False,docs,2,include/strata/core/coupled_draft.hpp:59
-env,STRATA_SPEC_DEPTH,,program,opt-in (presence),,,False,docs,1,src/program/generate.cpp:10916
-env,STRATA_SPEC_MIN_TEMP,,strata,presence flag,,,False,docs,1,include/strata/core/spec_prob.hpp:69
-env,STRATA_SPEC_PROB,,strata,presence flag,,,False,docs,1,include/strata/core/coupled_draft.hpp:69
-env,STRATA_SPEC_PROB_DT,,strata,presence flag,,,False,,1,include/strata/core/spec_prob.hpp:57
-env,STRATA_SPEC_PROB_GATE,,strata,presence flag,,,False,,1,include/strata/core/spec_prob.hpp:47
-env,STRATA_SPLIT_COVER_B,,program,float; opt-in (presence),,,False,,4,src/program/generate.cpp:3279
-env,STRATA_SPLIT_MISS_MS,,program,float,,,False,docs,2,src/program/generate.cpp:3253
-env,STRATA_SPLIT_OWN,,program,presence flag,,,False,docs,2,src/program/generate.cpp:2017
-env,STRATA_SPLIT_OWN_BUFFERS,,program,presence flag,,,False,,2,src/program/generate.cpp:6330
-env,STRATA_SPLIT_OWN_PLACE,,program,presence flag,,,False,,2,src/program/generate.cpp:3214
-env,STRATA_SPLIT_RING,,program,presence flag,,,False,,2,src/program/generate.cpp:6168
-env,STRATA_SPLIT_SMALL_MAX,,program,presence flag,,,False,,2,src/program/generate.cpp:6523
-env,STRATA_SPLIT_SMALL_OWN,,program,presence flag,,,False,,2,src/program/generate.cpp:6521
-env,STRATA_SPLIT_TIMING,,program,opt-in (presence),,,False,docs,2,src/program/generate.cpp:10887
-env,STRATA_SSD_KEEPALIVE,,program,presence flag,,,False,,2,src/program/generate.cpp:2794
-env,STRATA_SSD_KEEPALIVE_WINDOW,,program,presence flag,,,False,,2,src/program/generate.cpp:2795
-env,STRATA_STAGER_BATCH,,prefill,presence flag,,,False,docs,1,src/prefill/prefill.cpp:1014
-env,STRATA_STAGER_RING,,prefill,integer,,,False,docs,4,src/prefill/prefill.cpp:408
-env,STRATA_STAGER_SLEEP,,prefill,presence flag,,,False,docs,1,src/prefill/prefill.cpp:126
-env,STRATA_STAGER_THREADS,,prefill,presence flag,,D-5: the host copy threads of unpinned blobs,False,docs,2,src/prefill/prefill.cpp:1002
-env,STRATA_STAGE_TRIM,,program,presence flag,,,False,docs,2,src/program/generate.cpp:2569
-env,STRATA_STATE_HASH,,program,opt-in (presence),,,False,,2,src/program/generate.cpp:10621
-env,STRATA_STATE_HASH_GDN,,prefill,opt-in (presence),,debug: the GDN states as the prompt path leaves them,False,,4,src/prefill/prefill.cpp:3773
-env,STRATA_SYCL_ROOT,,setup_intel.py,presence flag,,,False,,1,sycl/setup_intel.py:40
-env,STRATA_TARGETS,,results,presence flag,,,False,,2,bench/results/2026-10-04-community-2x-rtx3060/bench-0.1.39.py:47
-env,STRATA_TEST_CACHE_FAIL,,program,integer,,,False,,2,src/program/generate.cpp:4462
-env,STRATA_TEST_EXE,,other,presence flag,,,False,,1,args-test.py:24
-env,STRATA_TEST_PAGEABLE,,prefill,opt-in (needs 1),,,False,,2,src/prefill/prefill.cpp:117
-env,STRATA_TEST_VERBOSE,,hip,opt-in (presence),,,False,,1,tests/hip/prefill_wmma_gemm_parity.cpp:338
-env,STRATA_TEST_VERIFY_STALL,,core,presence flag,,,False,,2,src/core/verify.cpp:234
-env,STRATA_TG_FLUSH_US,,core,presence flag,,,False,,2,src/core/session.cpp:922
-env,STRATA_TOKENIZER,,test_detok.py,presence flag,,,False,,1,serve/test_detok.py:21
-env,STRATA_TOKENS_PER_CHAR,,results,presence flag,,,False,,1,bench/results/2026-10-06-community-rtx4090-opt-ins/conc_bench.py:236
-env,STRATA_TOOLS,,results,presence flag,,,False,,1,bench/results/2026-10-04-community-2x-rtx3060/retry-512k.py:12
-env,STRATA_TOPK_ACTIVE_ANY,,kernels,opt-in (needs 1),,,False,,2,src/kernels/cuda/qsa_select.cu:1323
-env,STRATA_TOPK_CAPACITY_GUARD,,kernels,opt-in (presence),,,False,,2,src/kernels/cuda/qsa_select.cu:1320
-env,STRATA_TOPK_OLD,,kernels,opt-in (presence),,,False,,2,src/kernels/cuda/qsa_select.cu:1299
-env,STRATA_TOPK_STREAM,,kernels,presence flag,,,False,docs,2,src/kernels/cuda/qsa_select.cu:1350
-env,STRATA_TRACE,,prefill,opt-in (presence),,,False,docs,6,src/prefill/prefill.cpp:1941
-env,STRATA_TRACE_ADAPT,,program,opt-in (presence),,,False,,4,src/program/generate.cpp:11377
-env,STRATA_TSUM,,core,opt-in (needs 1); opt-in (presence),,,False,docs,8,src/core/arch_defaults_test.cpp:51
-env,STRATA_TTFT,,results,opt-in (needs 1),,,False,,2,bench/results/2026-10-04-community-2x-rtx3060/bench-0.1.39.py:48
-env,STRATA_UMA_HEADROOM_GIB,,core,presence flag,,,False,docs,2,src/core/expert_cache.cpp:55
-env,STRATA_UNBUFFERED_LOAD,,core,opt-in (presence),,,False,docs,8,src/core/expert_source.cpp:428
-env,STRATA_URL,,results,presence flag,,"127.0.0.1:8081"").rstrip(""/"") + ""/v1/chat/completions""",False,,3,bench/results/2026-10-04-community-2x-rtx3060/bench-0.1.39.py:40
-env,STRATA_VERIFY_ALL_RESIDENT,,core,presence flag,,,False,docs,2,src/core/verify.cpp:602
-env,STRATA_VERIFY_ALL_SLOTS,,src,opt-in (presence),,debug: every filled slot read back and compared with the GGUF,False,docs,1,sycl/src/program/generate.cpp:4586
-env,STRATA_VERIFY_ARENA,,core,opt-in (presence),,"tests: the loaded arena's checksum, any loader",False,,2,src/core/expert_source.cpp:3943
-env,STRATA_VERIFY_DEBUG,,core,opt-in (presence),,SYCL port: the per-layer residual ladder (token 0),False,docs,5,src/core/verify.cpp:65
-env,STRATA_VERIFY_DEVICE_PLAN,,core,integer; opt-in (presence),,,False,docs,4,src/core/expert_source.cpp:3172
-env,STRATA_VERIFY_DUMP,,src,opt-in (presence),,,False,docs,1,sycl/src/program/generate.cpp:4617
-env,STRATA_VERIFY_EAGER,,src,opt-in (presence),,eager (SYCL port): prof_h_ already holds the host clocks,False,docs,5,sycl/src/core/verify.cpp:751
-env,STRATA_VERIFY_FIND,,src,opt-in (presence),,whose blob is the wrong data?,False,docs,1,sycl/src/program/generate.cpp:4604
-env,STRATA_VERIFY_NODES,,core,opt-in (presence),,what the window graph holds,False,,2,src/core/verify.cpp:1661
-env,STRATA_VERIFY_NO_HOST,,src,presence flag,,,False,docs,2,sycl/src/core/verify.cpp:1941
-env,STRATA_VERIFY_PROFILE,,core,opt-in (presence),,,False,docs,2,src/core/verify.cpp:546
-env,STRATA_VERIFY_QDEDUP,,core,integer; opt-in (presence),,,False,,2,src/core/verify.cpp:69
-env,STRATA_WARM_GRAPHS,,src,presence flag,,,False,docs,1,sycl/src/program/generate.cpp:12142
-env,STRATA_WATCHDOG_S,,program,presence flag,,,False,docs,2,src/program/generate.cpp:7930
-env,STRATA_WDDM_BUDGET,,core,presence flag,,,False,docs,2,src/core/device.cu:186
-env,STRATA_WINDOW_SYNC,,src,presence flag,,,False,,1,sycl/src/core/verify.cpp:1905
-env,STRATA_WMMA_BF16,,prefill,on by default (0 turns off),,,False,,2,src/prefill/gemm.cu:699
-env,STRATA_WMMA_GEMM,,prefill,on by default (0 turns off),,,False,,4,src/prefill/gemm.cu:698
-env,STRATA_WMMA_PARITY_EXACT,,hip,opt-in (presence),,,False,,1,tests/hip/prefill_wmma_gemm_parity.cpp:237
-json_key,aliases,,config,unset,,,False,,,serve/server.py:5458
-json_key,allowed_hosts,,config,unset,,,False,,,serve/server.py:5480
-json_key,anthropic_thinking,,config,unset,,,False,,,serve/server.py:5509
-json_key,api_key,,config,"""""",,,False,,,serve/server.py:5470
-json_key,api_monitor,,config,unset,,,False,,,serve/server.py:5486
-json_key,backend,,config,unset,,,False,,,serve/server.py:2148
-json_key,before_load,,config,unset,,,False,,,serve/server.py:5498
-json_key,codex_compaction_cache,,config,unset,,,False,,,serve/server.py:5456
-json_key,codex_thread_titles,,config,unset,,,False,,,serve/server.py:5455
-json_key,cors_origins,,config,unset,,,False,,,serve/server.py:5477
-json_key,cwd,,config,unset,,,False,,,serve/server.py:2120
-json_key,effort_position,,config,"""start""",,,False,,,serve/server.py:1975
-json_key,engine_silence_s,,config,unset,,,False,,,serve/server.py:1998
-json_key,env,,config,unset,,,False,,,serve/server.py:2153
-json_key,expert_profile_save,,config,unset,,,False,,,serve/server.py:2111
-json_key,expert_profile_save_every,,config,unset,,,False,,,serve/server.py:2115
-json_key,fit_max_tokens,,config,unset,,,False,,,serve/server.py:5453
-json_key,gpu,,config,unset,,,False,,,serve/server.py:1726
-json_key,hip_ordinal,,config,unset,,,False,,,serve/server.py:2135
-json_key,host,,config,unset,,,False,,,serve/server.py:5373
-json_key,idle_unload_s,,config,unset,,,False,,,serve/server.py:5495
-json_key,layer_split,,config,unset,,,False,,,serve/server.py:2011
-json_key,lazy_load,,config,unset,,,False,,,serve/server.py:5403
-json_key,lib_dirs,,config,unset,,,False,,,serve/server.py:2155
-json_key,log,,config,unset,,,False,,,serve/server.py:2187
-json_key,max_tokens,,config,unset,,,False,,,serve/server.py:1730
-json_key,min_free_vram_mib,,config,unset,,,False,,,serve/server.py:5497
-json_key,min_tokens,,config,unset,,,False,,,serve/server.py:1732
-json_key,model_name,,config,"""qwen3.8-flash-next""",,,False,,,serve/server.py:5451
-json_key,open_browser,,config,unset,,,False,,,serve/server.py:5581
-json_key,parallel,,config,unset,,,False,,,serve/server.py:2075
-json_key,reasoning_budget_tokens,,config,unset,,,False,,,serve/server.py:5522
-json_key,reasoning_close_retry,,config,unset,,,False,,,serve/server.py:5454
-json_key,reasoning_loop_recovery,,config,False,,,False,,,serve/server.py:5531
-json_key,repeat_stop_tokens,,config,REPEAT_STOP_TOKENS,,,False,,,serve/server.py:5517
-json_key,sampling,,config,unset,,,False,,,serve/server.py:5278
-json_key,slot_save_path,,config,unset,,,False,,,serve/server.py:5501
-json_key,split_skip_if_fits,,config,unset,,,False,,,serve/server.py:2053
-json_key,threads,,config,unset,,,False,,,serve/server.py:1728
-json_key,tokenizer,,config,unset,,,False,,,serve/server.py:5378
-json_key,tool_call_recovery,,config,False,,,False,,,serve/server.py:5513
-json_key,trusted_origins,,config,unset,,,False,,,serve/server.py:5478
-json_key,vision,,config,unset,,,False,,,serve/server.py:2209
-json_key,vram_elastic,,config,unset,,,False,,,serve/server.py:2057
-json_key,vram_segment_mib,,config,unset,,,False,,,serve/server.py:2059
-request_key,sampling.experimental_speed_projection,,request,request wins,,"on = sampling.get(""experimental_speed_projection"")",False,,,serve/server.py:961
-request_key,sampling.frequency_penalty,,request,request wins,,"pf = sampling.get(""frequency_penalty"")",False,,,serve/server.py:917
-request_key,sampling.min_p,,request,request wins,,"mp = sampling.get(""min_p"")",False,,,serve/server.py:912
-request_key,sampling.penalty_last_n,,request,request wins,,"pln = sampling.get(""penalty_last_n"")",False,,,serve/server.py:929
-request_key,sampling.presence_penalty,,request,request wins,,"pp = sampling.get(""presence_penalty"")",False,,,serve/server.py:919
-request_key,sampling.repetition_penalty,,request,request wins,,"rp = sampling.get(""repetition_penalty"")",False,,,serve/server.py:915
-request_key,sampling.seed,,request,request wins,,"seed = sampling.get(""seed"")",False,,,serve/server.py:934
-request_key,sampling.strata_checkpoint,,request,request wins,,"if sampling.get(""strata_checkpoint"") is False:",False,,,serve/server.py:946
-request_key,sampling.strata_prefix,,request,request wins,,"prefix = sampling.get(""strata_prefix"")",False,,,serve/server.py:950
-request_key,sampling.strata_tune,,request,request wins,,"tune = sampling.get(""strata_tune"")",False,,,serve/server.py:938
-request_key,sampling.temperature,,request,request wins,,"t = sampling.get(""temperature"")",False,,,serve/server.py:902
-request_key,sampling.top_k,,request,request wins,,"tk = sampling.get(""top_k"")",False,,,serve/server.py:908
-request_key,sampling.top_p,,request,request wins,,"tp = sampling.get(""top_p"")",False,,,serve/server.py:905
-server_cli,--api-key,,cli,,,"ap.add_argument(""--api-key"", default=os.environ.get(""STRATA_API_KEY"", """"),",False,,,serve/server.py:5348
-server_cli,--api-monitor,,cli,,,"ap.add_argument(""--api-monitor"", action=""store_true"",",False,,,serve/server.py:5354
-server_cli,--before-load,,cli,,,"ap.add_argument(""--before-load"", help=""a command run before the model is loaded again (e.g. to unload another """,False,,,serve/server.py:5364
-server_cli,--config,,cli,,,"ap.add_argument(""--config"", help=""strata engine config (JSON: exe, args, cwd, tokenizer, model_name), """,False,,,serve/server.py:5331
-server_cli,--engine,,cli,,,"ap.add_argument(""--engine"", choices=[""mock"", ""strata""], default=""mock"")",False,,,serve/server.py:5330
-server_cli,--fit-max-tokens,,cli,,,"ap.add_argument(""--fit-max-tokens"", action=""store_true"",",False,,,serve/server.py:5345
-server_cli,--gpu,,cli,,,"ap.add_argument(""--gpu"", help=""the GPU to run on, as nvidia-smi numbers them, or several for a layer split """,False,,,serve/server.py:5340
-server_cli,--host,,cli,,,"ap.add_argument(""--host"", default=None,",False,,,serve/server.py:5333
-server_cli,--idle-unload,,cli,,,"ap.add_argument(""--idle-unload"", type=float, default=None, metavar=""SECONDS"",",False,,,serve/server.py:5357
-server_cli,--lazy,,cli,,,"ap.add_argument(""--lazy"", action=""store_true"", help=""start the API unloaded (the engine and the vision encoder start with the first request)"")",False,,,serve/server.py:5353
-server_cli,--mcp-config,,cli,,,"ap.add_argument(""--mcp-config"", help=""a JSON file with MCP servers in Claude Desktop's format ({\""mcpServers\"": """,False,,,serve/server.py:5350
-server_cli,--min-free-vram-mib,,cli,,,"ap.add_argument(""--min-free-vram-mib"", type=int, default=None,",False,,,serve/server.py:5361
-server_cli,--open,,cli,,,"ap.add_argument(""--open"", action=""store_true"", help=""open the local page in the browser once the model is ready"")",False,,,serve/server.py:5344
-server_cli,--port,,cli,,,"ap.add_argument(""--port"", type=int, default=8095)",False,,,serve/server.py:5339
-server_cli,--script,,cli,,,"ap.add_argument(""--script"", action=""append"",",False,,,serve/server.py:5336
-server_cli,--slot-save-path,,cli,,,"ap.add_argument(""--slot-save-path"", default=None, metavar=""DIR"",",False,,,serve/server.py:5366
-server_cli,--tokenizer,,cli,,,"ap.add_argument(""--tokenizer"", default=str(ROOT / ""pack/full/tokenizer""),",False,,,serve/server.py:5342
-setup_cli,--api-key,,cli,,,"ap.add_argument(""--api-key"", help=""require this key from clients (recommended with --host 0.0.0.0)"")",False,,,setup.py:4550
-setup_cli,--backend,,cli,,,"ap.add_argument(""--backend"", choices=[""cuda"", ""hip"", ""sycl""],",False,,,setup.py:4608
-setup_cli,--browser,,cli,,,"ap.add_argument(""--browser"", dest=""browser"", action=""store_true"",",False,,,setup.py:4554
-setup_cli,--build,,cli,,,"ap.add_argument(""--build"", action=""store_true"", help=""compile the engine instead of using the ready-made one"")",False,,,setup.py:4569
-setup_cli,--calibrate,,cli,,,"ap.add_argument(""--calibrate"", action=""store_true"",",False,,,setup.py:4584
-setup_cli,--check,,cli,,,"ap.add_argument(""--check"", action=""store_true"", help=""only check this PC and exit"")",False,,,setup.py:4583
-setup_cli,--context,,cli,,,"ap.add_argument(""--context"", type=int)",False,,,setup.py:4517
-setup_cli,--cuda,,cli,,,"ap.add_argument(""--cuda"", choices=[""12"", ""13"", ""auto""], default=os.environ.get(""STRATA_CUDA"") or None,",False,,,setup.py:4577
-setup_cli,--data-dir,,cli,,,"ap.add_argument(""--data-dir"", help=""where the model files go (~70-120 GB): default Strata-data next to this folder, """,False,,,setup.py:4556
-setup_cli,--draft-vocab,,cli,,,"ap.add_argument(""--draft-vocab"", choices=list(DRAFT_VOCABS),",False,,,setup.py:4586
-setup_cli,--experimental-speed-projection,,cli,,,"ap.add_argument(""--experimental-speed-projection"", metavar=""on|off|GGUF"",",False,,,setup.py:4534
-setup_cli,--family,,cli,,,"ap.add_argument(""--family"", choices=list(FAMILIES), help=""qwen = Qwen3.8-Flash-Next, swift = Swift 1.5"")",False,,,setup.py:4515
-setup_cli,--gguf-dir,,cli,,,"ap.add_argument(""--gguf-dir"", help=""use GGUF files you already have (a folder with every shard: """,False,,,setup.py:4559
-setup_cli,--gpu,,cli,,,"ap.add_argument(""--gpu"", help=""one GPU, numbered as nvidia-smi numbers them (default: asked when several can be """,False,,,setup.py:4538
-setup_cli,--gpus,,cli,,,"ap.add_argument(""--gpus"", help=""several GPUs sharing one model, as nvidia-smi numbers them (AMD: as setup lists """,False,,,setup.py:4540
-setup_cli,--host,,cli,,,"ap.add_argument(""--host"", help=""where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other """,False,,,setup.py:4548
-setup_cli,--inspect,,cli,,,"ap.add_argument(""--inspect"", nargs=""+"", metavar=(""SOURCE"", ""VARIANT""),",False,,,setup.py:4574
-setup_cli,--kv,,cli,,,"ap.add_argument(""--kv"", choices=[""int8"", ""q4_0"", ""k8v4""],",False,,,setup.py:4525
-setup_cli,--kv-streaming,,cli,,,"ap.add_argument(""--kv-streaming"", choices=[""auto"", ""on"", ""off""], default=""auto"",",False,,,setup.py:4605
-setup_cli,--layer-split,,cli,,,"ap.add_argument(""--layer-split"", help=""with --gpus: where each later GPU's layers start (\""18\"", \""16,32\""), one """,False,,,setup.py:4543
-setup_cli,--low-ram,,cli,,,"ap.add_argument(""--low-ram"", choices=[""auto"", ""on"", ""off"", ""resident"", ""mmap""], default=""auto"",",False,,,setup.py:4591
-setup_cli,--model,,cli,,,"ap.add_argument(""--model"", choices=list(MODELS))",False,,,setup.py:4516
-setup_cli,--models-dir,,cli,,,"ap.add_argument(""--models-dir"", help=""where the GGUF files go (default: <data folder>/models)"")",False,,,setup.py:4558
-setup_cli,--no-browser,,cli,,,"ap.add_argument(""--no-browser"", dest=""browser"", action=""store_false"", default=None,",False,,,setup.py:4551
-setup_cli,--no-remote-expert-opt,,cli,,,"ap.add_argument(""--no-remote-expert-opt"", action=""store_true"",",False,,,setup.py:4546
-setup_cli,--no-start,,cli,,,"ap.add_argument(""--no-start"", action=""store_true"", help=""install only, do not start the model"")",False,,,setup.py:4563
-setup_cli,--parallel,,cli,,,"ap.add_argument(""--parallel"", type=int, metavar=""N"",",False,,,setup.py:4602
-setup_cli,--port,,cli,,,"ap.add_argument(""--port"", type=int, help=""the server's port (default: the one the install was set up with, 8080 for a new one)"")",False,,,setup.py:4537
-setup_cli,--prebuilt,,cli,,,"ap.add_argument(""--prebuilt"", default=os.environ.get(""STRATA_PREBUILT_URL"", PREBUILT_URL),",False,,,setup.py:4581
-setup_cli,--resident-budget-gib,,cli,,,"ap.add_argument(""--resident-budget-gib"", type=float, metavar=""N"",",False,,,setup.py:4596
-setup_cli,--rollback-engine,,cli,,,"ap.add_argument(""--rollback-engine"", action=""store_true"",",False,,,setup.py:4567
-setup_cli,--rope-scale,,cli,,,"ap.add_argument(""--rope-scale"", type=float,",False,,,setup.py:4522
-setup_cli,--rope-scaling,,cli,,,"ap.add_argument(""--rope-scaling"", choices=[""none"", ""linear"", ""yarn""],",False,,,setup.py:4518
-setup_cli,--setup,,cli,,,"ap.add_argument(""--setup"", action=""store_true"", help=""install another model or change settings"")",False,,,setup.py:4562
-setup_cli,--skip-build,,cli,,,"ap.add_argument(""--skip-build"", action=""store_true"", help=argparse.SUPPRESS)",False,,,setup.py:4612
-setup_cli,--source,,cli,,,"ap.add_argument(""--source"", choices=SOURCES, default=None,",False,,,setup.py:4570
-setup_cli,--update,,cli,,,"ap.add_argument(""--update"", action=""store_true"",",False,,,setup.py:4564
-setup_cli,--vision,,cli,,,"ap.add_argument(""--vision"", choices=[""yes"", ""no"", ""none"", ""gpu"", ""cpu""],",False,,,setup.py:4528
-setup_cli,--vision-tokens,,cli,,,"ap.add_argument(""--vision-tokens"", type=int, metavar=""N"",",False,,,setup.py:4530
-setup_cli,--vram-reserve-mib,,cli,,,"ap.add_argument(""--vram-reserve-mib"", type=int, metavar=""N"",",False,,,setup.py:4599
-setup_cli,--yes,,cli,,,"ap.add_argument(""--yes"", action=""store_true"", help=""accept the recommended answers"")",False,,,setup.py:4561
-shared_settings,POST /settings experimental_speed_projection,,request,,,"elif key == ""experimental_speed_projection"":",False,,,serve/server.py:5261
-shared_settings,POST /settings reasoning_budget_tokens,,request,,,"elif key == ""reasoning_budget_tokens"":                 # #123: 0 means no budget, so 0 is allowed here",False,,,serve/server.py:5257
-shared_settings,POST /settings reasoning_effort,,request,,,"if key == ""reasoning_effort"":",False,,,serve/server.py:5240
-shared_settings,POST /settings temperature,,request,,,"elif key == ""temperature"":",False,,,serve/server.py:5243
-shared_settings,POST /settings top_k,,request,,,"elif key == ""top_k"":",False,,,serve/server.py:5249
-shared_settings,POST /settings top_p,,request,,,"elif key == ""top_p"":",False,,,serve/server.py:5246
+kind,name,source,line,desc
+engine_cli,--adapt-async,src/program/generate.cpp,,
+engine_cli,--adapt-decay,src/program/generate.cpp,,
+engine_cli,--adapt-every,src/program/generate.cpp,,
+engine_cli,--adapt-swaps,src/program/generate.cpp,,
+engine_cli,--batch,src/program/generate.cpp,,
+engine_cli,--batch-groups,src/program/generate.cpp,,--batch with a layer split: the slots in G groups pipelined through the GPUs
+engine_cli,--batch-mtp,src/program/generate.cpp,,"--batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP"
+engine_cli,--check-logits,src/program/generate.cpp,,copy and check all logits in the stream-token path
+engine_cli,--control-vector,src/program/generate.cpp,,
+engine_cli,--control-vector-layer-range,src/program/generate.cpp,,
+engine_cli,--control-vector-scaled,src/program/generate.cpp,,
+engine_cli,--conversation-cache-mib,src/program/generate.cpp,,--serve: RAM budget for parked conversations (default 0 = off)
+engine_cli,--conversation-cache-min-free-mib,src/program/generate.cpp,,--serve: physical RAM floor when parking or restoring a
+engine_cli,--conversation-cache-slots,src/program/generate.cpp,,--serve: at most N parked conversations (default 4)
+engine_cli,--coupled-draft,src/program/generate.cpp,,enable coupled draft sampling for MTP drafter under sampling (STRATA_SPEC_COUPLED)
+engine_cli,--cpu-oracle-q8-0,src/program/generate.cpp,,experimental pinned CPU expert quantization and dot reduction
+engine_cli,--cvec-dir,src/program/generate.cpp,,
+engine_cli,--cvec-mode,src/program/generate.cpp,,
+engine_cli,--dump-final-r,src/program/generate.cpp,,
+engine_cli,--dump-halves,src/program/generate.cpp,,write both halves' block_out and inject per layer: the half bisection
+engine_cli,--dump-layers,src/program/generate.cpp,,"write R after EVERY layer, per position: the C1 bisection ladder"
+engine_cli,--dump-logits,src/program/generate.cpp,,write one line of raw logits per position
+engine_cli,--dump-mixed,src/program/generate.cpp,,"write the post-attention residual (n_embd, f32)"
+engine_cli,--dump-residual,src/program/generate.cpp,,
+engine_cli,--dump-routing,src/program/generate.cpp,,write the routed expert ids and weights per layer per position (P0.S8)
+engine_cli,--embd-gguf,src/program/generate.cpp,,the token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py:
+engine_cli,--eos-ids,src/program/generate.cpp,,
+engine_cli,--expert-cache,src/program/generate.cpp,,R4: keep N expert blobs resident in VRAM and compute their rows on the
+engine_cli,--expert-cache-cpu-order,src/program/generate.cpp,,experimental GPU expert reduction matching CPU order
+engine_cli,--expert-cache-device1,src/program/generate.cpp,,
+engine_cli,--expert-cache-device2,src/program/generate.cpp,,
+engine_cli,--expert-cache-device3,src/program/generate.cpp,,
+engine_cli,--expert-cache-per-layer,src/program/generate.cpp,,R4.2g: give each layer its OWN slots instead of letting the first
+engine_cli,--expert-cache-remote-placement,src/program/generate.cpp,,
+engine_cli,--expert-profile,src/program/generate.cpp,,R4.2e: pre-load the VRAM tier from a `profile.bin` (see
+engine_cli,--expert-profile-save,src/program/generate.cpp,,"--serve, #477: save what the adaptive tier learned (the experts in"
+engine_cli,--expert-profile-save-every,src/program/generate.cpp,,
+engine_cli,--gpu,src/program/generate.cpp,,"run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every"
+engine_cli,--gpu-only-full,src/program/generate.cpp,,"MEASURE: replay pre+post for all 48 layers plus the LM head, no pool."
+engine_cli,--gpu-stages,src/program/generate.cpp,,R0.9: capture the layer as three graphs (mixer / ffn+router / post)
+engine_cli,--gr-fp32-activations,src/program/generate.cpp,,experimental CUDA-oracle GR activation precision
+engine_cli,--gr-native-mmvf,src/program/generate.cpp,,experimental pinned GR norm/projections; implies FP32 activations
+engine_cli,--graph-only,src/program/generate.cpp,,MEASURE: replay the 48 `pre` graphs only.  OMITS the 48 `post` graphs
+engine_cli,--greedy,src/program/generate.cpp,,argmax (the default)
+engine_cli,--help,src/program/generate.cpp,,
+engine_cli,--host-core,src/program/generate.cpp,,"The host thread's core: first (the default: the first physical core, as always) or"
+engine_cli,--keep-canonical,src/program/generate.cpp,,A/B: also load canonical copies of natively served tensors (more VRAM)
+engine_cli,--kv,src/program/generate.cpp,,
+engine_cli,--kv-grow,src/program/generate.cpp,,the K/V takes VRAM only for the cells the requests reach and the expert
+engine_cli,--kv-resident,src/program/generate.cpp,,KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the
+engine_cli,--layer-split,src/program/generate.cpp,,
+engine_cli,--logits-stride,src/program/generate.cpp,,store every Nth row plus final input (default 1); N>1 requires --max-new 1
+engine_cli,--lookup-chain,src/program/generate.cpp,,"opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue"
+engine_cli,--lookup-chain-min,src/program/generate.cpp,,the shortest context match --lookup-chain extends on (default 3)
+engine_cli,--max-context,src/program/generate.cpp,,KV/state capacity (default 4096)
+engine_cli,--max-new,src/program/generate.cpp,,tokens to generate (default 16)
+engine_cli,--mmap-experts,src/program/generate.cpp,,"R2.1: opt OUT of the resident expert arena, back to MapViewOfFile."
+engine_cli,--mtp,src/program/generate.cpp,,
+engine_cli,--mtp-draft-vocab,src/program/generate.cpp,,opt-in: the draft head's token subset (default <mtp>/draft_vocab.bin)
+engine_cli,--mtp-hnorm,src/program/generate.cpp,,
+engine_cli,--mtp-max-t,src/program/generate.cpp,,cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)
+engine_cli,--mtp-q4,src/program/generate.cpp,,
+engine_cli,--mtp-window,src/program/generate.cpp,,
+engine_cli,--native,src/program/generate.cpp,,"every full-context native path at once (plan v0.3 P1): stream-token,"
+engine_cli,--native-bf16,src/program/generate.cpp,,experimental CUDA-oracle SSM/router/indexer BF16 projections
+engine_cli,--native-bf16-extra,src/program/generate.cpp,,experimental CUDA-oracle PLE/shared gate BF16 projections
+engine_cli,--native-dense-gguf,src/program/generate.cpp,,
+engine_cli,--native-flash-attn-short,src/program/generate.cpp,,diagnostic pinned vector attention; --max-context <=256
+engine_cli,--native-gdn,src/program/generate.cpp,,experimental pinned CUDA GDN norms/gates/recurrence
+engine_cli,--native-head-gguf,src/program/generate.cpp,,native Q5_K head from model shard 1; requires --stream-token
+engine_cli,--native-moe-combine,src/program/generate.cpp,,experimental pinned CUDA routed/shared combination
+engine_cli,--native-ple-key,src/program/generate.cpp,,experimental native PLE key; requires --native-dense-gguf
+engine_cli,--native-ple-postops,src/program/generate.cpp,,experimental pinned PLE postprojection arithmetic
+engine_cli,--native-qsa,src/program/generate.cpp,,experimental pinned QSA normalization and output gate
+engine_cli,--native-qsa-indexer,src/program/generate.cpp,,experimental pinned indexer key cache and pooling
+engine_cli,--native-rope,src/program/generate.cpp,,experimental pinned text-only CUDA rotary arithmetic
+engine_cli,--native-router,src/program/generate.cpp,,experimental pinned CUDA 512-expert top-10 routing
+engine_cli,--no-capture,src/program/generate.cpp,,run the layers directly instead of replaying graphs
+engine_cli,--no-coupled-draft,src/program/generate.cpp,,disable coupled draft sampling (propose argmax drafts)
+engine_cli,--no-fast-attn,src/program/generate.cpp,,
+engine_cli,--no-fast-select,src/program/generate.cpp,,
+engine_cli,--no-fused-gdn,src/program/generate.cpp,,
+engine_cli,--no-fused-gr,src/program/generate.cpp,,A/B: the six-kernel hyper-connection read and a separate write (native)
+engine_cli,--no-hit-poke,src/program/generate.cpp,,R4.2d's A/B arm.  The hit path pokes the driver once right after its
+engine_cli,--no-host-worker,src/program/generate.cpp,,"R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the"
+engine_cli,--no-kv-grow,src/program/generate.cpp,,
+engine_cli,--no-ple,src/program/generate.cpp,,explicit diagnostic ablation of the PLE layer
+engine_cli,--no-ple-prefetch,src/program/generate.cpp,,"A/B arm: read the PLE table's sixteen rows one at a time, instead of"
+engine_cli,--no-pool,src/program/generate.cpp,,skip the CPU expert pool (the GPU-only floor)
+engine_cli,--no-prefill-borrow,src/program/generate.cpp,,
+engine_cli,--no-publish-kernel,src/program/generate.cpp,,
+engine_cli,--no-spec-split,src/program/generate.cpp,,
+engine_cli,--no-split-rows,src/program/generate.cpp,,
+engine_cli,--no-token-graph,src/program/generate.cpp,,A/B: two graphs per layer (the host launches each) instead of one per token
+engine_cli,--pack,src/program/generate.cpp,,the pack directory (default pack/full)
+engine_cli,--pcie-frac,src/program/generate.cpp,,
+engine_cli,--pcie-mode,src/program/generate.cpp,,
+engine_cli,--peer-adapt-swaps,src/program/generate.cpp,,peer cache swaps per adaptation step (default: --adapt-swaps)
+engine_cli,--peer-device,src/program/generate.cpp,,a second GPU as an adaptive expert-cache tier (rows over P2P; it also
+engine_cli,--peer-prefill-rows,src/program/generate.cpp,,prompt rows per layer the peer computes (default half of chunk x top-k;
+engine_cli,--peer-reserve-mib,src/program/generate.cpp,,VRAM the peer tier leaves free on its card (default 600)
+engine_cli,--peer-slots,src/program/generate.cpp,,expert slots on the peer (default: what fits)
+engine_cli,--pipeline-windows,src/program/generate.cpp,,
+engine_cli,--ple-delay-us,src/program/generate.cpp,,fault injection: each row read completes no earlier than U us
+engine_cli,--ple-gguf,src/program/generate.cpp,,"the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,"
+engine_cli,--ple-inflight,src/program/generate.cpp,,outstanding SSD reads (default 256)
+engine_cli,--ple-io,src/program/generate.cpp,,
+engine_cli,--ple-row-cache,src/program/generate.cpp,,"bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)"
+engine_cli,--ple-sync-submit,src/program/generate.cpp,,A/B arm: submit table reads on the token thread (default: an I/O thread)
+engine_cli,--pool-affinity,src/program/generate.cpp,,
+engine_cli,--pool-tasks,src/program/generate.cpp,,Batched CPU expert tasks per GU/Down phase (0..4096). Default 0 =
+engine_cli,--pool-workers,src/program/generate.cpp,,R2.2: CPU expert pool worker count.  Default 0 = every physical core
+engine_cli,--prefill,src/program/generate.cpp,,batched prompt processing in chunks of CHUNK tokens (needs --native); auto =
+engine_cli,--prefill-until,src/program/generate.cpp,,
+engine_cli,--prompt-cache,src/program/generate.cpp,,"--serve: keep N conversation checkpoints between requests (default 6, ~118 MB"
+engine_cli,--prompt-cache-every,src/program/generate.cpp,,"--serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)"
+engine_cli,--prompt-cache-root,src/program/generate.cpp,,
+engine_cli,--prompt-cache-tail,src/program/generate.cpp,,"--serve, single GPU: one extra checkpoint near the prompt's end, at an existing"
+engine_cli,--remote-expert-opt,src/program/generate.cpp,,enable remote-expert decode optimizations (serve mode)
+engine_cli,--resident-budget-gib,src/program/generate.cpp,,
+engine_cli,--resident-cpu-experts,src/program/generate.cpp,,"with mmap and a static profile, keep the experts the GPU cache does not"
+engine_cli,--resident-experts,src/program/generate.cpp,,the low-RAM PC's resident mode (setup): --mmap-experts --resident-cpu-experts
+engine_cli,--rope-freq-base,src/program/generate.cpp,,the raw ggml knobs: the frequency base (0 = the model's 1e7) and
+engine_cli,--rope-freq-scale,src/program/generate.cpp,,the angle shrink (0 = 1/--rope-scale)
+engine_cli,--rope-scale,src/program/generate.cpp,,the extension factor for linear/yarn (default: the model file's
+engine_cli,--rope-scaling,src/program/generate.cpp,,"extend the context past the trained one: none, linear"
+engine_cli,--seed,src/program/generate.cpp,,enable sampling with this Philox seed
+engine_cli,--serve,src/program/generate.cpp,,
+engine_cli,--session-min-free-mib,src/program/generate.cpp,,--serve: disk space a SAVE must leave free (default 4096; 0 = no check)
+engine_cli,--shared-expert-arena,src/program/generate.cpp,,Linux: back the resident arena with one MAP_SHARED file.
+engine_cli,--shared-late,src/program/generate.cpp,,A/B: shared expert after the CPU pool (default: overlapped with it)
+engine_cli,--short-read,src/program/generate.cpp,,--serve: read at most N fresh text tokens through the decode windows instead
+engine_cli,--slots,src/program/generate.cpp,,
+engine_cli,--spec,src/program/generate.cpp,,the MTP drafter's verify window: how many tokens it proposes per check (setup
+engine_cli,--spec-corrupt,src/program/generate.cpp,,
+engine_cli,--spec-follow,src/program/generate.cpp,,benchmarks: emit this continuation (token ids) instead of the argmax and
+engine_cli,--spec-min-p,src/program/generate.cpp,,how sure the draft layer must be to extend a verify window by another guess
+engine_cli,--spec-oracle,src/program/generate.cpp,,
+engine_cli,--spec-split,src/program/generate.cpp,,
+engine_cli,--split-device,src/program/generate.cpp,,
+engine_cli,--split-skip-if-fits,src/program/generate.cpp,,
+engine_cli,--stage-timing,src/program/generate.cpp,,per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured
+engine_cli,--stats,src/program/generate.cpp,,print the per-stage breakdown
+engine_cli,--stop-eos,src/program/generate.cpp,,
+engine_cli,--stream-token,src/program/generate.cpp,,enqueue token work on the session stream (experimental)
+engine_cli,--suffix-draft,src/program/generate.cpp,,prompt lookup: draft from an earlier repeat of the last N+ tokens of context
+engine_cli,--sync-every-layer,src/program/generate.cpp,,debug: synchronise after every layer
+engine_cli,--tail-role-token,src/program/generate.cpp,,
+engine_cli,--temperature,src/program/generate.cpp,,
+engine_cli,--tokens,src/program/generate.cpp,,the prompt as comma-separated token IDS (required)
+engine_cli,--tokens-file,src/program/generate.cpp,,"pretokenized prompt, commas or whitespace (alternative to --tokens)"
+engine_cli,--top-k,src/program/generate.cpp,,
+engine_cli,--top-p,src/program/generate.cpp,,
+engine_cli,--trim-stage-weights,src/program/generate.cpp,,
+engine_cli,--turn-token,src/program/generate.cpp,,"--serve: the token that opens a chat turn (default 248045, <|im_start|>)"
+engine_cli,--vision,src/program/generate.cpp,,--serve takes images too (GENI requests; embeddings from strata-vision)
+engine_cli,--vram-elastic,src/program/generate.cpp,,"--serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,"
+engine_cli,--vram-reserve-later-mib,src/program/generate.cpp,,
+engine_cli,--vram-reserve-mib,src/program/generate.cpp,,
+engine_cli,--vram-segment-mib,src/program/generate.cpp,,
+engine_cli,--window-hashes,src/program/generate.cpp,,
+engine_cli,--yarn-attn-factor,src/program/generate.cpp,,
+engine_cli,--yarn-beta-fast,src/program/generate.cpp,,
+engine_cli,--yarn-beta-slow,src/program/generate.cpp,,
+engine_cli,--yarn-ext-factor,src/program/generate.cpp,,
+engine_cli,--yarn-orig-ctx,src/program/generate.cpp,,the trained context the correction targets (0 = 262144)
+env,BATCH_TEST_LOG,tools/batch_test.py,49,
+env,CUDA_DEVICE_ORDER,serve/server.py,2281,
+env,CUDA_LAUNCH_BLOCKING,src/program/generate.cpp,1191,
+env,CUDA_MODULE_LOADING,src/program/generate.cpp,1586,
+env,FAKE_MCP_LOG,serve/mcp_fake_server.py,37,
+env,GPU_MAX_HW_QUEUES,src/core/verify.cpp,576,
+env,HF_ENDPOINT,tools/mtp_fetch.py,35,
+env,HIP_HOST_COHERENT,src/core/verify.cpp,574,
+env,HIP_PATH,serve/test_server.py,1714,
+env,HSA_ENABLE_SDMA,src/core/verify.cpp,575,
+env,MODELSCOPE_ENDPOINT,tools/mtp_fetch.py,42,
+env,P,serve/telemetry.py,38,
+env,PROF,tools/batch_test.py,95,
+env,QA_DUMP,src/kernels/qsa_prompt_attn_parity.cpp,153,
+env,QA_LAYER,src/kernels/qsa_prompt_attn_parity.cpp,154,
+env,QA_SAME,src/kernels/qsa_prompt_attn_parity.cpp,130,
+env,ROCM_PATH,tools/test_setup_amd.py,111,
+env,S,serve/server.py,1830,
+env,STRATA_ADAPT_JOB_CPU,src/program/generate.cpp,1323,
+env,STRATA_ADAPT_LAG,src/program/generate.cpp,1267,
+env,STRATA_ADAPT_NOWAIT,src/program/generate.cpp,1257,
+env,STRATA_ALLOWED_HOSTS,serve/server.py,5764,
+env,STRATA_API_KEY,serve/server.py,5631,
+env,STRATA_ARENA_LOCK,src/core/pinned.cu,414,
+env,STRATA_ARENA_MMAP,src/core/expert_source.cpp,3895,
+env,STRATA_ARENA_PIN_GIB,src/core/pinned.cu,300,
+env,STRATA_ARENA_RELEASE,src/program/generate.cpp,5605,
+env,STRATA_ARGMAX_MULTI,src/kernels/cuda/sampler.cu,1256,
+env,STRATA_ATTN_LANECELL,src/kernels/cuda/qsa_decode_attn.cu,548,
+env,STRATA_ATTN_PRE75,src/kernels/cuda/qsa_decode_attn.cu,490,
+env,STRATA_BATCH_DECODE_SHARE,src/program/generate.cpp,9706,
+env,STRATA_BATCH_MTP,src/program/generate.cpp,3878,
+env,STRATA_BATCH_TRACE,serve/server.py,554,
+env,STRATA_BF16_TC,src/prefill/gemm.cu,545,
+env,STRATA_BF16_TC_CACHE,src/prefill/gemm.cu,574,
+env,STRATA_BF16_TC_CACHE_MIB,src/prefill/gemm.cu,576,
+env,STRATA_CACHE_MESSAGE_BOUNDARY,src/program/generate.cpp,9858,
+env,STRATA_CKPT_REREAD,src/program/generate.cpp,9351,
+env,STRATA_COMMIT_SYNC,src/core/verify.cpp,2259,
+env,STRATA_CPU_YMM,src/kernels/cpu/expert.cpp,151,
+env,STRATA_CVEC_FUSE,src/prefill/prefill.cpp,340,
+env,STRATA_CVEC_FUSE_CHECK,src/prefill/prefill.cpp,3845,
+env,STRATA_DBG_CPU_GATE,src/prefill/prefill.cpp,3049,
+env,STRATA_DBG_FEAT,src/prefill/prefill.cpp,2800,
+env,STRATA_DBG_FEAT_LAYERS,src/prefill/prefill.cpp,2806,
+env,STRATA_DBG_FORCE_SLOW_LAYER,src/prefill/prefill.cpp,2895,
+env,STRATA_DBG_GDN,src/kernels/cuda/verify_kernels.cu,944,
+env,STRATA_DBG_NAN,src/core/verify.cpp,2108,
+env,STRATA_DBG_ROUTE_OVERRIDE,src/prefill/prefill.cpp,2801,
+env,STRATA_DEBUG,serve/mcp.py,131,
+env,STRATA_DECODE_TIMING,src/program/generate.cpp,9985,
+env,STRATA_DEC_BATCH,src/core/expert_source.cpp,3267,
+env,STRATA_DEFERRED_REGISTER,src/core/expert_source.cpp,3977,
+env,STRATA_DENSE_MMQ,src/prefill/gemm.cu,844,
+env,STRATA_DF_BRANCH,src/core/verify.cpp,619,
+env,STRATA_DF_PDL,src/kernels/pdl_parity.cpp,252,
+env,STRATA_DF_PLE,src/core/verify.cpp,875,
+env,STRATA_DF_QB_Q4,src/core/verify.cpp,1077,
+env,STRATA_DISJOINT_ADAPT,src/program/generate.cpp,4953,
+env,STRATA_DMA_BATCH,include/strata/core/dma_batch.hpp,32,
+env,STRATA_DRAFT_TIMING,src/prefill/prefill.cpp,1345,
+env,STRATA_DUMP_FIRST_LOGITS,src/program/generate.cpp,10705,
+env,STRATA_EARLY_REMOTE_CONTEXTS,src/program/generate.cpp,2440,
+env,STRATA_EMB_REUSE_ACCOUNT,src/prefill/prefill.cpp,257,
+env,STRATA_EMULATE_CC,include/strata/core/emulate.hpp,17,
+env,STRATA_EXCHANGE_ROTATE,src/core/expert_source.cpp,2765,
+env,STRATA_EXPERT_V2,src/kernels/cuda/iq_kernels.cu,3484,
+env,STRATA_EXPERT_V2K,src/kernels/cuda/iq_kernels.cu,3498,
+env,STRATA_EXP_MODE,src/kernels/cuda/iq_kernels.cu,3432,
+env,STRATA_FETCH_PVM,src/core/expert_source.cpp,1424,
+env,STRATA_FETCH_THREADS,src/program/generate.cpp,4162,
+env,STRATA_FILE_RELEASE,src/core/expert_source.cpp,2133,
+env,STRATA_FILL_AHEAD,src/program/generate.cpp,4672,
+env,STRATA_FORCE_AVX2,src/kernels/cpu/expert_layout.cpp,43,
+env,STRATA_FORCE_ISA,src/kernels/cpu/expert_layout.cpp,29,
+env,STRATA_FS_AHEAD,src/program/generate.cpp,4976,
+env,STRATA_FS_SLOTS,src/core/expert_source.cpp,4394,
+env,STRATA_FUSED_SWIGLU_Q81,src/kernels/cuda/shared_expert.cu,207,
+env,STRATA_FUSE_HEAD_GR,src/core/mtp.cpp,903,
+env,STRATA_GDN_CHUNKED,src/prefill/gdn_rec_parity.cu,567,
+env,STRATA_GDN_COMMIT_SPLIT,src/kernels/cuda/verify_kernels.cu,940,
+env,STRATA_GDN_CONVL2,src/prefill/kernels.cu,1912,
+env,STRATA_GDN_CONV_SERIAL,src/prefill/kernels.cu,1908,
+env,STRATA_GDN_HEAD,src/prefill/kernels.cu,2001,
+env,STRATA_GDN_KEYHEAD,src/prefill/kernels.cu,697,
+env,STRATA_GDN_NOY,src/prefill/kernels.cu,1960,
+env,STRATA_GDN_PIPELINE,src/prefill/kernels.cu,1978,
+env,STRATA_GDN_PP,src/prefill/kernels.cu,1953,
+env,STRATA_GDN_REC_HEADS,src/prefill/kernels.cu,1974,
+env,STRATA_GDN_SPLIT,src/kernels/cuda/verify_kernels.cu,921,
+env,STRATA_GFX1151_DEFAULTS,src/core/arch_defaults.cpp,15,
+env,STRATA_GGUF_PY,tools/_paths.py,16,
+env,STRATA_GROUPED_PAIR_MIN_HITS,src/kernels/cuda/s2_expert_grouped.cu,540,
+env,STRATA_GROUP_COPY,src/prefill/prefill.cpp,1068,
+env,STRATA_GR_DOWN_MAX4,src/kernels/cuda/fused_gr.cu,861,
+env,STRATA_GR_FAST,src/kernels/cuda/fused_gr.cu,1635,
+env,STRATA_GR_SPLIT,src/kernels/cuda/fused_gr.cu,1754,
+env,STRATA_GR_UNFUSED,src/prefill/prefill.cpp,357,
+env,STRATA_GR_V3,src/kernels/gr_parity.cpp,342,
+env,STRATA_HCD_EXACT,src/prefill/prefill.cpp,335,
+env,STRATA_HC_Q8,src/core/native_dense.cpp,42,
+env,STRATA_HC_Q8_INJECT,src/core/native_dense.cpp,327,
+env,STRATA_HC_SPLIT,src/kernels/cuda/fused_gr.cu,942,
+env,STRATA_HC_UPMIX,src/prefill/prefill.cpp,317,
+env,STRATA_HC_UPMIX_CHECK,src/prefill/prefill.cpp,2495,
+env,STRATA_HEAD_MIX_MULTI,src/core/mtp.cpp,910,
+env,STRATA_HIPBLASLT_TUNING,src/prefill/gemm.cu,195,
+env,STRATA_HIPBLASLT_VERBOSE,src/prefill/gemm.cu,150,
+env,STRATA_HIP_ADAPT_KERNEL_COPY,src/program/generate.cpp,169,
+env,STRATA_HIP_PROMPT_F16,src/prefill/gemm.cu,367,
+env,STRATA_HIP_ROUTER_FAST,src/kernels/cuda/router_top10.cu,429,
+env,STRATA_HIP_ROUTER_OLD,src/kernels/cuda/router_top10.cu,431,
+env,STRATA_HIP_WMMA,src/prefill/prefill.cpp,276,
+env,STRATA_HOST_CORE,src/program/generate.cpp,1964,
+env,STRATA_HTTP_BACKLOG,serve/server.py,5220,
+env,STRATA_IDX_FP16_CHECK,src/prefill/prefill.cpp,2701,
+env,STRATA_INDEXER_PER_TOKEN,src/prefill/prefill.cpp,2646,
+env,STRATA_IO_PF_AHEAD,src/core/expert_source.cpp,582,
+env,STRATA_IO_PF_STAGE,src/core/expert_source.cpp,584,
+env,STRATA_IO_PF_THREADS,src/program/generate.cpp,4189,
+env,STRATA_IO_PREFETCH,src/program/generate.cpp,4188,
+env,STRATA_IO_PREFETCH_DEPTH,src/program/generate.cpp,4992,
+env,STRATA_IO_STATS,src/program/generate.cpp,4215,
+env,STRATA_IO_THREADS,src/platform/direct_file.cpp,63,
+env,STRATA_IQ256_GATHER,src/kernels/cpu/expert_layout.cpp,204,
+env,STRATA_IQ3S_MT1,src/kernels/cpu/native_expert.cpp,120,
+env,STRATA_IQ_GATHER,src/kernels/cpu/iq_avx512.cpp,33,
+env,STRATA_IQ_MT_MIN,src/kernels/native_expert_parity.cpp,538,
+env,STRATA_IQ_PREFETCH,src/kernels/cpu/iq_avx2.cpp,185,
+env,STRATA_IQ_STAGE_GRID,src/kernels/cuda/iq_kernels.cu,1976,
+env,STRATA_IQ_STAGE_GRID_MMVQ,src/kernels/cuda/iq_kernels.cu,1983,
+env,STRATA_KEEP_EMPTY_TURNS,serve/frontend.py,60,
+env,STRATA_KEEP_MAPPING,src/program/generate.cpp,6202,
+env,STRATA_KEY,tools/early_close_test.py,9,
+env,STRATA_KQ256,src/kernels/cpu/native_expert.cpp,145,
+env,STRATA_KV_GROW,src/program/generate.cpp,3800,
+env,STRATA_KV_GROW_FLOOR,src/program/generate.cpp,5889,
+env,STRATA_KV_GROW_HOLD,src/program/generate.cpp,9330,
+env,STRATA_KV_GROW_INIT,src/program/generate.cpp,3812,
+env,STRATA_KV_GROW_STEP,src/program/generate.cpp,5887,
+env,STRATA_KV_HOST_DMA,src/prefill/prefill.cpp,2596,
+env,STRATA_KV_MAIN_OFF,src/core/layer.cpp,642,
+env,STRATA_KV_PREFETCH,src/prefill/prefill.cpp,1986,
+env,STRATA_KV_RING_OFF,src/core/layer.cpp,641,
+env,STRATA_KV_ROT,src/program/generate.cpp,2179,
+env,STRATA_KV_STAGE_OWN,src/prefill/prefill.cpp,807,
+env,STRATA_LAYER_SPLIT_GATE,src/program/generate.cpp,3526,
+env,STRATA_LAYER_SPLIT_PROBE,src/program/generate.cpp,4795,
+env,STRATA_LFUSE,src/core/verify.cpp,66,
+env,STRATA_LFUSE_GATE,src/core/verify.cpp,101,
+env,STRATA_LFUSE_PAIR,src/core/verify.cpp,102,
+env,STRATA_LOGPOS,src/program/generate.cpp,9534,
+env,STRATA_LOGPOS_EXTRA,src/program/generate.cpp,9566,
+env,STRATA_LOGPOS_TOPK,src/core/verify.cpp,2241,
+env,STRATA_LOOKAHEAD,src/program/generate.cpp,4978,
+env,STRATA_LOOKAHEAD_K,src/program/generate.cpp,4989,
+env,STRATA_LOOKUP_CHAIN_FIXED,src/program/generate.cpp,9976,
+env,STRATA_MAX_BODY_MIB,serve/server.py,4187,
+env,STRATA_MMQ_RESIDENT_SORT_NE,src/prefill/mmq_resident_sort.hpp,17,
+env,STRATA_MMVF_ROWS,src/kernels/cuda/native_bf16.cu,272,
+env,STRATA_MMVQ_IL,src/core/verify.cpp,107,
+env,STRATA_MMVQ_IL_ROWS,src/kernels/cuda/native_mmvq.cu,2534,
+env,STRATA_MMVQ_WAVE,src/kernels/mmvq_multi_parity.cpp,245,
+env,STRATA_MTP_BATCH,src/prefill/prefill.cpp,1277,
+env,STRATA_MTP_BATCH_F16,src/prefill/prefill.cpp,1314,
+env,STRATA_MTP_BATCH_RING,src/prefill/prefill.cpp,1282,
+env,STRATA_MTP_CATCHUP_ALL,src/core/mtp.cpp,62,
+env,STRATA_MTP_FULL_HEAD,src/core/mtp.cpp,508,
+env,STRATA_MTP_PREFILL_SYNC,src/core/mtp.cpp,1217,
+env,STRATA_MTP_PRIORITY,src/core/mtp.cpp,471,
+env,STRATA_MTP_REVISION,tools/mtp_fetch.py,33,
+env,STRATA_MTP_SHARED_BRANCH,src/core/mtp.cpp,920,
+env,STRATA_MTP_TOP2,src/core/mtp.cpp,514,
+env,STRATA_MULTI_BLOCK_ARGMAX,src/kernels/cuda/verify_kernels.cu,828,
+env,STRATA_NORM_ROPE,src/kernels/cuda/native_rope.cu,180,
+env,STRATA_NO_ARENA_THP,src/core/pinned.cu,256,
+env,STRATA_NO_AVXVNNI,src/kernels/cpu/expert_layout.cpp,254,
+env,STRATA_NO_BATCH_KV_STEP,src/core/mtp.cpp,785,
+env,STRATA_NO_IQ256,src/program/generate.cpp,2479,
+env,STRATA_NO_IQ4NL,src/kernels/cpu/native_expert.cpp,182,
+env,STRATA_NO_IQ512,src/kernels/cpu/native_expert.cpp,132,
+env,STRATA_NO_LARGEPAGES,src/core/pinned.cu,89,
+env,STRATA_NO_MMVQ_ROWS2,src/kernels/cuda/native_mmvq.cu,1279,
+env,STRATA_NO_MULTI_GR,src/core/mtp.cpp,976,
+env,STRATA_NO_NORM_ROPE,src/kernels/cuda/native_rope.cu,177,
+env,STRATA_NO_Q8K_AVX2,src/kernels/cpu/native_expert.cpp,91,
+env,STRATA_OLD_GROUPED,src/kernels/cuda/s2_expert_grouped.cu,527,
+env,STRATA_ONE_TOKEN_COMMIT,src/core/verify.cpp,178,
+env,STRATA_OWNED_PRICE,src/program/generate.cpp,4309,
+env,STRATA_PARALLEL_SOLO,serve/server.py,1166,
+env,STRATA_PARTIAL_PIN,src/core/expert_source.cpp,2465,
+env,STRATA_PARTIAL_PIN_GIB,src/core/expert_source.cpp,2471,
+env,STRATA_PA_FAST,src/kernels/cuda/qsa_prompt_attn.cu,1431,
+env,STRATA_PEER_DIRECT,src/core/peer_experts.cpp,189,
+env,STRATA_PEER_HOT,src/program/generate.cpp,3157,
+env,STRATA_PEER_HOT_AT,src/program/generate.cpp,3159,
+env,STRATA_PEER_NO_P2P,src/core/peer_experts.cpp,101,
+env,STRATA_PF_BK64,src/prefill/wmma_gemm.cu,693,
+env,STRATA_PF_FUSED,src/prefill/moe_fused.cu,657,
+env,STRATA_PF_FUSED_KQ,src/prefill/moe_fused_iq.cu,991,
+env,STRATA_PF_FUSED_NATIVE,src/prefill/moe_fused_iq.cu,1040,
+env,STRATA_PF_FUSED_TILE,src/prefill/moe_fused_iq.cu,1027,
+env,STRATA_PF_GEMM,src/prefill/gemm.cu,812,
+env,STRATA_PF_HCDOWN,src/prefill/prefill.cpp,327,
+env,STRATA_PF_OCC,src/prefill/moe_fused.cu,588,
+env,STRATA_PF_PAD,src/prefill/gemm.cu,933,
+env,STRATA_PF_PEER_COMPACT,src/prefill/prefill.cpp,1618,
+env,STRATA_PF_PEER_F16,src/prefill/prefill.cpp,1663,
+env,STRATA_PF_PEER_GATHER,src/prefill/prefill.cpp,1666,
+env,STRATA_PF_PEER_HOST,src/prefill/prefill.cpp,1575,
+env,STRATA_PF_PEER_OUT_PIPE,src/prefill/prefill.cpp,1602,
+env,STRATA_PF_PEER_RING,src/prefill/prefill.cpp,1636,
+env,STRATA_PF_PEER_STREAM,src/prefill/prefill.cpp,1632,
+env,STRATA_PF_PEER_SUMS,src/prefill/prefill.cpp,1659,
+env,STRATA_PF_PEER_XSTREAM,src/prefill/prefill.cpp,1587,
+env,STRATA_PF_STEP_SYNC,src/prefill/prefill.cpp,2388,
+env,STRATA_PF_SWITCH_MIN_T,src/prefill/gemm.cu,813,
+env,STRATA_PIN_GUARD,src/core/expert_source.cpp,2384,
+env,STRATA_PIN_RESERVE_GIB,src/core/expert_source.cpp,2377,
+env,STRATA_PIPELINE_ADAPT_ASYNC,src/program/generate.cpp,6091,
+env,STRATA_PIPELINE_DEBUG,src/program/generate.cpp,242,
+env,STRATA_PLE_BATCH,src/core/verify.cpp,831,
+env,STRATA_PLE_GGUF,src/kernels/ple_parity.cpp,257,
+env,STRATA_POOL_SPIN_US,src/kernels/cpu/pool.cpp,439,
+env,STRATA_POOL_TRACE,src/core/expert_source.cpp,3128,
+env,STRATA_PREFILL_AUTO_MAX,src/program/generate.cpp,1773,
+env,STRATA_PREFILL_BF16X2,src/prefill/prefill.cpp,303,
+env,STRATA_PREFILL_CPU_SHARE,src/prefill/prefill.cpp,165,
+env,STRATA_PREFILL_CPU_SHARE_MAX,src/prefill/prefill.cpp,182,
+env,STRATA_PREFILL_DUMP_R,src/prefill/prefill.cpp,3921,
+env,STRATA_PREFILL_DUMP_R_ALL,src/prefill/prefill.cpp,3934,
+env,STRATA_PREFILL_EQUAL,src/program/generate.cpp,5744,
+env,STRATA_PREFILL_GROUP_GATHER,src/prefill/prefill.cpp,3598,
+env,STRATA_PREFILL_HELP,src/prefill/prefill.cpp,1444,
+env,STRATA_PREFILL_HELP_FRAC,src/prefill/prefill.cpp,1456,
+env,STRATA_PREFILL_ISSUER,src/prefill/prefill.cpp,2322,
+env,STRATA_PREFILL_LEND_PCT,src/program/generate.cpp,3383,
+env,STRATA_PREFILL_MMQ,src/prefill/prefill.cpp,926,
+env,STRATA_PREFILL_RING,src/prefill/prefill.cpp,271,
+env,STRATA_PREFILL_STREAM_AHEAD,src/prefill/prefill.cpp,106,
+env,STRATA_PREFILL_STREAM_MIN,src/prefill/prefill.cpp,144,
+env,STRATA_PREFILL_TIMING,src/prefill/prefill.cpp,1895,
+env,STRATA_PROMPT_ATTN_OLD,src/prefill/prefill.cpp,2769,
+env,STRATA_PROMPT_ATTN_Q4,src/kernels/cuda/qsa_prompt_attn.cu,1498,
+env,STRATA_PROMPT_ATTN_V1,src/kernels/cuda/qsa_prompt_attn.cu,1515,
+env,STRATA_Q2_BITPLANE,src/kernels/cpu/q2_avx2.cpp,147,
+env,STRATA_Q6P_GRID,src/kernels/cuda/native_mmvq.cu,1778,
+env,STRATA_Q6P_SELFTEST,src/kernels/cuda/native_mmvq.cu,1976,
+env,STRATA_Q6_PACKED,src/kernels/cuda/native_mmvq.cu,1938,
+env,STRATA_Q8_PACKED,src/kernels/cuda/native_mmvq.cu,1903,
+env,STRATA_QFUSE,src/core/arch_defaults_test.cpp,52,
+env,STRATA_QSA_CLUSTER,src/kernels/cuda/qsa_select.cu,1305,
+env,STRATA_QSA_DUMP,src/prefill/prefill.cpp,2747,
+env,STRATA_QSA_DUMP_LAST,src/prefill/prefill.cpp,2748,
+env,STRATA_QSA_EARLY_EXIT,src/kernels/cuda/qsa_select.cu,1103,
+env,STRATA_QSA_WARP,src/kernels/cuda/qsa_prompt_attn.cu,1475,
+env,STRATA_READ_AHEAD,src/platform/memory.cpp,152,
+env,STRATA_REFILL_BLOCKING,src/program/generate.cpp,233,
+env,STRATA_REFILL_SERIAL,src/program/generate.cpp,9623,
+env,STRATA_REMOTE_SPIN,src/core/remote_experts.cpp,78,
+env,STRATA_REMOTE_ZEROCOPY,src/core/remote_experts.cpp,209,
+env,STRATA_REQUEST_LINES,serve/server.py,636,
+env,STRATA_RESIDENT_HEADROOM_GIB,src/program/generate.cpp,1920,
+env,STRATA_RESIDENT_PIN,src/program/generate.cpp,1918,
+env,STRATA_RING_BYTES,src/prefill/prefill.cpp,261,
+env,STRATA_ROPE_TABLE,src/kernels/cuda/native_rope.cu,154,
+env,STRATA_ROUTER_BLOCK,src/kernels/cuda/router_top10.cu,462,
+env,STRATA_ROUTE_PER_TOKEN,src/core/layer.cpp,399,
+env,STRATA_ROUTE_PROJ_PER_TOKEN,src/core/layer.cpp,411,
+env,STRATA_ROUTE_RESIDENT,src/core/verify.cpp,95,
+env,STRATA_ROUTE_RESIDENT_RANKS,src/core/verify.cpp,96,
+env,STRATA_RSS_TRACE,src/program/generate.cpp,219,
+env,STRATA_S2_SWIGLU_Q8,src/kernels/cuda/s2_expert_grouped.cu,1155,
+env,STRATA_SCORES_MULTI,src/kernels/cuda/qsa_select.cu,1100,
+env,STRATA_SELECT_OLD,src/prefill/prefill.cpp,2668,
+env,STRATA_SELECT_SIMT,src/kernels/cuda/qsa_select.cu,1159,
+env,STRATA_SELECT_WMMA,src/kernels/cuda/qsa_select.cu,1126,
+env,STRATA_SEL_OVERLAP,src/prefill/prefill.cpp,2679,
+env,STRATA_SESSION_BUFFERED,src/core/conversation_file.cpp,340,
+env,STRATA_SESSION_GOLDEN_PRINT,src/core/conversation_file_test.cpp,179,
+env,STRATA_SHARD1,tools/canonical_xcheck.py,46,
+env,STRATA_SH_FORK_LATE,src/core/verify.cpp,1277,
+env,STRATA_SH_STREAM,src/core/verify.cpp,146,
+env,STRATA_SKIP_SHA256,tools/test_setup_engine_hash.py,239,
+env,STRATA_SM70_TABLE,src/kernels/cuda/fused_gr.cu,1641,
+env,STRATA_SNAPSHOT_FULL_CAPTURE,src/program/generate.cpp,9302,
+env,STRATA_SNAPSHOT_VERIFY,src/program/generate.cpp,7312,
+env,STRATA_SOURCE,tools/mtp_fetch.py,41,
+env,STRATA_SPEC_COUPLED,include/strata/core/coupled_draft.hpp,59,
+env,STRATA_SPEC_DEPTH,src/program/generate.cpp,11115,
+env,STRATA_SPEC_MIN_TEMP,include/strata/core/spec_prob.hpp,69,
+env,STRATA_SPEC_PROB,include/strata/core/coupled_draft.hpp,69,
+env,STRATA_SPEC_PROB_DT,include/strata/core/spec_prob.hpp,57,
+env,STRATA_SPEC_PROB_GATE,include/strata/core/spec_prob.hpp,47,
+env,STRATA_SPLIT_COVER_B,src/program/generate.cpp,3361,
+env,STRATA_SPLIT_MISS_MS,src/program/generate.cpp,3335,
+env,STRATA_SPLIT_OWN,src/program/generate.cpp,2079,
+env,STRATA_SPLIT_OWN_BUFFERS,src/program/generate.cpp,6441,
+env,STRATA_SPLIT_OWN_PLACE,src/program/generate.cpp,3282,
+env,STRATA_SPLIT_RING,src/program/generate.cpp,6279,
+env,STRATA_SPLIT_SMALL_MAX,src/program/generate.cpp,6634,
+env,STRATA_SPLIT_SMALL_OWN,src/program/generate.cpp,6632,
+env,STRATA_SPLIT_TIMING,src/program/generate.cpp,11086,
+env,STRATA_SSD_KEEPALIVE,src/program/generate.cpp,2856,
+env,STRATA_SSD_KEEPALIVE_WINDOW,src/program/generate.cpp,2857,
+env,STRATA_STAGER_BATCH,src/prefill/prefill.cpp,1057,
+env,STRATA_STAGER_RING,src/prefill/prefill.cpp,429,
+env,STRATA_STAGER_SLEEP,src/prefill/prefill.cpp,126,
+env,STRATA_STAGER_SSD,src/prefill/prefill.cpp,1045,
+env,STRATA_STAGER_THREADS,src/prefill/prefill.cpp,1033,
+env,STRATA_STAGE_PIN,src/core/expert_source.cpp,1196,
+env,STRATA_STAGE_TRIM,src/program/generate.cpp,2631,
+env,STRATA_STATE_HASH,src/program/generate.cpp,10820,
+env,STRATA_STATE_HASH_GDN,src/prefill/prefill.cpp,4042,
+env,STRATA_TEST_CACHE_FAIL,src/program/generate.cpp,4567,
+env,STRATA_TEST_PAGEABLE,src/prefill/prefill.cpp,117,
+env,STRATA_TEST_VERIFY_STALL,src/core/verify.cpp,268,
+env,STRATA_TG_FLUSH_US,src/core/session.cpp,922,
+env,STRATA_TOKENIZER,serve/test_detok.py,21,
+env,STRATA_TOPK_ACTIVE_ANY,src/kernels/cuda/qsa_select.cu,1323,
+env,STRATA_TOPK_CAPACITY_GUARD,src/kernels/cuda/qsa_select.cu,1320,
+env,STRATA_TOPK_OLD,src/kernels/cuda/qsa_select.cu,1299,
+env,STRATA_TOPK_STREAM,src/kernels/cuda/qsa_select.cu,1350,
+env,STRATA_TRACE,src/prefill/prefill.cpp,2065,
+env,STRATA_TRACE_ADAPT,src/program/generate.cpp,11576,
+env,STRATA_TSUM,src/core/arch_defaults_test.cpp,51,
+env,STRATA_UMA_HEADROOM_GIB,src/core/expert_cache.cpp,55,
+env,STRATA_UNBUFFERED_LOAD,src/core/expert_source.cpp,430,
+env,STRATA_VERIFY_ALL_RESIDENT,src/core/verify.cpp,637,
+env,STRATA_VERIFY_ARENA,src/core/expert_source.cpp,4041,
+env,STRATA_VERIFY_DEBUG,src/core/verify.cpp,65,
+env,STRATA_VERIFY_DEVICE_PLAN,src/core/expert_source.cpp,3270,
+env,STRATA_VERIFY_NODES,src/core/verify.cpp,1704,
+env,STRATA_VERIFY_PROFILE,src/core/verify.cpp,581,
+env,STRATA_VERIFY_QDEDUP,src/core/verify.cpp,103,
+env,STRATA_WATCHDOG_IO_S,src/program/generate.cpp,8085,
+env,STRATA_WATCHDOG_S,src/program/generate.cpp,8081,
+env,STRATA_WDDM_BUDGET,src/core/device.cu,186,
+env,STRATA_WMMA_BF16,src/prefill/gemm.cu,699,
+env,STRATA_WMMA_GEMM,src/prefill/gemm.cu,698,
+env,VCT,tools/hip/package_windows.py,61,
+env,XDG_CONFIG_HOME,tools/strata_mcp.py,439,
+server_cli,--api-key,5631,,
+server_cli,--api-monitor,5638,,
+server_cli,--before-load,5648,,
+server_cli,--config,5614,,
+server_cli,--engine,5613,,
+server_cli,--fit-max-tokens,5628,,
+server_cli,--gpu,5623,,
+server_cli,--host,5616,,
+server_cli,--idle-unload,5641,,
+server_cli,--lazy,5637,,
+server_cli,--mcp-config,5634,,
+server_cli,--min-free-vram-mib,5645,,
+server_cli,--open,5627,,
+server_cli,--port,5622,,
+server_cli,--script,5619,,
+server_cli,--slot-save-path,5650,,
+server_cli,--tokenizer,5625,,
+setup_cli,--accept-source-agreements,3067,,
+setup_cli,--api-key,4609,,
+setup_cli,--backend,4667,,
+setup_cli,--browser,4613,,
+setup_cli,--build,4628,,
+setup_cli,--calibrate,4643,,
+setup_cli,--check,4642,,
+setup_cli,--context,4576,,
+setup_cli,--cuda,4636,,
+setup_cli,--cvec-mode,5452,,
+setup_cli,--data-dir,4615,,
+setup_cli,--draft-vocab,4645,,
+setup_cli,--experimental-speed-projection,4593,,
+setup_cli,--expert-profile,5352,,
+setup_cli,--experts-bin,5319,,
+setup_cli,--family,4574,,
+setup_cli,--gguf-dir,4618,,
+setup_cli,--gpu,4597,,
+setup_cli,--gpus,4599,,
+setup_cli,--host,4607,,
+setup_cli,--inspect,4633,,
+setup_cli,--kv,4584,,
+setup_cli,--kv-resident,5543,,
+setup_cli,--kv-streaming,4664,,
+setup_cli,--layer-split,4602,,
+setup_cli,--low-ram,4650,,
+setup_cli,--max-context,5354,,
+setup_cli,--model,4575,,
+setup_cli,--models-dir,4617,,
+setup_cli,--no-browser,4610,,
+setup_cli,--no-remote-expert-opt,4605,,
+setup_cli,--no-start,4622,,
+setup_cli,--out,5306,,
+setup_cli,--parallel,4661,,
+setup_cli,--port,4087,,
+setup_cli,--prebuilt,4640,,
+setup_cli,--prefill,5353,,
+setup_cli,--resident-budget-gib,4655,,
+setup_cli,--rollback-engine,4626,,
+setup_cli,--rope-scale,4581,,
+setup_cli,--rope-scaling,4577,,
+setup_cli,--setup,4621,,
+setup_cli,--skip-build,4671,,
+setup_cli,--source,4629,,
+setup_cli,--update,4623,,
+setup_cli,--vision,4587,,
+setup_cli,--vision-tokens,4589,,
+setup_cli,--vram-reserve-mib,4658,,
+setup_cli,--yes,4620,,
+config_key,aliases,server.py,5742,
+config_key,allowed_hosts,server.py,5764,
+config_key,anthropic_thinking,server.py,5793,
+config_key,api_key,server.py,5754,
+config_key,api_monitor,server.py,5770,
+config_key,args,mcp.py,105,
+config_key,backend,server.py,2341,
+config_key,before_load,server.py,5782,
+config_key,busy,server.py,3004,
+config_key,codex_compaction_cache,server.py,5740,
+config_key,codex_thread_titles,server.py,5739,
+config_key,command,mcp.py,611,
+config_key,cors_origins,server.py,5761,
+config_key,cuda,setup.py,886,
+config_key,cwd,mcp.py,106,
+config_key,data_dir,setup.py,3593,
+config_key,draft_vocab,setup.py,4023,
+config_key,effort_position,server.py,2095,
+config_key,engine_silence_s,server.py,2118,
+config_key,env,mcp.py,95,
+config_key,exe,setup.py,886,
+config_key,expert_profile_save,server.py,2243,
+config_key,expert_profile_save_every,server.py,2247,
+config_key,first_token,server.py,3004,
+config_key,fit_max_tokens,server.py,5737,
+config_key,generated,server.py,3078,
+config_key,gpu,server.py,1846,
+config_key,gpu_order,server.py,2336,
+config_key,gpus_asked,setup.py,1171,
+config_key,headers,mcp.py,258,
+config_key,held_tokens,server.py,4579,
+config_key,hip_ordinal,server.py,2267,
+config_key,host,server.py,5657,
+config_key,idle_unload_s,server.py,5779,
+config_key,installs,setup.py,3512,
+config_key,layer_split,server.py,2131,
+config_key,lazy_load,server.py,5687,
+config_key,lib_dirs,server.py,2363,
+config_key,log,server.py,2395,
+config_key,max_tokens,server.py,1850,
+config_key,mcp,mcp.py,633,
+config_key,mcp_servers,mcp.py,652,
+config_key,min_free_vram_mib,server.py,5781,
+config_key,min_tokens,server.py,1852,
+config_key,model_name,server.py,5735,
+config_key,open_browser,server.py,5865,
+config_key,parallel,server.py,2207,
+config_key,phase,server.py,3076,
+config_key,port,setup.py,3810,
+config_key,prompt_tokens,server.py,3077,
+config_key,queued,server.py,3063,
+config_key,reasoning_budget_tokens,server.py,5806,
+config_key,reasoning_close_retry,server.py,5738,
+config_key,reasoning_effort,server.py,2962,
+config_key,reasoning_loop_recovery,server.py,5815,
+config_key,remote_expert_opt,setup.py,1141,
+config_key,repeat_stop_tokens,server.py,5801,
+config_key,sampling,runconfig.py,54,
+config_key,slot_save_path,server.py,5785,
+config_key,split_skip_if_fits,server.py,2185,
+config_key,started,server.py,3080,
+config_key,tail,server.py,3386,
+config_key,threads,server.py,1848,
+config_key,tokenizer,server.py,5662,
+config_key,tool_call_recovery,server.py,5797,
+config_key,trusted_origins,server.py,5762,
+config_key,type,mcp.py,605,
+config_key,url,mcp.py,385,
+config_key,vision,runconfig.py,92,
+config_key,vram_elastic,server.py,2189,
+config_key,vram_segment_mib,server.py,2191,
