@@ -106,3 +106,34 @@ its numbers differ from the old file's by construction.
   **#1548** (`STRATA_PCIE_BALANCE`), **#1547** (routing metrics), **#1551** (the 16 under-documented flags).
 - `STRATA_PREFILL_TIMING=1` replaces the hand-rolled prompt-phase profiling.
 - Enlarge the page file, then re-measure commit headroom.
+
+## 12. Prefill regression: the chunk size, not the engine (fixed)
+
+`--prefill` was left at 4096 to sidestep #1630's Windows commit-charge spike. That is the wrong trade for
+long prompts: a small chunk re-stages the overlapping expert sets once per chunk and pays the per-chunk
+overhead each time, so the cost grows with prompt length.
+
+Same prompt through the live server (73,367 real-text tokens, one engine restart per arm, same box state):
+
+| `--prefill` | prefill | note |
+|---|---|---|
+| 4096 | 878.0 tok/s | the regression: my #1630-safety value |
+| 7500 | 1,110.1 tok/s | +26%; the largest value #1630 documents as safe |
+| 16384 | 1,264.5 tok/s | +44%; adopted |
+
+CLI ladder on the same binary (synthetic token file, which flatters the rate ~25%: repeated tokens route to
+a narrow expert set): 16K prompt 907.6 -> 982.7 -> 1,589.9; 32K prompt 933.6 -> 1,146.3 -> 1,609.3.
+
+#1630's spike does not reproduce here: committed went 69.6 -> 70.3 GiB of 77.6 (+0.7 GiB) across a
+24,402-token prefill with 16384-token chunks. If the engine ever dies mid-prefill with 0xC0000409, fall
+back to 7500, which still beats 4096 by 26%.
+
+Why 1.3k+ was real and 4K prompts never show it: rate rises with prompt length (per-chunk overhead
+amortises). Measured server reads: ~950-990 at 4.5K tokens, 1,290.6 at 31,871, 1,335.9 at 110,780,
+1,400.2 at 72,993 (these recorded with 16384 chunks and a 13.6 GiB budget). At the same 73K size today we
+read 1,264.5 with a ~11 GiB budget; the known budget dose-response (~4%/GiB) accounts for the rest, and the
+budget is squeezed now because Steam / VS Code / Sunshine / OneDrive are resident (0.5 GiB free physical at
+one point, commit 69.8/77.6 GiB).
+
+Harness: `scratch/scripts/prefill-server-ab.py <chunk>...` measures real text through the server, per arm,
+from the engine's own `prompt N tokens = ... read in T ms (R tok/s)` line.
