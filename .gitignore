@@ -36,6 +36,9 @@ td.log
 /run-*.sh
 /strata-*.json
 /strata-*.log
+# the same local engine config / settings, now that our harnesses keep them under scratch/
+/scratch/configs/strata-*.json
+/scratch/configs/*.shared-settings.json
 /build-strata.bat
 /build-strata-cuda12.bat
 /build-cuda12/

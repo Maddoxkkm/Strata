@@ -1,0 +1,8 @@
+[
+ ["R1 stock 1403", "logs/binaries/strata-1403-stock.exe", [], []],
+ ["R1 tuned 1403", "logs/binaries/strata-1403-tuned.exe", [], []],
+ ["R1 tuned gdn=0", "logs/binaries/strata-1403-tuned.exe", [], [["STRATA_GDN_CHUNKED", "0"]]],
+ ["R2 stock 1403", "logs/binaries/strata-1403-stock.exe", [], []],
+ ["R2 tuned 1403", "logs/binaries/strata-1403-tuned.exe", [], []],
+ ["R2 tuned gdn=0", "logs/binaries/strata-1403-tuned.exe", [], [["STRATA_GDN_CHUNKED", "0"]]]
+]

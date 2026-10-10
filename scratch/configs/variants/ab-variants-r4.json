@@ -1,0 +1,7 @@
+[
+ ["g1323 default (round-1 winner)", "logs/binaries/strata-g1323.exe", [], []],
+ ["g1324 default", "logs/binaries/strata-g1324.exe", [], []],
+ ["g1324 + --resident-lru-gib 6", "logs/binaries/strata-g1324.exe", ["--resident-lru-gib", "6"], []],
+ ["g1324 + lru6 + unbuffered=1", "logs/binaries/strata-g1324.exe", ["--resident-lru-gib", "6"], [["STRATA_UNBUFFERED_LOAD", "1"]]],
+ ["g1324 + STAGE_KEEP_MIB=2048", "logs/binaries/strata-g1324.exe", [], [["STRATA_STAGE_KEEP_MIB", "2048"]]]
+]

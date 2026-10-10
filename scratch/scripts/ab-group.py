@@ -17,7 +17,7 @@ import threading
 import time
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
-CFG = ROOT / "strata-iq2_xs.json"
+CFG = ROOT / "scratch/configs/strata-iq2_xs.json"
 TOKENS = str(ROOT / "logs" / "prompt-ids.txt")
 
 VARIANTS_FILE = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "logs" / "ab-variants.json"

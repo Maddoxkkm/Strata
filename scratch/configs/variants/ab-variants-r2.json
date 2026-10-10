@@ -1,0 +1,9 @@
+[
+ ["control (repeat)", "logs/binaries/strata-base.exe", [], []],
+ ["+PF_FUSED=1", "logs/binaries/strata-base.exe", [], [["STRATA_PF_FUSED", "1"]]],
+ ["+PF_GEMM=1", "logs/binaries/strata-base.exe", [], [["STRATA_PF_GEMM", "1"]]],
+ ["+HC_UPMIX=1", "logs/binaries/strata-base.exe", [], [["STRATA_HC_UPMIX", "1"]]],
+ ["+PA_FAST=1", "logs/binaries/strata-base.exe", [], [["STRATA_PA_FAST", "1"]]],
+ ["+HC_Q8=1", "logs/binaries/strata-base.exe", [], [["STRATA_HC_Q8", "1"]]],
+ ["+all prompt knobs", "logs/binaries/strata-base.exe", [], [["STRATA_PF_FUSED", "1"], ["STRATA_PF_GEMM", "1"], ["STRATA_HC_UPMIX", "1"], ["STRATA_PA_FAST", "1"], ["STRATA_HC_Q8", "1"], ["STRATA_PF_SWITCH_MIN_T", "4096"]]]
+]

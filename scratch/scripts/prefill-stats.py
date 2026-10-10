@@ -16,7 +16,7 @@ import sys
 import time
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
-CFG = ROOT / "strata-iq2_xs.json"
+CFG = ROOT / "scratch/configs/strata-iq2_xs.json"
 tokens = sys.argv[1] if len(sys.argv) > 1 else "logs/prompt-ids.txt"
 extra = sys.argv[2:]
 

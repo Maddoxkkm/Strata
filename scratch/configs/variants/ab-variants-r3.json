@@ -1,0 +1,9 @@
+[
+ ["g13 default (1323+1283+1298+1151+1181+1262+1368+1316+1305)", "logs/binaries/strata-g13.exe", [], []],
+ ["+SELECT_WMMA=1 (#1298)", "logs/binaries/strata-g13.exe", [], [["STRATA_SELECT_WMMA", "1"]]],
+ ["+SELECT_SGEMM=1 (#1151)", "logs/binaries/strata-g13.exe", [], [["STRATA_SELECT_SGEMM", "1"]]],
+ ["+QUANT_GATHER=1 (#1368)", "logs/binaries/strata-g13.exe", [], [["STRATA_QUANT_GATHER", "1"]]],
+ ["+HC_REQ8=1 (#1262)", "logs/binaries/strata-g13.exe", [], [["STRATA_HC_REQ8", "1"]]],
+ ["+remote-expert-opt (#1181)", "logs/binaries/strata-g13.exe", ["--remote-expert-opt"], []],
+ ["+all of round 3", "logs/binaries/strata-g13.exe", ["--remote-expert-opt"], [["STRATA_SELECT_WMMA", "1"], ["STRATA_SELECT_SGEMM", "1"], ["STRATA_QUANT_GATHER", "1"], ["STRATA_HC_REQ8", "1"]]]
+]

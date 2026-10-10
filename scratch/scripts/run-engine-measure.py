@@ -5,7 +5,7 @@
     .venv/Scripts/python.exe run-engine-measure.py --gpu-stages
     .venv/Scripts/python.exe run-engine-measure.py --stats
 
-Starts engine/strata.exe with the args, env and working directory from strata-iq2_xs.json (what serve/server.py
+Starts engine/strata.exe with the args, env and working directory from scratch/configs/strata-iq2_xs.json (what serve/server.py
 does), plus the measurement flag, and prints what it says. Stop the server first: these need the GPU to itself.
 """
 import json
@@ -16,7 +16,7 @@ import sys
 import time
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
-CFG = ROOT / "strata-iq2_xs.json"
+CFG = ROOT / "scratch/configs/strata-iq2_xs.json"
 
 
 def main():

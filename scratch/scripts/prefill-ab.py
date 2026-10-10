@@ -17,7 +17,7 @@ import urllib.request
 ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 LABEL = sys.argv[2] if len(sys.argv) > 2 else "arm"
 URL = "http://127.0.0.1:8080/v1/chat/completions"
-ENGINE_LOG = pathlib.Path(r"D:\llm-dev\strata\strata-iq2_xs.log")
+ENGINE_LOG = pathlib.Path(r"D:\llm-dev\strata\scratch/configs/strata-iq2_xs.log")
 BODY = ("The following is a long technical note about GPU memory hierarchies and expert streaming. " * 240)
 
 

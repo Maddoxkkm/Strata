@@ -18,7 +18,7 @@ import urllib.request
 LABEL = sys.argv[1] if len(sys.argv) > 1 else "run"
 URL = "http://127.0.0.1:8080/v1/chat/completions"
 CSV_PATH = pathlib.Path(r"D:\llm-dev\strata\bench-raw.csv")
-ENGINE_LOG = pathlib.Path(r"D:\llm-dev\strata\strata-iq2_xs.log")
+ENGINE_LOG = pathlib.Path(r"D:\llm-dev\strata\scratch/configs/strata-iq2_xs.log")
 
 FILLER = ("The storage engine keeps a write-ahead log, flushes immutable segments to object storage "
           "and compacts them in the background while consensus replicates the log across five nodes. ")

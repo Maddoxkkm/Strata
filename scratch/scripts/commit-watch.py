@@ -30,9 +30,10 @@ class Sampler(threading.Thread):
 
     def run(self):
         cmd = ["powershell", "-NoProfile", "-Command",
-               "Get-Counter '\\Memory\\Committed Bytes','\\Memory\\Commit Limit' -SampleInterval 1 -MaxSamples 600 | "
+               "Get-Counter '\\Memory\\Committed Bytes','\\Memory\\Commit Limit' -SampleInterval 1 -MaxSamples 90 | "
                "ForEach-Object { $_.CounterSamples | ForEach-Object { $_.CookedValue } }"]
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        self._proc = p
         vals = []
         while not self._stop.is_set():
             line = (p.stdout.readline() if p.stdout else "")
@@ -44,7 +45,10 @@ class Sampler(threading.Thread):
                 continue
             if len(vals) % 2 == 0 and len(vals) >= 2:
                 self.samples.append((vals[-2], vals[-1]))
-        p.terminate()
+        try:
+            p.kill()          # never leave the counter's process behind: the caller waits on the tree
+        except Exception:
+            pass
 
     def stop(self):
         self._stop.set()

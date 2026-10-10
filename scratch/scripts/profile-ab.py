@@ -18,7 +18,7 @@ import threading
 import time
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
-CFG = ROOT / "strata-iq2_xs.json"
+CFG = ROOT / "scratch/configs/strata-iq2_xs.json"
 SHIPPED = r"D:\llm-dev\strata\data\expert-profile.bin"
 TRACE_TOKENS = str(ROOT / "logs" / "trace-ids.txt")
 MEASURE_TOKENS = str(ROOT / "logs" / "prompt-ids.txt")

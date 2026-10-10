@@ -1,0 +1,15 @@
+[
+ ["R1 control", "logs/binaries/strata-g13.exe", [], []],
+ ["R1 SGEMM", "logs/binaries/strata-g13.exe", [], [["STRATA_SELECT_SGEMM", "1"]]],
+ ["R1 GATHER", "logs/binaries/strata-g13.exe", [], [["STRATA_QUANT_GATHER", "1"]]],
+ ["R1 HC_REQ8", "logs/binaries/strata-g13.exe", [], [["STRATA_HC_REQ8", "1"]]],
+ ["R2 control", "logs/binaries/strata-g13.exe", [], []],
+ ["R2 SGEMM", "logs/binaries/strata-g13.exe", [], [["STRATA_SELECT_SGEMM", "1"]]],
+ ["R2 GATHER", "logs/binaries/strata-g13.exe", [], [["STRATA_QUANT_GATHER", "1"]]],
+ ["R2 HC_REQ8", "logs/binaries/strata-g13.exe", [], [["STRATA_HC_REQ8", "1"]]],
+ ["R3 control", "logs/binaries/strata-g13.exe", [], []],
+ ["R3 SGEMM", "logs/binaries/strata-g13.exe", [], [["STRATA_SELECT_SGEMM", "1"]]],
+ ["R3 GATHER", "logs/binaries/strata-g13.exe", [], [["STRATA_QUANT_GATHER", "1"]]],
+ ["R3 HC_REQ8", "logs/binaries/strata-g13.exe", [], [["STRATA_HC_REQ8", "1"]]],
+ ["stage timing (our box)", "logs/binaries/strata-g13.exe", [], [["STRATA_PREFILL_TIMING", "1"]]]
+]

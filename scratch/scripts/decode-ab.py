@@ -16,8 +16,8 @@ import time
 import urllib.request
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
-CFG = ROOT / "strata-iq2_xs.json"
-LOG = ROOT / "strata-iq2_xs.log"
+CFG = ROOT / "scratch/configs/strata-iq2_xs.json"
+LOG = ROOT / "scratch/configs/strata-iq2_xs.log"
 URL = "http://127.0.0.1:8080/v1/chat/completions"
 ROUNDS = 3
 PROMPT = ("Write a short paragraph about GPU memory hierarchies and expert streaming, "

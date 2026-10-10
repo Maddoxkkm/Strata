@@ -1,0 +1,8 @@
+[
+ ["E1 max-new 16 (warm 4K prompt)", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "16"], [], "logs/prompt-ids.txt"],
+ ["E2 max-new 64", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "64"], [], "logs/prompt-ids.txt"],
+ ["E3 max-new 160", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160"], [], "logs/prompt-ids.txt"],
+ ["E4 max-new 400", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "400"], [], "logs/prompt-ids.txt"],
+ ["E5 max-new 160, adapt-every 0", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--adapt-every", "0"], [], "logs/prompt-ids.txt"],
+ ["E6 max-new 160, spec 8", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--spec", "8"], [], "logs/prompt-ids.txt"]
+]

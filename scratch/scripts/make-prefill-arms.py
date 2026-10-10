@@ -13,7 +13,7 @@ import json
 import pathlib
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
-base = json.loads((ROOT / "strata-iq2_xs.json").read_text(encoding="utf-8-sig"))
+base = json.loads((ROOT / "scratch/configs/strata-iq2_xs.json").read_text(encoding="utf-8-sig"))
 
 
 def variant(name, args_tweak=None, env_extra=None):

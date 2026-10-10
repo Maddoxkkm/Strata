@@ -14,7 +14,7 @@ import time
 import urllib.request
 
 URL = "http://127.0.0.1:8080/v1/chat/completions"
-LOG = pathlib.Path(r"D:\llm-dev\strata\strata-iq2_xs.log")
+LOG = pathlib.Path(r"D:\llm-dev\strata\scratch/configs/strata-iq2_xs.log")
 BODY = ("The following is a long technical note about GPU memory hierarchies and expert streaming. " * 240)
 SUMMARY = re.compile(
     r"prompt (\d+) tokens = (\d+) reused \+ (\d+) read in (\d+) ms \(([\d.]+) tok/s\), "

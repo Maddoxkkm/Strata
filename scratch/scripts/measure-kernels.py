@@ -7,7 +7,7 @@
 
 Builds a token list with the pack's own tokenizer (tools/strata_tokenizer.py, via
 tools/conversation_cache_parity.load_tokenizer), writes it to measure-tokens.txt, and runs engine/strata.exe with
-the args, env, cwd and lib_dirs from strata-iq2_xs.json - the same launch serve/server.py makes - plus the
+the args, env, cwd and lib_dirs from scratch/configs/strata-iq2_xs.json - the same launch serve/server.py makes - plus the
 measurement mode. Stop the server first: these want the GPU to themselves.
 
 Every line the engine prints is kept in measure-<mode>.log next to it.
@@ -20,7 +20,7 @@ import sys
 import time
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
-CFG = ROOT / "strata-iq2_xs.json"
+CFG = ROOT / "scratch/configs/strata-iq2_xs.json"
 TOKENS = ROOT / "measure-tokens.txt"
 PROMPT_TOKENS = 4096
 

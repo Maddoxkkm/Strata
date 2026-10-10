@@ -16,8 +16,8 @@ import threading
 import time
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
-CFG = ROOT / "strata-iq2_xs.json"
-LOG = ROOT / "strata-iq2_xs.log"
+CFG = ROOT / "scratch/configs/strata-iq2_xs.json"
+LOG = ROOT / "scratch/configs/strata-iq2_xs.log"
 
 
 class DiskSampler(threading.Thread):

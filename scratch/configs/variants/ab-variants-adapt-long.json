@@ -1,0 +1,6 @@
+[
+ ["L1 400 tok baseline", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "400"], [], "logs/prompt-ids.txt"],
+ ["L1 400 tok adapt-every 0", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "400", "--adapt-every", "0"], [], "logs/prompt-ids.txt"],
+ ["L2 400 tok baseline", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "400"], [], "logs/prompt-ids.txt"],
+ ["L2 400 tok adapt-every 0", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "400", "--adapt-every", "0"], [], "logs/prompt-ids.txt"]
+]
