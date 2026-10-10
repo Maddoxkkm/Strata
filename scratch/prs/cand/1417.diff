@@ -1,0 +1,28 @@
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 7b53ac9a4a..4c2fe9b1fb 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -930,7 +930,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
+         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit (" +
+               std::to_string(fb >> 20) + " of " + std::to_string(tb >> 20) + " MiB free at the failure; " +
+               std::to_string(o.used >> 20) + " MiB taken, the failing buffer wanted " +
+-              std::to_string(o.failed_bytes >> 20) + " MiB)";
++              std::to_string(o.failed_bytes >> 20) + " MiB" +
++              (o.base != nullptr ? "; the loan holds " + std::to_string(o.cap >> 20) + " MiB" : std::string()) + ")";
+         return false;
+     }
+     return true;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3b551f3aaf..19320ed821 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -5586,6 +5586,9 @@ int main(int argc, char** argv) {
+             return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+         };
+         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
++            // counted on the part's own device, as `init` and the other `bytes_needed` callers in this block are: the
++            // count follows `init`, whose per-device choices (prompt_f16) are the stage device's, not CUDA0's
++            const strata::core::OnDevice on(p.dev);
+             return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c));
+         };
+         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {

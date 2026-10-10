@@ -1,0 +1,6 @@
+[
+ ["A0 baseline (141-tuned)", "logs/binaries/strata-141-tuned.exe", [], [], "logs/prompt-ids.txt"],
+ ["A1 +#1451 wiring", "logs/binaries/strata-141-p1451.exe", [], [], "logs/prompt-ids.txt"],
+ ["B0 baseline long", "logs/binaries/strata-141-tuned.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["B1 +#1451 long", "logs/binaries/strata-141-p1451.exe", [], [], "logs/prompt-16k-ids.txt"]
+]
