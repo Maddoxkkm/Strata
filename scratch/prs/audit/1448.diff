@@ -1,0 +1,305 @@
+diff --git a/docs/DEGENERATION_RCA.md b/docs/DEGENERATION_RCA.md
+new file mode 100644
+index 0000000000..0030cf1b71
+--- /dev/null
++++ b/docs/DEGENERATION_RCA.md
+@@ -0,0 +1,156 @@
++# Degeneration on Qwen-family hybrid models: root-cause analysis and diagnostic criteria
++
++Companion to `Q8_1_FINITE_DS.md`. This document records the RCA behind the
++`#606` follow-up commits: how the carried-state degeneration was localized,
++what the three distinct defects are, how each was confirmed with a
++falsification test, and the criteria another deployment can use to identify
++or rule out each one. Model paths, hostnames, and deployment-specific tuning
++are omitted; everything here is reproducible on any affected engine.
++
++## 1. Symptom
++
++On a Qwen3-Next-class hybrid model (GDN/PLE recurrent state + sparse experts)
++served with the conversation cache and speculative decoding enabled:
++
++- output degrades mid-generation: runs of a single token (classically `!`),
++  content collapse onto a few literal tokens, or structurally-shaped but
++  meaningless text;
++- a full engine restart cures it immediately — re-reading the *same* prompt
++  on the restarted engine produces clean output;
++- once onset occurs it affects **all** sessions, including brand-new ones,
++  until the engine restarts or the conversation state is explicitly dropped
++  (a `FLUSH`-style drop of the checkpoint chain cures identically).
++
++Symptoms 2 and 3 are the strongest diagnostic levers. A restart cure means
++the damage is **carried engine state**, not weights, not KV of one session,
++not the prompt. Cross-session persistence narrows the carrier to state
++shared by all sessions — the shared system-prompt root of the checkpoint
++chain, from which every session forks.
++
++## 2. The contract that was violated
++
++The conversation cache memoizes the recurrent state: `state = f(prefix)`.
++Forked checkpoints are trusted because the function is assumed pure. The
++investigation found three mechanisms by which `f` was **not** pure — three
++invisible inputs that made the same prefix compute different bits at
++different times. Each violation is a separate defect; the first two produce
++wrong-parity checkpoints, and wrong-parity checkpoints are what re-mount a
++degenerate basin after every restart of the process that cached them —
++until the chain is dropped.
++
++### Defect A — non-finite q8_1 activation scales (fixed by this PR)
++
++Three kernels emitted the q8_1 block pair `(d, sum)` unclamped
++(`fused_gr.cu gr_q8_tail`, `verify_kernels.cu gdn_q8_1_store`,
++`iq_kernels.cu s26_swiglu_q8_1_kernel`), bypassing the finite helper the
++rest of the tree uses. A block with an overflowing `amax` emits a NaN scale;
++NaN is not contained by the dot path; a fully non-finite logit row ends at
++the sampler's all-NaN fallback — vocabulary id 0, the `!` face. Details and
++diagnostics: `Q8_1_FINITE_DS.md`. This defect was environment-gated (fused /
++S26 expert paths); deployments not enabling those paths were immune to
++*face A* but fully exposed to defects B and C.
++
++### Defect B — expert output depends on residency tier (the cross-session latch)
++
++The sparse-expert tier migrates experts between GPU residency and the CPU
++pool while serving. The two paths are not bit-identical: the GPU path packs
++the activation `(d, sum)` pair as fp16 (rounding `d`), the CPU pool keeps an
++fp32 scale. Same expert, same input, different bits depending on **where the
++expert happened to live this second**. With the adaptive migrator running,
++`f(prefix)` silently acquires wall-clock and access-history as inputs:
++a checkpoint captured under one residency table restores to a different
++number stream under another.
++
++Confirmation (falsification): a state-parity probe hashing every tensor the
++checkpoint restore path carries. Pre-fix, identical prefixes produced three
++distinct state-hash sets depending on capture/restore history; with the
++migrator disabled (`--adapt-swaps 0`, freezing the residency table for the
++process lifetime), the same probe is byte-identical across fresh prefill,
++checkpoint resume, and park/restore — and the cross-session latch stopped
++reproducing. The freeze is a mitigation, not the remedy: it restores the
++contract by giving up expert promotion. The engine-side remedy is to make
++the **checkpoint identity tier-aware** — capture a fingerprint of the
++residency table alongside the state tensors, and treat a mismatch at
++restore as a cache miss (re-prefill on the existing miss path), so forks
++are trusted exactly when they were computed under the table they will
++restore into. A stronger alternative is tier-invariant numerics (one
++quantization of the activation scale across both paths), but the two
++formats compute on different hardware with different dot-product shapes,
++so the fingerprint route is the one that preserves the migrator. Either
++way, plus verifying all state tensors on restore, not only the token
++prefix.
++
++### Defect C — the draft policy learns from wall time (mid-run kicks)
++
++The speculative window shape is chosen by a process-scoped policy whose cost
++estimates are learned from **measured round times**. Wall time is not a
++function of the prefix, so two identical requests arriving at different
++moments can choose different window shapes; and the batched verify kernels
++are not bit-invariant across window shapes, so window shape rides the output
++bits. Greedy decoding amplifies a last-bit difference whenever the top-2
++logits are near-tied, which is exactly what long generations hit.
++
++Confirmation (falsification): identical greedy requests (temperature 0,
++sampling ruled out with seed-pinned arms) of ≥100 generated tokens diverge
++run-to-run with the suffix-draft source enabled, with per-round draft
++acceptance counts varying; at depth ≤5 tokens they never diverge (no shape
++decision has had a chance to differ). Disabling the suffix-draft source —
++removing the policy's decision surface — makes five identical long requests
++**byte-identical**, with byte-stable acceptance counts. The short-run/long-run
++bisection and the acceptance-count scatter are the cheap field diagnostics.
++This defect does not by itself explain the cross-session latch (the policy
++dies with the process); it supplies the kicks that walk a trajectory into a
++basin that defect B then makes sticky.
++
++## 3. Mechanism, in one paragraph
++
++The sampler turns non-finite input into vocabulary id 0 and turns ulps into
++coin flips at near-ties. Defect A manufactures non-finite activations from
++ordinary overflow; defects B and C make the state cache's `f(prefix)` impure,
++so cached checkpoints fork the wrong continuations and inherit basins across
++sessions, while the drafting policy kicks trajectories toward them. Restarts
++cure because they drop the carried chain; new sessions do not escape because
++they re-fork the same poisoned root. The unifying invariant for engines that
++cache state: **any component that chooses *how* to compute — expert
++residency, batch/window shape, drain order, quantization tier — is part of
++the output function unless its numerics are provably shape-invariant. If the
++invariant cannot be proven, the choice must be frozen for the process
++lifetime, keyed into the cache identity, or shared as one numeric image.**
++
++## 4. Diagnostic protocol (field checklist)
++
++1. On onset, **preserve the episode log before restarting anything.** Record
++   onset turn and the first degenerate turn.
++2. Restart the engine and re-read the same prompt. Clean ⇒ carried state
++   (this family). Still dirty ⇒ prompt/model problem (different tree).
++3. Identify the face: id-0 (`!`) runs ⇒ check for unclamped q8_1 emit sites
++   and any NaN sentinel in the sampler (defect A). Small literal-token
++   collapse with structure ⇒ suspect state parity (B) and kicks (C).
++4. Cross-session: open a brand-new session mid-episode. Affected ⇒ shared
++   root checkpoint is the carrier (B). Cure by dropping the conversation
++   cache/checkpoint chain, then freeze the migrator for verification.
++5. Parity probe: hash the restored state tensors for one fixed prefix via
++   (a) fresh prefill, (b) checkpoint resume, (c) park/restore. Divergent
++   hashes ⇒ defect B class. Byte-identical but long greedy requests still
++   fork ⇒ defect C class: bisect by generation depth and read per-round
++   draft acceptance counts; rule out sampling with explicit `temperature=0`
++   and a seed-pinned arm first.
++6. Guard placement: text-level repetition detectors are a safety net, not a
++   fix. They catch faces, not causes, and a cause fixed upstream makes them
++   quietly idle — which is the correct end state.
++
++## 5. What this PR changes, and what it deliberately does not
++
++Changes: the three emit sites clamp through `q8_1_ds()`, matching the rest
++of the tree (defect A). No behavior, tuning, or policy changes are included.
++
++Deliberately excluded (deployment-side, not engine fixes, listed so
++maintainers can route them properly): freezing the expert migrator via an
++existing flag (defect B mitigation within a process lifetime); disabling the
++suffix-draft source (defect C mitigation at a decode-speed cost); serve-layer
++repetition detectors and a state-drop verb for in-place unlatching. The
++engine-side remedies these stand in for — a shared numeric image across the
++residency split, checkpoint identity keyed to the residency table (a
++fingerprint at capture, a cache miss on mismatch), shape-invariant verify numerics
++or a reproducible policy input, and full-tensor restore verification — are the
++recommendations this RCA exists to support.
+diff --git a/docs/Q8_1_FINITE_DS.md b/docs/Q8_1_FINITE_DS.md
+new file mode 100644
+index 0000000000..7908981c3b
+--- /dev/null
++++ b/docs/Q8_1_FINITE_DS.md
+@@ -0,0 +1,83 @@
++# q8_1 activation blocks: keeping the scale and sum finite (#606, follow-up)
++
++Status: follow-up to the fixes in `19de7f4` / `f6601bf`, which introduced
++`include/strata/kernels/q8_1_finite.hpp` and routed the main q8_1 activation
++emit sites through it. This note covers the three sites that were missed and
++the change that clamps them the same way.
++
++## The invariant
++
++A q8_1 activation block stores 32 `int8` quants plus an fp16 `half2` pair:
++the block scale `d = amax / 127.0f` and the sum-of-absolutes term `sum` the
++dequant path consumes alongside it. Both halves must be finite fp16 values.
++The dequant and dot kernels do not test for finiteness; they assume the
++producer upheld the invariant, because every producer shares the helper
++`q8_1_ds()` from `q8_1_finite.hpp`, which clamps `d` into the fp16-finite
++range and clamps `sum` to a non-negative finite value (it is a mean of `|x|`,
++so it is never legitimately negative).
++
++## What the three missed sites do differently
++
++| site | kernel | path |
++|---|---|---|
++| `src/kernels/cuda/fused_gr.cu`, `gr_q8_tail` | fused gate-reduce tail | the fused (QFUSE) expert path |
++| `src/kernels/cuda/verify_kernels.cu`, `gdn_q8_1_store` | batched GDN verify store | speculative-window store on the fused path |
++| `src/kernels/cuda/iq_kernels.cu`, `s26_swiglu_q8_1_kernel` | S26 swiglu quantize | the S26 expert layout |
++
++Each wrote the pair with a raw `make_half2(d, sum)`. When a block's `amax`
++overflows — or the kernel reads a non-finite input — `d` is `inf`/NaN, and
++`__float2half` turns the pair into NaN (or the pathological `(0, 0)`, which
++silently reads the block as all-`-127 * 0` bias). There is no per-use guard
++downstream: a NaN scale propagates through the fp16 dot, through the expert
++output, and through every residual sum that follows it in the layer stack.
++
++The end of that chain is the sampler. When the damage reaches the logits, the
++greedy path's all-non-finite fallback selects vocabulary id 0 — on
++Qwen-family vocabularies the `!` token — and a row that is *mostly* damaged
++picks arguments from noise. That is the visible face of the degeneration
++reports in #606: runs of `!`, and content collapse onto whatever tokens the
++perturbed logits favor.
++
++## Why this is a correctness fix, not a filter
++
++The clamp runs at the producer, at the numeric layer, and is entirely
++content-blind: it changes what bits a damaged *activation block* can carry,
++never what text the model can say. It converts a NaN-poisoning block into a
++finite, neutral one — the same bits the CPU expert pool and the already-fixed
++GPU sites produce for the same inputs. This matters for the class of bug in
++#606: text-level repetition detectors treat symptoms; the engine must not
++invent damage in the first place.
++
++## Diagnostic criteria
++
++Evidence that a deployment is hitting one of these sites:
++
++1. Degeneration output begins mid-conversation and is cured by a full engine
++   restart while the same prompt re-reads clean — damage lives in carried
++   engine state (checkpoints, caches), not in the weights or the prompt.
++2. Once begun it affects *every* session, including brand-new ones: sessions
++   fork from a shared root checkpoint and inherit the damaged state until it
++   is dropped.
++3. The visible token is often vocabulary id 0 (`!` on Qwen tokenizers — the
++   sampler's all-non-finite fallback), or a small set of literal tokens with
++   no structure (content-id collapse, e.g. runs of `.`/`1`/`3`).
++4. On this branch family the fused/S26 expert paths are environment-gated;
++   reproductions concentrate where those paths are enabled (the performance
++   branch), while default production boots run the clamped path.
++
++(1)–(3) together point at carried-state damage; a one-token id-0 face points
++specifically at a non-finite activation scale reaching the sampler.
++
++## Related findings
++
++The same investigation localized a second, independent violation of the
++engine's determinism contract — expert-output bits depending on which tier
++(GPU-resident vs CPU pool) an expert was assigned, because the two paths
++quantize the activation scale at different precision — and a third one
++through the speculative drafting policy. Those are discussed in
++`docs/DEGENERATION_RCA.md` alongside the reproduction and verification
++protocol, because the remedy for all three is the same invariant:
++
++*anything that chooses **how** to compute is part of the output function
++unless the numerics are provably shape-invariant — otherwise it must be
++frozen, keyed, or shared.*
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index 210cf228c1..23aeedd70e 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -1,5 +1,6 @@
+ // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
+ #include "strata/core/emulate.hpp"
++#include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
+ #include "strata/kernels/fused_gr.hpp"
+ #include "strata/kernels/bf16_bits.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+@@ -199,7 +200,7 @@ __device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) {
+     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+     GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + c0 / 32;
+     y->qs[lane] = q;
+-    if (lane == 0) y->ds = make_half2(d, sum);
++    if (lane == 0) y->ds = q8_1_ds(d, sum);   // #606: clamped scale/sum - an unclamped pair NaN-poisons the dot path
+ }
+ // Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
+ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index 1c20986d5e..05dac2ffa8 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -2327,7 +2327,7 @@ __global__ void s26_swiglu_q8_1_kernel(const float* __restrict__ gate, const flo
+     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+     const long long ib = i / 32, iqs = i % 32;
+     y[ib].qs[iqs] = q;
+-    if (iqs == 0) y[ib].ds = make_half2(d, sum);
++    if (iqs == 0) y[ib].ds = q8_1_ds(d, sum);   // #606: clamped scale/sum (the S26 path bypassed the finite helper)
+ }
+ template<bool LT, bool LX, int RG, int RD, bool SL = false, bool FQ = false, bool TS = false, int BD = 0>
+ void s26_launch_l(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr,
+diff --git a/src/kernels/cuda/verify_kernels.cu b/src/kernels/cuda/verify_kernels.cu
+index 122db99733..525c24b213 100644
+--- a/src/kernels/cuda/verify_kernels.cu
++++ b/src/kernels/cuda/verify_kernels.cu
+@@ -4,6 +4,7 @@
+ // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
+ #include "strata/kernels/verify_kernels.hpp"
+ #include "strata/core/emulate.hpp"
++#include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
+ #include "strata/kernels/dp4a.hpp"
+ #include "strata/kernels/pdl.hpp"
+ 
+@@ -199,7 +200,7 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
+     const float d = amax / 127.0f;
+     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+     xq[idx / 32].qs[idx % 32] = q;
+-    if (idx % 32 == 0) xq[idx / 32].ds = make_half2(d, sum);
++    if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
+ }
+ 
+ template <bool ALL_OUT, bool Q>
