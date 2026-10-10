@@ -1,0 +1,8 @@
+[
+ ["E0 batch (live now) 4K", "logs/binaries/strata-141-batch.exe", [], [], "logs/prompt-ids.txt"],
+ ["E1 six-PR set 4K", "logs/binaries/strata-141-6pr.exe", [], [], "logs/prompt-ids.txt"],
+ ["E2 six-PR +WMMA 4K", "logs/binaries/strata-141-6pr.exe", [], [["STRATA_SELECT_WMMA", "1"]], "logs/prompt-ids.txt"],
+ ["E3 six-PR +SIMT 4K", "logs/binaries/strata-141-6pr.exe", [], [["STRATA_SELECT_SIMT", "1"]], "logs/prompt-ids.txt"],
+ ["F0 batch 16K", "logs/binaries/strata-141-batch.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["F1 six-PR set 16K", "logs/binaries/strata-141-6pr.exe", [], [], "logs/prompt-16k-ids.txt"]
+]
