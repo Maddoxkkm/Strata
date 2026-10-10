@@ -87,3 +87,36 @@ Ranked by (fit for this box) x (plausible size of win); each applies cleanly or 
 Intel Arc, CUDA-12/Docker, Pascal/Blackwell, web-UI, math-rendering, translation or bench-report PRs. Long prompt
 reads are now at 1.48k tok/s (16K synthetic) and 1.26k (73K real text), decode ~30 tok/s short-turn with 33/36 drafts
 accepted.
+
+## 7. Second batch (#1297 #1298 #1151 #1841 #1656): measured, and NOT adopted
+
+Applied and built (`logs/binaries/strata-141-6pr.exe`, commit `bf10c007`), then measured against the batch-1
+binary. It is a regression, at both prompt sizes:
+
+| arm (4K prompt) | prefill | host staging |
+| --- | --- | --- |
+| batch 1 (live) | **869.0 tok/s** | 2405 ms |
+| six-PR set | 666.9 (-23%) | 3958 ms |
+| six-PR + `STRATA_SELECT_WMMA=1` | 759.6 | 4134 ms |
+| six-PR + `STRATA_SELECT_SIMT=1` | 836.8 | 3020 ms |
+| 16K: batch 1 vs six-PR set | 1612.9 vs 1502.5 (-6.8%) | 3355 vs 4211 ms |
+
+So the two opt-in arms help (SIMT recovers most of it) but neither beats batch 1. The likely culprit is #1297:
+it rewrites 264 lines of `src/kernels/cuda/iq_kernels.cu` and changes the default expert/mvq row variants, and
+with no tuning table present the default path is slower here. Bisecting it is its own cycle (build without the
+`iq_kernels.cu` half, re-measure).
+
+The tree is rolled back to the batch-1 state (`tuned-141` = `9daddee8`, live config on `strata-141-batch.exe`);
+the experiment is preserved on branch `pr-batch2-tested` (`bf10c007`) so the bisect does not have to redo the
+merge work.
+
+Also settled in this pass:
+
+- **#1324** (LRU RAM tier): its CLI half lands in `generate.cpp` while its `FileExpertSource` half resolves to
+  upstream, which does not compile - i.e. it cannot be taken in halves. It needs a dedicated port of the whole
+  500-line memory-path change, then a measure. Left out.
+- **#1167** (rocBLAS prompt table): the cmake hook landed, the `gemm.cu` loader did not, and the PR's measured
+  win is RDNA2 (gfx1030) - a gfx1100 table would need `tools/hip/tune_rocblas` to generate one first.
+- **#1820**: not this model. `general.architecture = qwen4exp` in our GGUF (block_count 48, head_count_kv 2,
+  context_length 262144); `qwen35moe` is a different family (the 27B in the HF cache is `qwen35`).
+- **#1656** is in the six-PR set but inert on a single-GPU run: it is about three-or-more layer-split stages.
