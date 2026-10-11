@@ -1,0 +1,10 @@
+[
+ ["K0 142-b 16K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["K1 142-all 16K", "logs/binaries/strata-142-all.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["K2 142-b +SIMT 16K", "logs/binaries/strata-142-b.exe", [], [["STRATA_SELECT_SIMT", "1"]], "logs/prompt-16k-ids.txt"],
+ ["K3 per-layer slots 16K", "logs/binaries/strata-142-b.exe", ["--expert-cache-per-layer"], [], "logs/prompt-16k-ids.txt"],
+ ["L0 142-b 4K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"],
+ ["L1 142-all 4K", "logs/binaries/strata-142-all.exe", [], [], "logs/prompt-ids.txt"],
+ ["L2 142-b +SIMT 4K", "logs/binaries/strata-142-b.exe", [], [["STRATA_SELECT_SIMT", "1"]], "logs/prompt-ids.txt"],
+ ["L3 per-layer slots 4K", "logs/binaries/strata-142-b.exe", ["--expert-cache-per-layer"], [], "logs/prompt-ids.txt"]
+]

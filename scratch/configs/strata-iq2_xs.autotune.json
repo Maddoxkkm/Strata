@@ -1,0 +1,69 @@
+{
+ "config": "D:\\llm-dev\\strata\\scratch\\configs\\strata-iq2_xs.json",
+ "date": "2026-10-11 16:36",
+ "kernels": [
+  {
+   "what": "experts 16 42 2560 640",
+   "default_us": 56.8,
+   "chosen": "8/8",
+   "chosen_us": 56.8,
+   "changed": false
+  },
+  {
+   "what": "experts 22 42 2560 640",
+   "default_us": 62.7,
+   "chosen": "8/8",
+   "chosen_us": 62.7,
+   "changed": false
+  },
+  {
+   "what": "experts 29 42 2560 640",
+   "default_us": 53.11,
+   "chosen": "8/8",
+   "chosen_us": 53.11,
+   "changed": false
+  },
+  {
+   "what": "mmvq 21 2560 512",
+   "default_us": 4.01,
+   "chosen": "4",
+   "chosen_us": 4.01,
+   "changed": false
+  },
+  {
+   "what": "mmvq 21 2560 640",
+   "default_us": 4.43,
+   "chosen": "4",
+   "chosen_us": 4.43,
+   "changed": false
+  },
+  {
+   "what": "mmvq 21 2560 6144",
+   "default_us": 16.56,
+   "chosen": "4",
+   "chosen_us": 16.56,
+   "changed": false
+  },
+  {
+   "what": "mmvq 21 2560 10240",
+   "default_us": 25.25,
+   "chosen": "4",
+   "chosen_us": 25.25,
+   "changed": false
+  },
+  {
+   "what": "mmvq 21 2560 12288",
+   "default_us": 29.48,
+   "chosen": "4",
+   "chosen_us": 29.48,
+   "changed": false
+  },
+  {
+   "what": "mmvq 21 6144 2560",
+   "default_us": 14.85,
+   "chosen": "4",
+   "chosen_us": 14.85,
+   "changed": false
+  }
+ ]
+}

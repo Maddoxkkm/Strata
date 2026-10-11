@@ -1,0 +1,6 @@
+[
+ ["P0 slots as now 16K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["P1 expert-cache-per-layer 16K", "logs/binaries/strata-142-b.exe", ["--expert-cache-per-layer"], [], "logs/prompt-16k-ids.txt"],
+ ["P2 slots as now 4K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"],
+ ["P3 expert-cache-per-layer 4K", "logs/binaries/strata-142-b.exe", ["--expert-cache-per-layer"], [], "logs/prompt-ids.txt"]
+]

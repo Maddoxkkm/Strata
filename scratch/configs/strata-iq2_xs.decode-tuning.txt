@@ -1,0 +1,12 @@
+# made by tools/hip/tune_decode on this GPU; only shapes whose measured winner beat the default by more
+# than 3% (twice, interleaved) are listed - every listed variant was checked bitwise equal to the default
+# experts 16:42 (n_embd 2560, n_ff 640): default chain 56.8 us, best 8/8 56.8 us (kept the default)
+# experts 22:42 (n_embd 2560, n_ff 640): default chain 62.7 us, best 8/8 62.7 us (kept the default)
+# experts 29:42 (n_embd 2560, n_ff 640): default chain 53.1 us, best 8/8 53.1 us (kept the default)
+# mmvq 21 2560x512: default 4 4.0 us, best 4 4.0 us (kept the default)
+# mmvq 21 2560x640: default 4 4.4 us, best 4 4.4 us (kept the default)
+# mmvq 21 2560x6144: default 4 16.6 us, best 4 16.6 us (kept the default)
+# mmvq 21 2560x10240: default 4 25.2 us, best 4 25.2 us (kept the default)
+# mmvq 21 2560x12288: default 4 29.5 us, best 4 29.5 us (kept the default)
+# mmvq 21 6144x2560: default 4 14.9 us, best 4 14.9 us (kept the default)
+STRATA_DECODE_TUNING_V1 gfx1100 70260201 a35440565309b19a 2

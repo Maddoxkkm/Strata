@@ -60,7 +60,8 @@
   "STRATA_PREFILL_CPU_SHARE": "auto",
   "STRATA_RESIDENT_HEADROOM_GIB": "2",
   "STRATA_HIP_WMMA": "1",
-  "STRATA_SELECT_WMMA": "1"
+  "STRATA_SELECT_WMMA": "1",
+  "STRATA_SELECT_SIMT": "1"
  },
  "draft_vocab": "en",
  "fit_max_tokens": true,

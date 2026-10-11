@@ -1,0 +1,8 @@
+[
+ ["B0 142-b (group B) 4K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"],
+ ["B1 +SIMT scorer 4K", "logs/binaries/strata-142-b.exe", [], [["STRATA_SELECT_SIMT", "1"]], "logs/prompt-ids.txt"],
+ ["B2 142-all (no B) 4K", "logs/binaries/strata-142-all.exe", [], [], "logs/prompt-ids.txt"],
+ ["C0 142-b (group B) 16K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["C1 +SIMT scorer 16K", "logs/binaries/strata-142-b.exe", [], [["STRATA_SELECT_SIMT", "1"]], "logs/prompt-16k-ids.txt"],
+ ["C2 142-all (no B) 16K", "logs/binaries/strata-142-all.exe", [], [], "logs/prompt-16k-ids.txt"]
+]
