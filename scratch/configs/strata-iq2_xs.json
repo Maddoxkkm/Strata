@@ -58,7 +58,9 @@
   "STRATA_IO_THREADS": "32",
   "STRATA_RESIDENT_PIN": "1",
   "STRATA_PREFILL_CPU_SHARE": "auto",
-  "STRATA_RESIDENT_HEADROOM_GIB": "2"
+  "STRATA_RESIDENT_HEADROOM_GIB": "2",
+  "STRATA_HIP_WMMA": "1",
+  "STRATA_SELECT_WMMA": "1"
  },
  "draft_vocab": "en",
  "fit_max_tokens": true,

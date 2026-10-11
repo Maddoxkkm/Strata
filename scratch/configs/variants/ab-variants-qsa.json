@@ -1,0 +1,6 @@
+[
+ ["W0 qsa_prompt off 4K", "logs/binaries/strata-142-all.exe", [], [], "logs/prompt-ids.txt"],
+ ["W1 qsa_prompt WMMA 4K", "logs/binaries/strata-142-all.exe", [], [["STRATA_HIP_WMMA", "1"]], "logs/prompt-ids.txt"],
+ ["X0 qsa_prompt off 16K", "logs/binaries/strata-142-all.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["X1 qsa_prompt WMMA 16K", "logs/binaries/strata-142-all.exe", [], [["STRATA_HIP_WMMA", "1"]], "logs/prompt-16k-ids.txt"]
+]
