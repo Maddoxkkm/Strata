@@ -1,0 +1,9 @@
+[
+ ["R0 ring 96 (current) 4K", "logs/binaries/strata-142-all.exe", [], [["STRATA_PREFILL_RING", "96"]], "logs/prompt-ids.txt"],
+ ["R1 ring 384 4K", "logs/binaries/strata-142-all.exe", [], [["STRATA_PREFILL_RING", "384"]], "logs/prompt-ids.txt"],
+ ["R2 ring 1024 4K", "logs/binaries/strata-142-all.exe", [], [["STRATA_PREFILL_RING", "1024"]], "logs/prompt-ids.txt"],
+ ["R3 ring 512 4K", "logs/binaries/strata-142-all.exe", [], [["STRATA_PREFILL_RING", "512"]], "logs/prompt-ids.txt"],
+ ["S0 ring 96 16K", "logs/binaries/strata-142-all.exe", [], [["STRATA_PREFILL_RING", "96"]], "logs/prompt-16k-ids.txt"],
+ ["S1 ring 384 16K", "logs/binaries/strata-142-all.exe", [], [["STRATA_PREFILL_RING", "384"]], "logs/prompt-16k-ids.txt"],
+ ["S2 ring 1024 16K", "logs/binaries/strata-142-all.exe", [], [["STRATA_PREFILL_RING", "1024"]], "logs/prompt-16k-ids.txt"]
+]

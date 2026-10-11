@@ -1,5 +1,5 @@
 {
- "exe": "D:/llm-dev/strata/logs/binaries/strata-142-4pr.exe",
+ "exe": "D:/llm-dev/strata/logs/binaries/strata-142-all.exe",
  "args": [
   "--pack",
   "C:\\Users\\maddo\\.lmstudio\\models\\packs\\iq2_xs",
@@ -55,7 +55,6 @@
  "env": {
   "STRATA_HIPBLASLT_TUNING": "D:\\llm-dev\\strata\\tools\\hip\\gfx1100-hipblaslt-100500.txt",
   "STRATA_PREFILL_MMQ": "1",
-  "STRATA_PREFILL_RING": "96",
   "STRATA_IO_THREADS": "32",
   "STRATA_RESIDENT_PIN": "1",
   "STRATA_PREFILL_CPU_SHARE": "auto",
