@@ -17,6 +17,9 @@ import urllib.request
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
 CFG = ROOT / "scratch/configs/strata-iq2_xs.json"
+import os as _os
+if _os.environ.get("AB_CONFIG"):                       # e.g. a second model's config (see model-bench.sh)
+    CFG = ROOT / _os.environ["AB_CONFIG"]
 LOG = ROOT / "scratch/configs/strata-iq2_xs.log"
 URL = "http://127.0.0.1:8080/v1/chat/completions"
 ROUNDS = 3

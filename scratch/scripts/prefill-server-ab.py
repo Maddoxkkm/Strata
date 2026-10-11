@@ -20,6 +20,9 @@ import urllib.request
 
 ROOT = pathlib.Path(r"D:\llm-dev\strata")
 CFG = ROOT / "scratch" / "configs" / "strata-iq2_xs.json"
+import os as _os
+if _os.environ.get("PRE_CONFIG"):                      # e.g. a second model's config (see model-bench.sh)
+    CFG = ROOT / _os.environ["PRE_CONFIG"]
 LOG = ROOT / "scratch" / "configs" / "strata-iq2_xs.log"
 SERVER_LOG = ROOT / "logs" / "server-prefill-ab.log"
 READ = re.compile(r"strata serve: prompt (\d+) tokens = (\d+) reused \+ (\d+) read in (\d+) ms \(([\d.]+) tok/s\)")

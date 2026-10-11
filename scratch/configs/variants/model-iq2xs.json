@@ -1,0 +1,6 @@
+[
+ ["A0 IQ2_XS 4K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"],
+ ["A1 IQ2_XS 16K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["A2 IQ2_XS 32K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-32k-ids.txt"],
+ ["A3 IQ2_XS 16K (repeat)", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-16k-ids.txt"]
+]
