@@ -16,10 +16,22 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
 The first two are measured through one engine (per-request `strata_tune` keys); the worker count and the adaptive
 tier need a restart per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
 
+AMD (a config with "backend": "hip"): the PCIe share is left as the config has it (the HIP expert paths - mmap,
+resident CPU experts, the staging buffer - were measured with the share they run with; `sweep_pcie=True` sweeps it
+anyway), and the draft floor is swept wider: every extra draft token pulls more VRAM-missed experts onto the CPU.
+
+Drafting (`draft=True`, setup's --calibrate-draft): two more settings, a restart per value -
+  --spec          the MTP's longest window (with prompt lookup on, the engine allows lookup windows 2 tokens longer)
+  --suffix-draft  prompt lookup's shortest match (0 = MTP only)
+None of them changes an answer: verification keeps exactly the tokens plain greedy decoding would produce; they
+only decide which guesses are checked.  The built-in prompts include one that repeats its input (an edit), where
+prompt lookup pays; pass your own (`prompts=`, e.g. requests an agent really sends) for a measurement of YOUR mix.
+
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
 
     python tools/calibrate.py strata-q2_0.json        # measure and print; setup.py --calibrate also saves it
+    python tools/calibrate.py strata-iq3_xxs.json --draft --prompts my-agent-prompts.json
 """
 from __future__ import annotations
 
@@ -51,6 +63,35 @@ PROMPTS = (
     "Explain in two paragraphs how a refrigerator moves heat from inside to outside.",
     "List twelve European capitals with one sentence about each.",
 )
+# an edit: most of the answer repeats the input, which is what prompt lookup drafts (used with draft=True)
+EDIT_PROMPT = (
+    "Rename the variable `total` to `running_sum` in this function and return the whole function, nothing else:\n\n"
+    "def summarize(values, scale=1.0):\n"
+    "    total = 0.0\n"
+    "    count = 0\n"
+    "    for v in values:\n"
+    "        if v is None:\n"
+    "            continue\n"
+    "        total += v * scale\n"
+    "        count += 1\n"
+    "    mean = total / count if count else 0.0\n"
+    "    return {\"total\": total, \"count\": count, \"mean\": mean}\n"
+)
+
+
+def load_prompts(path) -> list[str]:
+    """Prompts from a file: a JSON list of strings, or plain text with prompts separated by a line `---`."""
+    text = Path(path).read_text(encoding="utf-8-sig")
+    if Path(path).suffix.lower() == ".json" or text.lstrip()[:1] in ("[", "{"):
+        items = json.loads(text)
+        if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
+            raise ValueError(f"{path}: expected a JSON list of strings")
+        out = [x for x in items if x.strip()]
+    else:
+        out = [b.strip() for b in text.replace("\r\n", "\n").split("\n---\n") if b.strip()]
+    if not out:
+        raise ValueError(f"{path}: no prompts")
+    return out
 
 
 def chat_ids(tok, text: str) -> list[int]:
@@ -133,9 +174,10 @@ class Session:
             self.rate()
 
 
-def run(cfg: dict, say=print, start_engine=None) -> dict:
+def run(cfg: dict, say=print, start_engine=None, prompts=None, draft: bool = False, sweep_pcie=None) -> dict:
     """Measure on the engine `cfg` describes; returns {"settings": {flag: value}, "report": {...}}.
-    `start_engine(args)` returns a started engine (serve.server.StrataEngine or a stand-in in tests)."""
+    `start_engine(args)` returns a started engine (serve.server.StrataEngine or a stand-in in tests).
+    `prompts`: your own prompt texts (default: the built-in ones, plus an edit when `draft`)."""
     if start_engine is None:
         from serve.server import StrataEngine, child_env
 
@@ -149,8 +191,10 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
         toks[i] = t
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
-    ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras())
+    texts = list(prompts) if prompts else list(PROMPTS) + ([EDIT_PROMPT] if draft else [])
+    ids_list = [chat_ids(tok, p) for p in texts]
+    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(),
+                   backend=cfg.get("backend"), draft=draft, sweep_pcie=sweep_pcie)
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -201,9 +245,12 @@ def sweep(s, values: list, base_tune: dict, key: str, label: str, say) -> dict:
 
 def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=()) -> dict:
     t0 = time.time()
-    report: dict = {}
+    hip = backend == "hip"
+    if sweep_pcie is None:
+        sweep_pcie = not hip
+    report: dict = {"backend": backend or "cuda", "draft": bool(draft), "pcie_swept": bool(sweep_pcie)}
     say("  Loading the model for the measurements ...")
-    base_args = apply(base_args, {})                   # the product defaults: what the measurements must beat
+    base_args = apply(base_args, {}, backend=backend, draft=draft)   # the product defaults the measurements must beat
     eng = start_engine(base_args)
     try:
         info = dict(getattr(eng, "info", {}) or {})
@@ -226,7 +273,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         if cand != dflt:
             for _ in range(SWEEP_ROUNDS):
                 for k in (dflt, cand):
-                    confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
+                    confirm[k].append(s.rate(tune(k[0], k[1])))
         chosen = pick(confirm, dflt) if cand != dflt else dflt
         report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
                       pcie_sweep={str(k): v for k, v in by_pcie.items()},
@@ -235,8 +282,9 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     finally:
         close(eng)
     settings = {}
-    if chosen != dflt:
-        settings["--pcie-frac"] = f"{chosen[0]:.2f}"
+    if chosen != dflt:                                 # (on AMD only the floor can differ: the share is fixed)
+        if sweep_pcie:
+            settings["--pcie-frac"] = f"{chosen[0]:.2f}"
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
     # 4. fewer CPU workers (a restart each), with the chosen settings
@@ -252,8 +300,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             try:
                 sw = Session(e, ids_list)
                 sw.warm_up(1)
-                by_workers[w] = [sw.rate(), sw.rate()]
-                say(f"    {w} workers: {statistics.median(by_workers[w]):.1f} tok/s")
+                out[key] = [sw.rate(), sw.rate()]
+                say(f"    {label} {key}: {statistics.median(out[key]):.1f} tok/s")
             finally:
                 close(e)
         report["workers"] = {str(k): v for k, v in by_workers.items()}
@@ -326,18 +374,30 @@ DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None, 
             "--adapt-every": None, "--adapt-swaps": None, "--adapt-decay": None}
 
 
-def apply(args: list[str], settings: dict) -> list[str]:
+def apply(args: list[str], settings: dict, backend=None, draft: bool = False) -> list[str]:
     """`args` with the calibrated settings; a setting the calibration did not change goes back to the product
     default (setup's --spec-min-p 0.5, the engine's own PCIe share and worker count), so an older calibration's
-    values never linger."""
+    values never linger.  AMD (`backend="hip"`) leaves --pcie-frac as the config has it, unless the settings name
+    one; the drafting flags are reset only by a calibration that measured them (`draft`) or that names them."""
     out = list(args)
-    for flag, default in DEFAULTS.items():
+    flags = dict(HIP_DEFAULTS if backend == "hip" else DEFAULTS)
+    if backend == "hip" and "--pcie-frac" in settings:
+        flags["--pcie-frac"] = None
+    if draft or any(k in settings for k in DRAFT_DEFAULTS):
+        flags.update(DRAFT_DEFAULTS)
+    for flag, default in flags.items():
         out = with_arg(out, flag, settings.get(flag, default))
     return out
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: calibrate.py <strata-*.json>")
-    res = run(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig")))
+    import argparse
+    ap = argparse.ArgumentParser(description="measure Strata's hardware-dependent engine settings on this PC")
+    ap.add_argument("config", help="a strata-*.json run config")
+    ap.add_argument("--draft", action="store_true", help="also measure the drafting settings (--spec, --suffix-draft)")
+    ap.add_argument("--prompts", help="your own prompts: a JSON list of strings, or text blocks separated by ---")
+    ap.add_argument("--sweep-pcie", action="store_true", help="AMD: sweep the PCIe share too")
+    a = ap.parse_args()
+    res = run(json.loads(Path(a.config).read_text(encoding="utf-8-sig")), draft=a.draft,
+              prompts=load_prompts(a.prompts) if a.prompts else None, sweep_pcie=True if a.sweep_pcie else None)
     print(json.dumps(res, indent=1))

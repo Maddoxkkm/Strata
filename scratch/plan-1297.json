@@ -1,0 +1,5 @@
+{
+  "CMakeLists.txt": ["both"],
+  "setup.py": ["ours", "ours", "ours"],
+  "tools/calibrate.py": ["ours", "ours", "ours", "ours", "ours", "ours"]
+}
