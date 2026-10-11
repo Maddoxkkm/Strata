@@ -1,0 +1,1 @@
+{ "docs/AMD_HIP.md": ["both"], "src/kernels/cuda/qsa_select.cu": ["both", "both", "both"] }
