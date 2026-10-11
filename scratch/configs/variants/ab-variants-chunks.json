@@ -1,0 +1,12 @@
+[
+ ["R1 4K chunks 4096 (current)", "logs/binaries/strata-141-tuned.exe", ["--prefill", "4096"], [], "logs/prompt-ids.txt"],
+ ["R1 4K chunks 7500", "logs/binaries/strata-141-tuned.exe", ["--prefill", "7500"], [], "logs/prompt-ids.txt"],
+ ["R1 4K chunks 16384", "logs/binaries/strata-141-tuned.exe", ["--prefill", "16384"], [], "logs/prompt-ids.txt"],
+ ["R1 16K chunks 4096", "logs/binaries/strata-141-tuned.exe", ["--prefill", "4096"], [], "logs/prompt-16k-ids.txt"],
+ ["R1 16K chunks 7500", "logs/binaries/strata-141-tuned.exe", ["--prefill", "7500"], [], "logs/prompt-16k-ids.txt"],
+ ["R1 16K chunks 16384", "logs/binaries/strata-141-tuned.exe", ["--prefill", "16384"], [], "logs/prompt-16k-ids.txt"],
+ ["R1 32K chunks 4096", "logs/binaries/strata-141-tuned.exe", ["--prefill", "4096"], [], "logs/prompt-32k-ids.txt"],
+ ["R1 32K chunks 7500", "logs/binaries/strata-141-tuned.exe", ["--prefill", "7500"], [], "logs/prompt-32k-ids.txt"],
+ ["R1 32K chunks 16384", "logs/binaries/strata-141-tuned.exe", ["--prefill", "16384"], [], "logs/prompt-32k-ids.txt"],
+ ["R1 4K chunks 16384 + SGEMM", "logs/binaries/strata-141-tuned.exe", ["--prefill", "16384"], [["STRATA_SELECT_SGEMM", "1"]], "logs/prompt-ids.txt"]
+]

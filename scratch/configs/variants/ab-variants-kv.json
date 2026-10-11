@@ -1,0 +1,6 @@
+[
+ ["R1 k8v4 (config)", "logs/binaries/strata-1403-tuned.exe", [], []],
+ ["R1 int8", "logs/binaries/strata-1403-tuned.exe", ["--kv", "int8"], []],
+ ["R2 k8v4 (config)", "logs/binaries/strata-1403-tuned.exe", [], []],
+ ["R2 int8", "logs/binaries/strata-1403-tuned.exe", ["--kv", "int8"], []]
+]

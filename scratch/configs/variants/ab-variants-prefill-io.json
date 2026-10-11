@@ -1,0 +1,11 @@
+[
+ ["P0 baseline", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-ids.txt"],
+ ["P1 headroom 2GiB", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_RESIDENT_HEADROOM_GIB", "2"]], "logs/prompt-ids.txt"],
+ ["P2 headroom 1GiB", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_RESIDENT_HEADROOM_GIB", "1"]], "logs/prompt-ids.txt"],
+ ["P3 chunks 8192", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_PREFILL_AUTO_MAX", "8192"]], "logs/prompt-ids.txt"],
+ ["P4 io threads 64", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_IO_THREADS", "64"]], "logs/prompt-ids.txt"],
+ ["P5 io threads 16", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_IO_THREADS", "16"]], "logs/prompt-ids.txt"],
+ ["P6 pf-ahead off", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_IO_PF_AHEAD", "0"]], "logs/prompt-ids.txt"],
+ ["P7 pin off (pageable)", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_RESIDENT_PIN", "0"]], "logs/prompt-ids.txt"],
+ ["P8 baseline (drift check)", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-ids.txt"]
+]

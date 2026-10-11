@@ -1,0 +1,6 @@
+[
+ ["V1 baseline 160", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160"], [], "logs/prompt-ids.txt"],
+ ["V1 adapt-every 0", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--adapt-every", "0"], [], "logs/prompt-ids.txt"],
+ ["V2 baseline 160", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160"], [], "logs/prompt-ids.txt"],
+ ["V2 adapt-every 0", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--adapt-every", "0"], [], "logs/prompt-ids.txt"]
+]

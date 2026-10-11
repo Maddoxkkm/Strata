@@ -1,0 +1,7 @@
+[
+ ["C0 #1451 only 4K", "logs/binaries/strata-141-p1451.exe", [], [], "logs/prompt-ids.txt"],
+ ["C1 batch 4K", "logs/binaries/strata-141-batch.exe", [], [], "logs/prompt-ids.txt"],
+ ["C2 batch +FILE_RELEASE 4K", "logs/binaries/strata-141-batch.exe", [], [["STRATA_FILE_RELEASE", "1"]], "logs/prompt-ids.txt"],
+ ["D0 #1451 only 16K", "logs/binaries/strata-141-p1451.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["D1 batch 16K", "logs/binaries/strata-141-batch.exe", [], [], "logs/prompt-16k-ids.txt"]
+]

@@ -1,0 +1,10 @@
+[
+ ["D0 baseline (160 tok)", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160"], [], "logs/prompt-ids.txt"],
+ ["D1 pool-workers 15 (SMT)", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--pool-workers", "15"], [], "logs/prompt-ids.txt"],
+ ["D2 pool-workers 16", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--pool-workers", "16"], [], "logs/prompt-ids.txt"],
+ ["D3 pool-tasks 8", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--pool-tasks", "8"], [], "logs/prompt-ids.txt"],
+ ["D4 pcie-frac 0.3", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--pcie-frac", "0.3"], [], "logs/prompt-ids.txt"],
+ ["D5 pool-affinity all", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--pool-affinity", "all"], [], "logs/prompt-ids.txt"],
+ ["D6 host-core last", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160", "--host-core", "last"], [], "logs/prompt-ids.txt"],
+ ["D7 baseline again", "logs/binaries/strata-1403-cpushare.exe", ["--max-new", "160"], [], "logs/prompt-ids.txt"]
+]

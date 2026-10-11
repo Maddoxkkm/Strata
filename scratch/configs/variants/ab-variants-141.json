@@ -1,0 +1,12 @@
+[
+ ["R1 1403-tuned 4K (prev build)", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-ids.txt"],
+ ["R1 141-tuned 4K", "logs/binaries/strata-141-tuned.exe", [], [], "logs/prompt-ids.txt"],
+ ["R1 141-tuned 4K prefill 4096", "logs/binaries/strata-141-tuned.exe", ["--prefill", "4096"], [], "logs/prompt-ids.txt"],
+ ["R1 141-tuned 1k share=auto", "logs/binaries/strata-141-tuned.exe", [], [["STRATA_PREFILL_CPU_SHARE", "auto"]], "logs/prompt-1k-ids.txt"],
+ ["R1 141-tuned 1k share=0", "logs/binaries/strata-141-tuned.exe", [], [["STRATA_PREFILL_CPU_SHARE", "0"]], "logs/prompt-1k-ids.txt"],
+ ["R2 1403-tuned 4K (prev build)", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-ids.txt"],
+ ["R2 141-tuned 4K", "logs/binaries/strata-141-tuned.exe", [], [], "logs/prompt-ids.txt"],
+ ["R2 141-tuned 4K prefill 4096", "logs/binaries/strata-141-tuned.exe", ["--prefill", "4096"], [], "logs/prompt-ids.txt"],
+ ["R2 141-tuned 1k share=auto", "logs/binaries/strata-141-tuned.exe", [], [["STRATA_PREFILL_CPU_SHARE", "auto"]], "logs/prompt-1k-ids.txt"],
+ ["R2 141-tuned 1k share=0", "logs/binaries/strata-141-tuned.exe", [], [["STRATA_PREFILL_CPU_SHARE", "0"]], "logs/prompt-1k-ids.txt"]
+]

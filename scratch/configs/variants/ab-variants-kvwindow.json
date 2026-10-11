@@ -1,0 +1,8 @@
+[
+ ["R1 resident 32768 (now)", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-ids.txt"],
+ ["R1 resident 65536", "logs/binaries/strata-1403-cpushare.exe", ["--kv-resident", "65536"], [], "logs/prompt-ids.txt"],
+ ["R1 resident 131072", "logs/binaries/strata-1403-cpushare.exe", ["--kv-resident", "131072"], [], "logs/prompt-ids.txt"],
+ ["R2 resident 32768 (now)", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-ids.txt"],
+ ["R2 resident 65536", "logs/binaries/strata-1403-cpushare.exe", ["--kv-resident", "65536"], [], "logs/prompt-ids.txt"],
+ ["R2 resident 131072", "logs/binaries/strata-1403-cpushare.exe", ["--kv-resident", "131072"], [], "logs/prompt-ids.txt"]
+]

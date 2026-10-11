@@ -1,0 +1,6 @@
+[
+ ["G0 0.1.41 batch (live) 4K", "logs/binaries/strata-141-batch.exe", [], [], "logs/prompt-ids.txt"],
+ ["G1 0.1.42 + local set 4K", "logs/binaries/strata-142-tuned.exe", [], [], "logs/prompt-ids.txt"],
+ ["H0 0.1.41 batch 16K", "logs/binaries/strata-141-batch.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["H1 0.1.42 + local set 16K", "logs/binaries/strata-142-tuned.exe", [], [], "logs/prompt-16k-ids.txt"]
+]

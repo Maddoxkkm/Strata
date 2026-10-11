@@ -1,0 +1,10 @@
+[
+ ["R1 cpushare short, default", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-short-ids.txt"],
+ ["R1 cpushare short, CPU_SHARE=auto", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_PREFILL_CPU_SHARE", "auto"]], "logs/prompt-short-ids.txt"],
+ ["R1 tuned short (no cluster)", "logs/binaries/strata-1403-tuned.exe", [], [], "logs/prompt-short-ids.txt"],
+ ["R2 cpushare short, default", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-short-ids.txt"],
+ ["R2 cpushare short, CPU_SHARE=auto", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_PREFILL_CPU_SHARE", "auto"]], "logs/prompt-short-ids.txt"],
+ ["R2 tuned short (no cluster)", "logs/binaries/strata-1403-tuned.exe", [], [], "logs/prompt-short-ids.txt"],
+ ["4K regression: cpushare auto", "logs/binaries/strata-1403-cpushare.exe", [], [["STRATA_PREFILL_CPU_SHARE", "auto"]], "logs/prompt-ids.txt"],
+ ["4K regression: tuned (prev)", "logs/binaries/strata-1403-tuned.exe", [], [], "logs/prompt-ids.txt"]
+]

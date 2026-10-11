@@ -1,0 +1,6 @@
+[
+ ["R1 kv-resident 32768 (streaming)", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-ids.txt"],
+ ["R1 kv-resident 0 (all in VRAM)", "logs/binaries/strata-1403-cpushare.exe", ["--kv-resident", "0"], [], "logs/prompt-ids.txt"],
+ ["R2 kv-resident 32768 (streaming)", "logs/binaries/strata-1403-cpushare.exe", [], [], "logs/prompt-ids.txt"],
+ ["R2 kv-resident 0 (all in VRAM)", "logs/binaries/strata-1403-cpushare.exe", ["--kv-resident", "0"], [], "logs/prompt-ids.txt"]
+]

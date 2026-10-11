@@ -1,0 +1,8 @@
+[
+ ["J0 142-tuned 4K", "logs/binaries/strata-142-tuned.exe", [], [], "logs/prompt-ids.txt"],
+ ["J1 142+4PR 4K", "logs/binaries/strata-142-4pr.exe", [], [], "logs/prompt-ids.txt"],
+ ["J2 142-tuned 4K (repeat)", "logs/binaries/strata-142-tuned.exe", [], [], "logs/prompt-ids.txt"],
+ ["J3 142+4PR 4K (repeat)", "logs/binaries/strata-142-4pr.exe", [], [], "logs/prompt-ids.txt"],
+ ["K0 142-tuned 16K", "logs/binaries/strata-142-tuned.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["K1 142+4PR 16K", "logs/binaries/strata-142-4pr.exe", [], [], "logs/prompt-16k-ids.txt"]
+]
