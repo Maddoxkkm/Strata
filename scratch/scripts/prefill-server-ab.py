@@ -86,7 +86,8 @@ def main():
         print(f"\n  --- --prefill {n} ---")
         set_chunk(n)
         restart()
-        out[n] = measure(24000)
+        import os as _os
+        out[n] = measure(int(_os.environ.get("PRE_TOKENS", 24000)))
         # the engine prints how it sliced the prompt; surface it for the record
         tail = SERVER_LOG.read_text(encoding="utf-8", errors="replace")
         for m in re.findall(r"prefill [0-9]+ tokens in [0-9]+ chunks[^\n]*", tail)[-1:]:
