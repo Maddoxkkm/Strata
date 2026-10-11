@@ -810,6 +810,9 @@ private:
     };
     std::mutex stage_mu_;
     std::vector<std::unique_ptr<uint8_t[], StageBufFree>> stage_buf_;
+    uint64_t lru_cap_ = ~0ull;                ///< the elastic LRU's current ceiling on the pool's bytes
+    struct StageFree { void operator()(uint8_t* p) const; };   ///< the PR's page-aligned free: unused here,
+                                                              ///< this merge allocates through StageBufFree
     // the elastic LRU (start_elastic_lru): the pool grows to lru_cap_ (at most stage_keep_), a watcher lowers
     // lru_cap_ and frees the coldest buffers when the available RAM falls below the floor, and raises it again
     // when RAM is free (#1324). Off until start_elastic_lru runs; a freed slot is not handed out again here.
