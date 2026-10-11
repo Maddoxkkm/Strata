@@ -2535,6 +2535,8 @@ double FileExpertSource::cached_share(int64_t samples) const {
     (void) samples;
     return -1.0;   // no cheap residency query for a file mapping here: the caller keeps its SSD assumption
 #endif
+}
+
 uint64_t FileExpertSource::stage_keep_env() {
     const char* v = std::getenv("STRATA_STAGE_KEEP_MIB");
     return v != nullptr && std::atoll(v) > 0 ? (uint64_t) std::atoll(v) << 20 : 0ull;
