@@ -1,0 +1,309 @@
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 3f673bff7..38a89a6f3 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -743,6 +743,12 @@ print(r.choices[0].message.content)
+   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
+   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
+   `strata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
++  A short phrase repeated back to back can be ended the same way (opt-in): with `"repeat_stop_period": N` (2 to
++  64; 16 is a good choice), a run of `repeat_stop_tokens` tokens that repeats with a period of 2 to N tokens ends the
++  reply (seen on a scanned page: `[unclear] ` written until `max_tokens` ran out, 12,000 tokens and 229 s). The
++  default, 1, keeps only the one-token rule. A reply either rule ends keeps `finish_reason` `"length"` (what OpenAI
++  clients expect), and its choice says why with Strata's own field `"stop_cause": "repetition"` (`"reasoning_loop"`
++  for the thinking guard below): a larger `max_tokens` would not have helped.
+ - **Repeated reasoning (opt-in, #728).** The single-token guard above does not see a model that repeats whole
+   passages. `"reasoning_loop_recovery"` in `strata-<model>.json` is `false` (the default), `"stop"` or `"recover"`
+   (`true` means `"recover"`). Every 512 output tokens, at a complete character and parser boundary, the reasoning is
+@@ -1881,6 +1887,8 @@ tools/MCP are refused explicitly. Without `response_format`, ordinary text and t
+ 
+ Structured SSE buffers the answer while sending keep-alive comments. It emits content only after validation,
+ then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without invalid content deltas.
++An answer the server ended because it repeated itself (`stop_cause` `"repetition"`, above) fails with a message that
++says so, instead of "increase the output budget", which only fits an answer that ran out of `max_tokens`.
+ `/v1/status.structured_output` advertises the formats, validation method and buffered streaming behavior.
+ 
+ ### API request monitor
+diff --git a/serve/server.py b/serve/server.py
+index a0fb2b88c..bdca8974c 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -143,6 +143,10 @@ def write_temporary(path: Path, parts: list) -> None:
+ # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
+ # sets it; 0 turns it off.
+ REPEAT_STOP_TOKENS = 256
++# The same guard for a short phrase repeated back to back ("[unclear] " forever, 3 tokens a time), opt-in: with the
++# config's "repeat_stop_period": N (2-64; 16 is a good choice), a run of repeat_stop_tokens tokens that repeats with
++# a period of 2 to N tokens ends the reply the same way.  1 (the default) keeps only the one-token guard.
++REPEAT_STOP_PERIOD = 1
+ ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+ # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
+ # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
+@@ -2790,6 +2794,7 @@ def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name
+         self.reasoning_loop_recovery = False
+         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
++        self.repeat_stop_period = REPEAT_STOP_PERIOD     # ... and a phrase of up to this many tokens repeated (1: off)
+         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
+         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
+@@ -3623,6 +3628,11 @@ def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> I
+         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+         detok, n, finish = Detokenizer(self.tok), 0, "length"
+         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
++        stop_cause = None                               # why the generator ended a reply itself ("done": stop_cause)
++        # a short phrase repeated back to back ("[unclear] " forever): for each period p in 2..repeat_stop_period, how
++        # many tokens in a row equal the one p back; the run is p tokens longer than that count
++        period_max = max(1, min(int(self.repeat_stop_period or 1), 64))
++        period_tail, period_run, period_hit = [], [0] * (period_max + 1), 0
+         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
+         stop_list = stop_strings(sampling)
+         stops = StopMatcher(stop_list) if stop_list else None
+@@ -3774,6 +3784,17 @@ def cut(evs):
+                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
+                                     repeated = True     # #606: a degenerate output, not an answer: end it here
+                                     break
++                                if self.repeat_stop_tokens and period_max > 1:
++                                    for p in range(2, period_max + 1):
++                                        same = len(period_tail) >= p and period_tail[-p] == t
++                                        period_run[p] = period_run[p] + 1 if same else 0
++                                        if same and period_run[p] + p >= self.repeat_stop_tokens:
++                                            period_hit = p
++                                    period_tail.append(t)
++                                    del period_tail[:-period_max]
++                                    if period_hit:
++                                        repeated = True  # the same short phrase over and over: end it as above
++                                        break
+                                 piece = detok.push(t)
+                                 tail = (tail + piece)[-2:]
+                                 evs = cut(parser.feed(piece))
+@@ -3918,10 +3939,19 @@ def cut(evs):
+                     if cancel.is_set():
+                         finish = "cancel"
+                     elif looped:
++                        stop_cause = "reasoning_loop"
+                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
+                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
+                               "strata-<model>.json; remove it to turn this off)", flush=True)
++                    elif repeated and period_hit:
++                        stop_cause = "repetition"
++                        phrase = self.tok.decode(period_tail[-period_hit:])
++                        print(f"[strata] the reply repeated the same {period_hit} tokens ({phrase!r}) "
++                              f"{(period_run[period_hit] + period_hit) // period_hit} times in a row: ended as "
++                              "\"length\" with stop_cause \"repetition\" (repeat_stop_tokens / repeat_stop_period in "
++                              "strata-<model>.json; 0 / 1 turn this off)", flush=True)
+                     elif repeated:
++                        stop_cause = "repetition"
+                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
+                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
+                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
+@@ -4022,6 +4052,8 @@ def cut(evs):
+                 "reasoning_recoveries": recovery_count}
+         if stops is not None and stops.hit is not None:
+             done["stop_sequence"] = stops.hit
++        if stop_cause is not None and finish == "length":
++            done["stop_cause"] = stop_cause             # "length" that a larger max_tokens would not have changed
+         yield "done", done
+ 
+ 
+@@ -4263,6 +4295,10 @@ def chunk(delta, finish=None):
+                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
+             if x.get("timings"):
+                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
++            if x.get("stop_cause"):
++                # Strata's own field beside finish_reason: "length" because the reply repeated itself ("repetition")
++                # or the thinking looped ("reasoning_loop"), so a larger max_tokens would not have helped
++                last["choices"][0]["stop_cause"] = x["stop_cause"]
+             yield last
+ 
+ 
+@@ -4305,6 +4341,8 @@ def openai_collect(chunks) -> dict:
+     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
+            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
+            "usage": last["usage"]}
++    if last["choices"][0].get("stop_cause"):
++        out["choices"][0]["stop_cause"] = last["choices"][0]["stop_cause"]
+     if last.get("timings"):
+         out["timings"] = last["timings"]
+     return out
+@@ -4324,7 +4362,8 @@ def structured_chunks(chunks, validator):
+                 yield chunk if progress else None
+         result = openai_collect(buffered)
+         choice = result["choices"][0]
+-        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
++        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"],
++                                 choice.get("stop_cause"))
+         yield buffered[0]
+         delta = {"content": content}
+         if choice["message"].get("reasoning_content"):
+@@ -5312,8 +5351,10 @@ def _responses(self, req):
+             cancel = threading.Event()
+             self._watch_client(cancel)                       # #430 #431
+ 
++            ended = {}                                       # the generator's "done": its stop_cause for check()
++
+             def check(text, finish):
+-                return validated_json(text, validator, finish)
++                return validated_json(text, validator, finish, ended.get("stop_cause"))
+ 
+             def events():
+                 yield from asm.start()
+@@ -5325,6 +5366,7 @@ def events():
+                         yield from asm.feed(x)
+                     elif kind == "done":
+                         done = x
++                        ended.update(x)
+                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
+                     yield from asm.finish(done, check)
+             items = self._capture(events(), "responses")
+@@ -6233,6 +6275,11 @@ def main() -> int:
+     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
+         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
+     svc.repeat_stop_tokens = rs
++    rp = cfg.get("repeat_stop_period", REPEAT_STOP_PERIOD)   # a short phrase repeated: up to this many tokens long
++    if isinstance(rp, bool) or not isinstance(rp, int) or not 1 <= rp <= 64:
++        raise SystemExit(f"[strata] config \"repeat_stop_period\" must be a whole number from 1 to 64 (1 = only one "
++                         f"repeated token, as #606), not {rp!r}")
++    svc.repeat_stop_period = rp
+     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
+         try:
+diff --git a/serve/structured.py b/serve/structured.py
+index 9bed53484..07d682899 100644
+--- a/serve/structured.py
++++ b/serve/structured.py
+@@ -189,7 +189,25 @@ def _extract_json(text: str) -> str:
+     return s[start:]
+ 
+ 
+-def validated_json(text, validator, finish):
++INCOMPLETE = {
++    # the generator's "stop_cause" for a reply it ended before its end (see Service.run): a bigger budget cannot help
++    "repetition": ("structured output was incomplete: the reply repeated the same text over and over and Strata stopped "
++                   "it (repeat_stop_tokens), so a larger output budget will not help. Long free text inside a JSON "
++                   "string can make the model loop; a schema with one string field is answered as plain text instead "
++                   "(structured_plain_string)"),
++    "reasoning_loop": ("structured output was incomplete: the thinking repeated the same passages and Strata stopped "
++                       "it (reasoning_loop_recovery), so a larger output budget will not help"),
++}
++
++
++def incomplete_message(finish, cause=None):
++    """The error for a structured answer that did not end on its own."""
++    return INCOMPLETE.get(cause) or f"structured output was incomplete (finish_reason={finish}); increase the output budget"
++
++
++def validated_json(text, validator, finish, cause=None):
++    """The answer as canonical JSON, or StructuredOutputError.  `cause`: the generator's stop_cause, when it ended
++    the reply itself (a repetition) rather than at the output budget."""
+     def pairs(items):
+         obj = {}
+         for key, value in items:
+@@ -202,7 +220,7 @@ def constant(value):
+         raise ValueError(f"invalid JSON constant: {value}")
+ 
+     if finish != "stop":
+-        raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); increase the output budget")
++        raise StructuredOutputError(incomplete_message(finish, cause))
+     try:
+         value = json.loads(_extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
+         canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 362cfa74c..74d4a8d9e 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -2060,11 +2060,13 @@ def test_no_profile_in_the_args(self):
+ class RepeatStop(unittest.TestCase):
+     """#606: one token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off."""
+ 
+-    def run_reply(self, script, limit=None):
++    def run_reply(self, script, limit=None, period=None):
+         tok = ByteTokenizer()
+         svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+         if limit is not None:
+             svc.repeat_stop_tokens = limit
++        if period is not None:
++            svc.repeat_stop_period = period
+         ids = tok.encode("hi")
+         with contextlib.redirect_stdout(io.StringIO()) as out:
+             done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
+@@ -2082,8 +2084,39 @@ def test_short_runs_and_off(self):
+         done, log = self.run_reply("!" * 1000, limit=0)
+         self.assertEqual((done["finish"], done["completion_tokens"]), ("stop", 1001))
+         self.assertNotIn("repeated one token", log)
+-        done, _ = self.run_reply("ab" * 400, limit=8)       # alternating tokens are not one run
++        done, _ = self.run_reply("ab" * 400, limit=8)       # alternating tokens: not one run (period 1)
+         self.assertEqual(done["finish"], "stop")
++        done, _ = self.run_reply("abcd" * 3, limit=16, period=16)   # a phrase repeated, but shorter than the limit
++        self.assertEqual(done["finish"], "stop")
++
++    def test_a_repeated_phrase_is_ended(self):
++        # "[unclear] " forever: a phrase of several tokens repeated, which the one-token run never sees
++        done, _ = self.run_reply("ok " + "[unclear] " * 100 + " never")      # off by default (period 1)
++        self.assertEqual(done["finish"], "stop")
++        done, log = self.run_reply("ok " + "[unclear] " * 100 + " never", period=16)
++        self.assertEqual((done["finish"], done["stop_cause"]), ("length", "repetition"))
++        # the run starts at the space that ends "ok " (" [unclear]" repeats from there): 256 tokens after "ok"
++        self.assertEqual(done["completion_tokens"], 2 + 256)
++        self.assertIn("repeated the same 10 tokens", log)
++        done, _ = self.run_reply("ab" * 400, limit=8, period=16)   # alternating tokens: a phrase of two
++        self.assertEqual((done["finish"], done["stop_cause"]), ("length", "repetition"))
++        self.assertEqual(done["completion_tokens"], 8)
++
++    def test_period_one_keeps_only_the_one_token_rule(self):
++        tok = ByteTokenizer()
++        svc = Service(MockEngine(tok, "ab" * 400, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        svc.repeat_stop_tokens, svc.repeat_stop_period = 8, 1
++        with contextlib.redirect_stdout(io.StringIO()):
++            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event())
++                    if kind == "done"][0]
++        self.assertEqual(done["finish"], "stop")
++        self.assertNotIn("stop_cause", done)
++
++    def test_a_long_reply_that_does_not_repeat_runs_to_the_end(self):
++        varied = "".join("abcdefghijklmnopqrstuvwxyz "[(i * i * 7 + i * 3) % 27] for i in range(2000))
++        done, _ = self.run_reply(varied, period=16)
++        self.assertEqual(done["finish"], "stop")
++        self.assertNotIn("stop_cause", done)
+ 
+ 
+ class LayerSplit(unittest.TestCase):
+diff --git a/serve/test_structured.py b/serve/test_structured.py
+index 6b66cf8b1..aed79585a 100644
+--- a/serve/test_structured.py
++++ b/serve/test_structured.py
+@@ -201,6 +201,34 @@ def test_schemas_that_allow_non_objects_are_still_rejected(self):
+                     self.assertIn("only JSON objects", reply["error"]["message"])
+             load.assert_not_called()
+ 
++    # ---- a reply the server stopped because it repeated itself -------------------------------------------------
++    def test_a_repetition_stop_is_named_not_blamed_on_the_budget(self):
++        self.svc.repeat_stop_period = 16                         # the phrase guard is opt-in
++        loop = '{"title":"x","sheet":"' + "[unclear] " * 100
++        code, reply = self.chat(loop, max_tokens=5000)
++        self.assertEqual(code, 502)
++        self.assertIn("repeated the same text", reply["error"]["message"])
++        self.assertNotIn("increase the output budget", reply["error"]["message"])
++        _, raw = self.chat(loop, max_tokens=5000, stream=True)
++        self.assertIn("repeated the same text", raw)
++        # the budget itself running out keeps the old advice
++        code, reply = self.chat(json.dumps(STORY), max_tokens=5)
++        self.assertIn("increase the output budget", reply["error"]["message"])
++
++    def test_plain_replies_name_the_cause_beside_length(self):
++        self.svc.repeat_stop_period = 16                         # "\\n" is two tokens here: a phrase
++        self.engine = self.svc.engine = MockEngine(self.tok, "ok " + "\\n" * 400, max_context=16384)
++        req = {"messages": [{"role": "user", "content": "x"}], "reasoning_effort": "none", "max_tokens": 5000}
++        code, reply = self.request("/v1/chat/completions", req)
++        self.assertEqual((code, reply["choices"][0]["finish_reason"], reply["choices"][0]["stop_cause"]),
++                         (200, "length", "repetition"))
++        _, raw = self.request("/v1/chat/completions", {**req, "stream": True})
++        last = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")][-1]
++        self.assertEqual(last["choices"][0]["stop_cause"], "repetition")
++        _, reply = self.request("/v1/chat/completions", {**req, "max_tokens": 5})     # a real budget stop: no cause
++        self.assertEqual(reply["choices"][0]["finish_reason"], "length")
++        self.assertNotIn("stop_cause", reply["choices"][0])
++
+     def test_the_server_does_not_import_jsonschema_at_start(self):
+         import subprocess
+         import sys

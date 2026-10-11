@@ -1,0 +1,8 @@
+[
+ ["Q0 0.1.41 batch 4K a", "logs/binaries/strata-141-batch.exe", [], [], "logs/prompt-ids.txt"],
+ ["Q1 0.1.42-b 4K a", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"],
+ ["Q2 0.1.41 batch 4K b", "logs/binaries/strata-141-batch.exe", [], [], "logs/prompt-ids.txt"],
+ ["Q3 0.1.42-b 4K b", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"],
+ ["Q4 0.1.41 batch 4K c", "logs/binaries/strata-141-batch.exe", [], [], "logs/prompt-ids.txt"],
+ ["Q5 0.1.42-b 4K c", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"]
+]

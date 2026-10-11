@@ -1,0 +1,7 @@
+[
+ ["U0 LRU off 4K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"],
+ ["U1 LRU 2G 4K", "logs/binaries/strata-142-b.exe", ["--resident-lru-gib", "2"], [], "logs/prompt-ids.txt"],
+ ["U2 LRU 6G 4K", "logs/binaries/strata-142-b.exe", ["--resident-lru-gib", "6"], [], "logs/prompt-ids.txt"],
+ ["V0 LRU off 16K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["V1 LRU 2G 16K", "logs/binaries/strata-142-b.exe", ["--resident-lru-gib", "2"], [], "logs/prompt-16k-ids.txt"]
+]

@@ -1,0 +1,6 @@
+[
+ ["S0 WMMA select only 4K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"],
+ ["S1 +SIMT scorer 4K", "logs/binaries/strata-142-b.exe", [], [["STRATA_SELECT_SIMT", "1"]], "logs/prompt-ids.txt"],
+ ["T0 WMMA select only 16K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["T1 +SIMT scorer 16K", "logs/binaries/strata-142-b.exe", [], [["STRATA_SELECT_SIMT", "1"]], "logs/prompt-16k-ids.txt"]
+]

@@ -1,0 +1,245 @@
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 3f673bff7..d74d6f27d 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -167,6 +167,25 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
+   as far as the RAM allows, their experts are kept in RAM too (so a prompt reads nothing from the SSD either).
+ - The cache still follows the conversation (`--adapt-every`): a swap copies the evicted expert back from VRAM into the
+   RAM place of the one that replaces it, so the RAM copy keeps holding exactly what the GPU does not.
++- `STRATA_RAM_ADAPT=<n>` (opt-in, `--serve`, one GPU): the RAM copy follows the conversation too. Without it the
++  copy is chosen once, at start, so when the RAM cannot hold every expert the GPU does not, an expert outside the copy
++  is read from the SSD every time the conversation routes to it. With it, before a decode window and while no adaptive
++  round is in flight, up to `n` experts the windows keep routing to (the adaptive tier's decayed count, 2 or more) take
++  the RAM places of experts of their own layer that are not routed to (count below 0.5): one pair per layer, the
++  largest difference first, one blob read each. The RAM stays the same size; the routing, the weights and the VRAM
++  tier's rule are untouched, and an expert that left the copy is read from the file again when it is needed. It needs
++  the adaptive tier (`--adapt-every`), and does nothing with `STRATA_EXCHANGE_ROTATE=1`, a layer split, a peer or
++  helper GPU, or `--batch`. Prompt routing is not used to choose replacements, and no selection runs during prefill.
++  Later prompts can read from a RAM copy changed by earlier decode requests. The log reports how many experts moved.
++  Measured on an RTX 3060 12 GB with 32 GB of RAM (Linux, IQ2_XS, 20.5 GiB of experts in RAM and about 6,000 experts on
++  the file tier, `--adapt-async 1`, `--spec 3`, power-saver), against v0.1.42: four fresh 3.8K-4.8K-token prompts in
++  four languages with 768 new tokens each, three fresh-process runs per arm. With the default tail skip (7), median
++  decode is 45.19 -> 49.51 tok/s (+9.6%) with `STRATA_RAM_ADAPT=8`; with `STRATA_ROUTE_TAIL_SKIP=0`, 35.36 -> 40.40
++  (+14.3%). Prompt speed is within run variation (470 -> 471 and 467 -> 471 tok/s). Decode file-tier blob reads per
++  generated token fall from 11.41 -> 4.71 and 20.08 -> 8.86 respectively; the 2,307 / 2,247 successful RAM promotions
++  per run read another blob each and are counted separately. Tail skip tests VRAM residency, so moving an expert to
++  RAM does not exempt it from being skipped. This option reduces remaining file reads for experts that still have
++  to be evaluated. One machine and one quantization; blocking adaptation and `--spec 2` were not retested on v0.1.42.
+ - `--adapt-async 1` (opt-in, `--serve`): the swaps of a round advance between decode windows on a helper thread
+   (copy back, copy in, move into RAM) instead of one window waiting for the whole round. With `--batch` slots it
+   advances between their windows too (docs/BATCHING.md); not with `--batch-groups` or `--peer-device` (the blocking
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index b51c8f99d..8929a133d 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -611,6 +611,13 @@ class FileExpertSource : public ExpertSource {
+     /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read (any thread).
+     const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
+     int64_t exchanges() const { return exchanges_; }
++    /// STRATA_RAM_ADAPT: the compact copy gives `out`'s place to `in`, read from the file, so the RAM tier can follow
++    /// the conversation as the VRAM tier does.  Both are experts of `layer` (one blob size), `out` is held by the copy
++    /// and `in` is not, no exchange is staged, and nothing may be reading `out`'s blob: the caller's thread, between
++    /// windows, with no adaptive round in flight.  A failed read leaves the copy as it was.  Not with
++    /// STRATA_EXCHANGE_ROTATE (false, nothing changes).
++    bool replace_resident(int64_t layer, int64_t in, int64_t out);
++    int64_t ram_adapts() const { return ram_adapts_; }
+     bool exchange_rotation() const { return exchange_storage_.active(); }
+     uint64_t rotated_exchanges() const { return exchange_storage_.exchanges(); }
+     uint64_t avoided_exchange_copy_bytes() const { return exchange_storage_.avoided_bytes(); }
+@@ -790,6 +797,8 @@ class FileExpertSource : public ExpertSource {
+     std::unordered_map<int64_t, size_t> stage_of_;
+     uint64_t stage_blob_ = 0;
+     uint64_t stage_seq_ = 0;
++    int64_t ram_adapts_ = 0;                  ///< replace_resident: experts moved from the file into the compact copy
++    std::vector<uint8_t> ram_adapt_buf_;      ///< ...one blob, read here before it replaces another
+     uint64_t epoch_ = 0;
+     int64_t last_layer_ = -1;
+     bool stage_grew_ = false;
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 4604eb8d4..500064c48 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -3252,6 +3252,30 @@ int64_t FileExpertSource::commit_exchanges() {
+     return n;
+ }
+ 
++bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) {
++    if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
++        layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out)
++        return false;
++    const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
++    const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
++    if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
++    if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
++    const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
++    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
++        bytes > complement_bytes_ - at) return false;
++    // read beside the copy first: a failed read leaves `out` where it was
++    if (ram_adapt_buf_.size() < (size_t) bytes) ram_adapt_buf_.resize((size_t) bytes);
++    const auto t0 = std::chrono::steady_clock::now();
++    if (!copy_from_files(layer, in, ram_adapt_buf_.data())) return false;
++    file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
++                       std::memory_order_relaxed);
++    file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
++    std::memcpy((uint8_t*) complement_host_ + (size_t) at, ram_adapt_buf_.data(), (size_t) bytes);
++    if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
++    ++ram_adapts_;
++    return true;
++}
++
+ void FileExpertSource::commit_copies() {
+     if (exchange_storage_.active()) return;   // STRATA_EXCHANGE_ROTATE: ownership moves in commit_flip, nothing to copy
+     for (const Exchange& x : staged_) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ff3f2e1a6..0e9dd8023 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -11572,6 +11572,40 @@ int main(int argc, char** argv) {
+                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
+                 if (adapt_nowait()) apply_pending(false);
+                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
++                // STRATA_RAM_ADAPT=<n> (opt-in, the resident RAM mode on one GPU): the RAM copy is chosen once, at
++                // start, so an expert it does not hold is read from the file every time the conversation routes to
++                // it.  With this, before a window and while no adaptive round is in flight, up to n experts the windows
++                // keep routing to (the adaptive tier's decayed count, at least its own candidate floor of 2) take the
++                // RAM places of experts of their layer that are not routed to (count below 0.5), one pair per layer,
++                // the largest difference first.  One blob read each, on this thread; the RAM stays the same size, and
++                // the routing, the weights and the VRAM tier's own rule are untouched.
++                static const int ram_adapt_n = [] {
++                    const char* e = std::getenv("STRATA_RAM_ADAPT");
++                    return e != nullptr ? std::max(0, std::atoi(e)) : 0;
++                }();
++                if (ram_adapt_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
++                    (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu && !peer.valid() &&
++                    !remote_opt && o.batch == 0) {
++                    constexpr float kRamAdaptRouted = 2.0f, kRamAdaptUnused = 0.5f;
++                    struct RamSwap { float gain; int32_t layer, in, out; };
++                    std::vector<RamSwap> swaps;
++                    for (int64_t l = 0; l < g.n_layers; ++l) {
++                        const float* u = drive.d.usage.data() + l * g.n_expert;
++                        const int32_t* r = host_res.data() + l * g.n_expert;
++                        int32_t in = -1, out = -1;
++                        for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
++                            if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
++                            if (src.has_resident(l, e)) { if (out < 0 || u[e] < u[out]) out = e; }
++                            else if (u[e] >= kRamAdaptRouted && (in < 0 || u[e] > u[in])) in = e;
++                        }
++                        if (in >= 0 && out >= 0 && u[out] < kRamAdaptUnused)
++                            swaps.push_back({u[in] - u[out], (int32_t) l, in, out});
++                    }
++                    std::sort(swaps.begin(), swaps.end(),
++                              [](const RamSwap& a, const RamSwap& b) { return a.gain > b.gain; });
++                    if ((int) swaps.size() > ram_adapt_n) swaps.resize((size_t) ram_adapt_n);
++                    for (const RamSwap& x : swaps) src.replace_resident(x.layer, x.in, x.out);
++                }
+                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
+                     std::printf("ERR an adaptive refill failed\n");
+                     return 1;
+@@ -11964,6 +11998,9 @@ int main(int argc, char** argv) {
+                                      "VRAM tier, %lld blob reads from the file\n",
+                              (double) src.resident_bytes() / 1073741824.0, (long long) src.exchanges(),
+                              (long long) src.file_reads());
++            if (src.ram_adapts() > 0)   // STRATA_RAM_ADAPT, cumulative
++                std::fprintf(stderr, "strata serve: resident RAM: %lld experts moved in from the file in place of "
++                                     "unused ones (STRATA_RAM_ADAPT)\n", (long long) src.ram_adapts());
+             if (ajob)   // --adapt-async, cumulative (a round may still be in flight: it lands before the next request)
+                 std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in, "
+                                      "%.1f ms per round (start to flip, between windows)\n",
+diff --git a/tests/core/file_expert_source_test.cpp b/tests/core/file_expert_source_test.cpp
+index 321c623ca..afcd33ac0 100644
+--- a/tests/core/file_expert_source_test.cpp
++++ b/tests/core/file_expert_source_test.cpp
+@@ -725,6 +725,84 @@ void test_rotating_source(bool rotate, bool pin) {
+     require(!src.has_resident(0, 0) && !src.exchange_rotation(), "reopen retained residency");
+ }
+ 
++// STRATA_RAM_ADAPT: an expert read from the file takes the RAM place of another of its layer.
++void test_replace_resident(bool pin) {
++    using namespace strata::core;
++    using namespace strata::kernels::cpu;
++#if defined(_WIN32)
++    _putenv_s("STRATA_EXCHANGE_ROTATE", "0");
++#else
++    setenv("STRATA_EXCHANGE_ROTATE", "0", 1);
++#endif
++    TempDirectory dir;
++    std::string err;
++    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
++    const size_t bytes = (size_t)BLOB;
++    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
++    {
++        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
++        for (size_t e = 0; e < truth.size(); ++e) {
++            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t)((i * 131u + e * 37u) ^ (i >> 8));
++            out.write((const char*)truth[e].data(), (std::streamsize)bytes);
++        }
++        require((bool)out, "fixture write failed");
++    }
++    FileExpertSource src;
++    ExpertCache cache;
++    require(src.open(dir.path.string(), 1, 5, err), err);
++    require(cache.open(2, 1, 5, BLOB, err), err);
++    for (int e : {2, 3}) {
++        const int slot = cache.admit(0, e);
++        require(slot >= 0 && cache.fill_slot_blocking(slot, truth[e].data(), err), err);
++    }
++    const std::vector<std::pair<int32_t, int32_t>> rank{{0,0},{0,1},{0,2},{0,3},{0,4}};
++    // experts 2 and 3 are in VRAM, the RAM budget holds 0 and 1, expert 4 stays on the file tier
++    require(src.pin_cache_complement(cache, err, pin, {}, -1, 0, 2 * bytes, &rank), err);
++    require(src.reserve_exchanges(1, err), err);
++    require(src.has_resident(0, 0) && src.has_resident(0, 1) && !src.has_resident(0, 4), "fixture residency wrong");
++    std::vector<uint8_t> actual(bytes);
++    auto holds = [&](int e) {
++        const uint8_t* b = src.blob(0, e);
++        return b != nullptr && !std::memcmp(b, truth[(size_t)e].data(), bytes);
++    };
++    require(!src.replace_resident(0, 1, 0), "an expert already in RAM accepted");
++    require(!src.replace_resident(0, 4, 2), "a place the RAM does not hold accepted");
++    require(!src.replace_resident(0, 4, 4) && !src.replace_resident(0, 5, 0) && !src.replace_resident(1, 4, 0),
++            "invalid arguments accepted");
++    require(src.ram_adapts() == 0 && holds(0) && holds(1) && holds(4), "a refused call changed the copy");
++    // a staged exchange owns the tables until it commits
++    require(cudaMemcpy(src.exchange_buffer(0), cache.device_slot(0), bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
++            "D2H eviction failed");
++    require(src.stage_exchange(0, 0, 2, 0), "stage rejected");
++    require(!src.replace_resident(0, 4, 1), "accepted beside a staged exchange");
++    require(cache.fill_slot_blocking(0, truth[0].data(), err), err);
++    require(src.commit_exchanges() == 1, "commit count wrong");   // RAM: 2 (in 0's place) and 1; VRAM: 0 and 3
++    const uint8_t* place = src.blob(0, 1);
++    require(src.replace_resident(0, 4, 1), "replace rejected");
++    require(src.ram_adapts() == 1 && src.has_resident(0, 4) && !src.has_resident(0, 1), "residency wrong");
++    require(src.blob(0, 4) == place && holds(4), "the incoming expert is not in the outgoing one's place");
++    require(holds(1) && holds(2), "another expert's bytes changed");
++    require(src.copy_blob(0, 1, actual.data()) && actual == truth[1], "the outgoing expert is not read from the file");
++    require(!src.transient(0, 4), "resident became transient");
++    if (pin) {
++        require(src.pinned(0, 4) && src.device_alias(0, 4), "mapping lost");
++        require(cudaMemcpy(actual.data(), src.device_alias(0, 4), bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
++                "device alias read failed");
++        require(actual == truth[4], "CUDA alias points at the old expert");
++    }
++    // and back, then an exchange with the VRAM tier still works on the moved place
++    require(src.replace_resident(0, 1, 4) && holds(1) && src.blob(0, 1) == place && !src.has_resident(0, 4),
++            "replace back wrong");
++    require(cudaMemcpy(src.exchange_buffer(0), cache.device_slot(1), bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
++            "D2H eviction failed");
++    require(src.stage_exchange(0, 1, 3, 0), "stage after replace rejected");
++    require(cache.fill_slot_blocking(1, truth[1].data(), err), err);
++    require(src.commit_exchanges() == 1 && src.has_resident(0, 3) && holds(3) && !src.has_resident(0, 1),
++            "exchange after replace wrong");
++    require(src.ram_adapts() == 2, "accounting wrong");
++    std::cout << "replace_resident: pinned=" << pin << " exact_bytes=PASS\n";
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -747,6 +825,8 @@ int main(int argc, char** argv) {
+             test_rotating_source(false, true);
+             test_rotating_source(true, true);
+             test_rotating_source(true, false);
++            test_replace_resident(true);
++            test_replace_resident(false);
+         }
+         std::cout << "file_expert_source_test: PASS\n";
+         return 0;

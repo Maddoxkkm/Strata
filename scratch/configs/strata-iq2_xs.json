@@ -1,5 +1,5 @@
 {
- "exe": "D:/llm-dev/strata/logs/binaries/strata-142-all.exe",
+ "exe": "D:/llm-dev/strata/logs/binaries/strata-142-b.exe",
  "args": [
   "--pack",
   "C:\\Users\\maddo\\.lmstudio\\models\\packs\\iq2_xs",

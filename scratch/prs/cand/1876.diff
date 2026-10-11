@@ -1,0 +1,123 @@
+diff --git a/serve/server.py b/serve/server.py
+index a0fb2b88c..e1293a487 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -3133,7 +3133,8 @@ def start_telemetry(self):
+                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
+                                        gpu_indices=getattr(self, "gpu_indices", None),
+-                                       amd=getattr(self, "backend", None) == "hip")
++                                       amd=getattr(self, "backend", None) == "hip",
++                                       electricity=getattr(self, "electricity", None))
+             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
+                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
+                 # slow card keeps the GPU at work while the host thread sleeps)
+@@ -6256,6 +6257,7 @@ def main() -> int:
+         svc.gpu_indices = [c for g in groups for c in g]
+         svc.gpu_index = svc.gpu_indices[0]
+     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
++    svc.electricity = cfg.get("electricity")  # Optional block enables GPU energy monitoring.
+     if a.config:
+         svc.config_path = a.config                      # #564: the web page's Settings view
+     if a.config:                                        # the Chat settings shared with other apps, from last time
+diff --git a/serve/telemetry.py b/serve/telemetry.py
+index b0d1bae28..8e46d7086 100644
+--- a/serve/telemetry.py
++++ b/serve/telemetry.py
+@@ -66,6 +66,16 @@ def _uint(self, fn, *args):
+         except (AttributeError, OSError):
+             return None
+ 
++    def energy_mj(self):
++        """NVML cumulative board energy in millijoules, when supported."""
++        value = ctypes.c_ulonglong()
++        try:
++            if self.lib.nvmlDeviceGetTotalEnergyConsumption(self.dev, ctypes.byref(value)) == 0:
++                return value.value
++        except (AttributeError, OSError):
++            pass
++        return None
++
+     def name(self):
+         buf = ctypes.create_string_buffer(96)
+         try:
+@@ -328,7 +338,7 @@ class MS(ctypes.Structure):
+ 
+ # ------------------------------------------------------------------------------------------------ the sampler
+ class Telemetry:
+-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
++    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, electricity=None):
+         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
+         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
+         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
+@@ -342,6 +352,12 @@ def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
+         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
+         self.gpu = self.gpus[0][1]
++        # The optional electricity configuration enables energy monitoring.
++        self._energy_enabled = isinstance(electricity, dict)
++        self._energy_base_mj = self._energy_mj() if self._energy_enabled else None
++        self._energy_j = 0.0
++        self._energy_valid = self._energy_base_mj is not None
++        self._energy_prev = None
+         try:
+             import psutil  # noqa: F401
+             self.ps = sys.modules["psutil"]
+@@ -364,6 +380,16 @@ def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+         self._stop = threading.Event()
+         threading.Thread(target=self._loop, daemon=True).start()
+ 
++    def _energy_mj(self):
++        readings = []
++        for _, gpu in self.gpus:
++            reader = getattr(gpu, "energy_mj", None)
++            value = reader() if reader else None
++            if value is None:
++                return None
++            readings.append(value)
++        return sum(readings) if readings else None
++
+     def _disk(self):
+         if not self.ps:
+             return None, None
+@@ -424,6 +450,23 @@ def close(self):
+     def _loop(self):
+         while not self._stop.is_set():
+             s = self.sample()
++            if self._energy_enabled:
++                if self._energy_base_mj is not None:
++                    reading = self._energy_mj()
++                    if reading is not None and reading >= self._energy_base_mj:
++                        self._energy_j = max(self._energy_j, (reading - self._energy_base_mj) / 1000.0)
++                else:
++                    # Fallback: approximate energy from the existing 1 Hz GPU power samples.
++                    now, power = time.monotonic(), s.get("gpu_power")
++                    if isinstance(power, (int, float)) and 0 <= power < float("inf"):
++                        if self._energy_prev is not None:
++                            t0, p0 = self._energy_prev
++                            self._energy_j += (p0 + power) / 2.0 * max(0.0, now - t0)
++                        self._energy_prev = (now, power)
++                        self._energy_valid = True
++                    else:
++                        self._energy_prev = None
++                s["gpu_energy_kwh"] = self._energy_j / 3_600_000.0 if self._energy_valid else None
+             with self.lock:
+                 self.now = s
+                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
+diff --git a/serve/web/app.js b/serve/web/app.js
+index 4460a95a7..3b3ec270d 100644
+--- a/serve/web/app.js
++++ b/serve/web/app.js
+@@ -288,7 +288,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
+             multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
+   spark("sp-temp", h.gpu_temp, 90);
+-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
++  const kwh = hw.gpu_energy_kwh;
++  const energy = Number.isFinite(kwh) ? (kwh < 1 ? `${fmt(kwh * 1000, 1)} Wh` : `${fmt(kwh, 3)} kWh`) : "";
++  const powerLimit = hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "";
++  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W",
++            [powerLimit, energy].filter(Boolean).join(" · "));
+   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
+   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
+   setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
