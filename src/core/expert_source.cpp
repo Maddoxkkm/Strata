@@ -2631,39 +2631,6 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     return true;
 }
-
-// pp-opt: the prompt path streams a chunk's experts in file order, so a stager thread's run of jobs is mostly
-// neighbouring blobs of experts.bin.  One read_direct batch merges them into requests of up to 32 MiB (kMerge) where
-// copy_blob made one ~2 MB request each - and NTFS serves the unbuffered reads of a mapped file one at a time, so the
-// request size is what sets the rate (see read_direct).  The blobs the RAM copy holds are copied as before.
-bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
-    if (direct_.empty() || n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
-    thread_local std::vector<Fill> fills;
-    fills.clear();
-    uint64_t bytes = 0;
-    for (size_t i = 0; i < n; ++i) {
-        const int64_t l = layers[i], e = experts[i];
-        if (base_ == nullptr || dst[i] == nullptr || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return false;
-        const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
-        if (complement_ready_ &&
-            (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr))) {
-            if (!copy_blob(l, e, dst[i])) return false;
-            continue;
-        }
-        fills.push_back({0, l, e, dst[i]});
-        bytes += layer_blob_bytes_[(size_t) l];
-    }
-    if (fills.empty()) return true;
-    const auto t0 = std::chrono::steady_clock::now();
-    if (!read_direct(fills.data(), fills.size()))
-        for (const Fill& f : fills)   // a failed batch: each blob on its own (copy_from_files falls back to the mapping)
-            if (!copy_from_files(f.layer, f.e, f.dst)) return false;
-    file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
-                       std::memory_order_relaxed);
-    file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    return true;
-}
-
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
     if (!role_ptr_.empty()) return nullptr;   // the GGUF in place: no contiguous blob in any file
     if (unmapped_) return nullptr;            // pp-opt: drop_mapping closed the view; read_direct reads them

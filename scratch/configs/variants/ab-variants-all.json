@@ -1,0 +1,8 @@
+[
+ ["L0 142-4pr (was live) 4K", "logs/binaries/strata-142-4pr.exe", [], [], "logs/prompt-ids.txt"],
+ ["L1 142-all shortlist 4K", "logs/binaries/strata-142-all.exe", [], [], "logs/prompt-ids.txt"],
+ ["L2 142-all +RING384 4K", "logs/binaries/strata-142-all.exe", [], [["STRATA_PREFILL_RING", "384"]], "logs/prompt-ids.txt"],
+ ["L3 142-all +LRU4 4K", "logs/binaries/strata-142-all.exe", ["--resident-lru-gib", "4"], [], "logs/prompt-ids.txt"],
+ ["M0 142-all 16K", "logs/binaries/strata-142-all.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["M1 142-all +LRU4 16K", "logs/binaries/strata-142-all.exe", ["--resident-lru-gib", "4"], [], "logs/prompt-16k-ids.txt"]
+]
