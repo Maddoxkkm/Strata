@@ -1,0 +1,1 @@
+{ "CMakeLists.txt": ["both"], "src/kernels/cuda/qsa_select.cu": ["both"] }
