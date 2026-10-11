@@ -1,0 +1,8 @@
+[
+ ["V0 base 16K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["V1 +RAM_ADAPT 16K", "logs/binaries/strata-142-b.exe", [], [["STRATA_RAM_ADAPT", "1"]], "logs/prompt-16k-ids.txt"],
+ ["V2 +PA_FAST 16K", "logs/binaries/strata-142-b.exe", [], [["STRATA_PA_FAST", "1"], ["STRATA_PF_SWITCH_MIN_T", "4096"]], "logs/prompt-16k-ids.txt"],
+ ["V3 +PF_GEMM+PAD 16K", "logs/binaries/strata-142-b.exe", [], [["STRATA_PF_GEMM", "1"], ["STRATA_PF_PAD", "1"], ["STRATA_PF_SWITCH_MIN_T", "4096"]], "logs/prompt-16k-ids.txt"],
+ ["V4 prefill 32768 16K", "logs/binaries/strata-142-b.exe", ["--prefill", "32768"], [], "logs/prompt-16k-ids.txt"],
+ ["V5 +PF_FUSED 16K", "logs/binaries/strata-142-b.exe", [], [["STRATA_PF_FUSED", "1"]], "logs/prompt-16k-ids.txt"]
+]

@@ -1,0 +1,7 @@
+[
+ ["W0 base 16K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-16k-ids.txt"],
+ ["W1 three switches 16K", "logs/binaries/strata-142-b.exe", [], [["STRATA_RAM_ADAPT","1"],["STRATA_PA_FAST","1"],["STRATA_PF_SWITCH_MIN_T","4096"],["STRATA_PF_GEMM","1"],["STRATA_PF_PAD","1"]], "logs/prompt-16k-ids.txt"],
+ ["W2 three + 32768 chunk 16K", "logs/binaries/strata-142-b.exe", ["--prefill","32768"], [["STRATA_RAM_ADAPT","1"],["STRATA_PA_FAST","1"],["STRATA_PF_SWITCH_MIN_T","4096"],["STRATA_PF_GEMM","1"],["STRATA_PF_PAD","1"]], "logs/prompt-16k-ids.txt"],
+ ["W3 base 4K", "logs/binaries/strata-142-b.exe", [], [], "logs/prompt-ids.txt"],
+ ["W4 three switches 4K", "logs/binaries/strata-142-b.exe", [], [["STRATA_RAM_ADAPT","1"],["STRATA_PA_FAST","1"],["STRATA_PF_SWITCH_MIN_T","4096"],["STRATA_PF_GEMM","1"],["STRATA_PF_PAD","1"]], "logs/prompt-ids.txt"]
+]

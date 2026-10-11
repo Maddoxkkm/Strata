@@ -61,7 +61,12 @@
   "STRATA_RESIDENT_HEADROOM_GIB": "2",
   "STRATA_HIP_WMMA": "1",
   "STRATA_SELECT_WMMA": "1",
-  "STRATA_SELECT_SIMT": "1"
+  "STRATA_SELECT_SIMT": "1",
+  "STRATA_PA_FAST": "1",
+  "STRATA_PF_SWITCH_MIN_T": "4096",
+  "STRATA_PF_GEMM": "1",
+  "STRATA_PF_PAD": "1",
+  "STRATA_RAM_ADAPT": "1"
  },
  "draft_vocab": "en",
  "fit_max_tokens": true,
