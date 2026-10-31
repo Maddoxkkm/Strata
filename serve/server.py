@@ -83,6 +83,7 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
+from serve import usage_log  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -6658,6 +6659,10 @@ class Service:
                                 t["decode_ms"] += last.get("decode_ms") or 0.0
                                 t["drafts_offered"] += last.get("drafts_offered") or 0
                                 t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                                # STRATA_USAGE_LOG: the same numbers, written once where they are computed, so they
+                                # survive the restart that resets the totals above. Never raises (see usage_log).
+                                usage_log.generation(self, request_id, started, finish,
+                                                     seen, len(ids), last, n)
                                 ft0 = st.get("first_token")             # this request's own (#465: one per request)
                                 self.latencies.observe(ft0 - started if ft0 else None, n,
                                                        (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
