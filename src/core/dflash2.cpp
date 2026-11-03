@@ -522,7 +522,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         if (!skip_part("head")) {
             // the verify window's head kernel (interleaved activations, rows a warp by the card's table): bitwise native_mmvq's output, so the drafts are the same
             static const bool il_on = [] { const char* e = std::getenv("STRATA_DF2_HEAD_IL"); return !(e && e[0] == '0'); }();
-            if (il_on && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)) {
+            if (il_on && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_, N_)) {
                 native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
                 native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
             } else
